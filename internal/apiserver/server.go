@@ -1648,9 +1648,11 @@ func (s *Server) patchEnsemble(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Auto-create a K8s Secret when the user provides a raw API key.
-	if req.Provider != "" && req.APIKey != "" && req.SecretName == "" {
-		req.SecretName = defaultProviderSecretName(name, req.Provider)
+	// Create or update a K8s Secret when the user provides a raw API key.
+	if req.Provider != "" && req.APIKey != "" {
+		if req.SecretName == "" {
+			req.SecretName = defaultProviderSecretName(name, req.Provider)
+		}
 		envKey := providerEnvKey(req.Provider)
 		secret := &corev1.Secret{
 			ObjectMeta: metav1.ObjectMeta{
@@ -1663,26 +1665,9 @@ func (s *Server) patchEnsemble(w http.ResponseWriter, r *http.Request) {
 			},
 			StringData: map[string]string{envKey: req.APIKey},
 		}
-		createErr := s.client.Create(r.Context(), secret)
-		if createErr != nil && !k8serrors.IsAlreadyExists(createErr) {
-			http.Error(w, "failed to create credentials secret: "+createErr.Error(), http.StatusInternalServerError)
+		if err := createOrUpdateSecret(r.Context(), s.client, secret); err != nil {
+			http.Error(w, "failed to create credentials secret: "+err.Error(), http.StatusInternalServerError)
 			return
-		}
-		if k8serrors.IsAlreadyExists(createErr) {
-			// Update the existing secret with the new key.
-			existing := &corev1.Secret{}
-			if err := s.client.Get(r.Context(), types.NamespacedName{Name: req.SecretName, Namespace: ns}, existing); err != nil {
-				http.Error(w, "failed to get existing secret: "+err.Error(), http.StatusInternalServerError)
-				return
-			}
-			if existing.Data == nil {
-				existing.Data = map[string][]byte{}
-			}
-			existing.Data[envKey] = []byte(req.APIKey)
-			if err := s.client.Update(r.Context(), existing); err != nil {
-				http.Error(w, "failed to update credentials secret: "+err.Error(), http.StatusInternalServerError)
-				return
-			}
 		}
 	}
 

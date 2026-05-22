@@ -177,10 +177,6 @@ func (r *EnsembleReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 			if err != nil {
 				return ctrl.Result{}, err
 			}
-			pack.Spec.AuthRefs = nil
-			if err := r.Update(ctx, pack); err != nil {
-				return ctrl.Result{}, err
-			}
 			if deleted > 0 {
 				log.Info("Deleted managed Ensemble auth secrets", "count", deleted)
 			}
@@ -791,18 +787,17 @@ func (r *EnsembleReconciler) cleanupPersona(
 ) error {
 	instanceName := pack.Name + "-" + persona.Name
 
-	// Cancel running AgentRuns for this persona by marking them Failed
-	// and deleting their pods.
+	// Cancel active AgentRuns and delete all runs for this persona.
 	var runList sympoziumv1alpha1.AgentRunList
 	if err := r.List(ctx, &runList, client.InNamespace(pack.Namespace), client.MatchingLabels{"sympozium.ai/instance": instanceName}); err == nil {
 		for i := range runList.Items {
 			run := &runList.Items[i]
-			if run.Status.Phase == sympoziumv1alpha1.AgentRunPhaseRunning ||
-				run.Status.Phase == sympoziumv1alpha1.AgentRunPhaseAwaitingDelegate ||
-				run.Status.Phase == sympoziumv1alpha1.AgentRunPhasePending ||
-				run.Status.Phase == sympoziumv1alpha1.AgentRunPhaseServing {
+			switch run.Status.Phase {
+			case sympoziumv1alpha1.AgentRunPhaseRunning,
+				sympoziumv1alpha1.AgentRunPhaseAwaitingDelegate,
+				sympoziumv1alpha1.AgentRunPhasePending,
+				sympoziumv1alpha1.AgentRunPhaseServing:
 				log.Info("Cancelling running AgentRun for disabled persona", "agentrun", run.Name)
-				// Delete the pod first to stop the workload.
 				if run.Status.PodName != "" {
 					pod := &corev1.Pod{}
 					if err := r.Get(ctx, client.ObjectKey{Name: run.Status.PodName, Namespace: pack.Namespace}, pod); err == nil {
@@ -815,6 +810,10 @@ func (r *EnsembleReconciler) cleanupPersona(
 				if err := r.Status().Update(ctx, run); err != nil && !errors.IsNotFound(err) {
 					log.Error(err, "Failed to mark AgentRun as failed", "agentrun", run.Name)
 				}
+			}
+			// Delete all runs (active or terminal) so the ensemble starts clean on re-enable.
+			if err := r.Delete(ctx, run); err != nil && !errors.IsNotFound(err) {
+				log.Error(err, "Failed to delete AgentRun for disabled persona", "agentrun", run.Name)
 			}
 		}
 	}
