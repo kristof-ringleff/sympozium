@@ -391,6 +391,47 @@ func TestBuildVolumes_IPCUsesMemory(t *testing.T) {
 	t.Error("ipc volume not found")
 }
 
+// ── skipRun ──────────────────────────────────────────────────────────────────
+
+func TestSkipRun_MarksSkippedTerminal(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := sympoziumv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add sympozium scheme: %v", err)
+	}
+
+	run := &sympoziumv1alpha1.AgentRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "run-skip", Namespace: "default"},
+		Spec:       sympoziumv1alpha1.AgentRunSpec{AgentRef: "demo"},
+		Status:     sympoziumv1alpha1.AgentRunStatus{Phase: sympoziumv1alpha1.AgentRunPhaseRunning},
+	}
+
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(run).
+		WithStatusSubresource(&sympoziumv1alpha1.AgentRun{}).
+		Build()
+
+	r := &AgentRunReconciler{Client: cl, Scheme: scheme, Log: logr.Discard()}
+
+	if _, err := r.skipRun(context.Background(), run, "no work to do"); err != nil {
+		t.Fatalf("skipRun returned error: %v", err)
+	}
+
+	var got sympoziumv1alpha1.AgentRun
+	if err := cl.Get(context.Background(), types.NamespacedName{Name: "run-skip", Namespace: "default"}, &got); err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if got.Status.Phase != sympoziumv1alpha1.AgentRunPhaseSkipped {
+		t.Fatalf("phase = %q, want %q", got.Status.Phase, sympoziumv1alpha1.AgentRunPhaseSkipped)
+	}
+	if got.Status.Result != "no work to do" {
+		t.Fatalf("result = %q, want %q", got.Status.Result, "no work to do")
+	}
+	if got.Status.CompletedAt == nil {
+		t.Fatal("expected CompletedAt to be set")
+	}
+}
+
 // ── result parsing tests ─────────────────────────────────────────────────────
 
 func TestParseAgentResultFromLogs_Success(t *testing.T) {
@@ -399,7 +440,10 @@ func TestParseAgentResultFromLogs_Success(t *testing.T) {
 		`{"status":"success","response":"all good","metrics":{"durationMs":1200,"inputTokens":10,"outputTokens":20,"toolCalls":1}}` +
 		"__SYMPOZIUM_END__\n"
 
-	result, errMsg, usage := parseAgentResultFromLogs(logs, logr.Discard())
+	result, errMsg, usage, skipped := parseAgentResultFromLogs(logs, logr.Discard())
+	if skipped {
+		t.Fatal("did not expect skipped")
+	}
 	if errMsg != "" {
 		t.Fatalf("unexpected error message: %q", errMsg)
 	}
@@ -420,7 +464,10 @@ func TestParseAgentResultFromLogs_Error(t *testing.T) {
 		fmt.Sprintf(`{"status":"error","error":%q,"metrics":{"durationMs":123}}`, want) +
 		"__SYMPOZIUM_END__\n"
 
-	result, errMsg, usage := parseAgentResultFromLogs(logs, logr.Discard())
+	result, errMsg, usage, skipped := parseAgentResultFromLogs(logs, logr.Discard())
+	if skipped {
+		t.Fatal("did not expect skipped")
+	}
 	if result != "" {
 		t.Fatalf("expected empty result, got %q", result)
 	}
@@ -429,6 +476,39 @@ func TestParseAgentResultFromLogs_Error(t *testing.T) {
 	}
 	if usage != nil {
 		t.Fatalf("expected nil usage on error, got %+v", usage)
+	}
+}
+
+func TestParseAgentResultFromLogs_Skipped(t *testing.T) {
+	logs := "noise\n" +
+		"__SYMPOZIUM_RESULT__" +
+		`{"status":"skipped","response":"no new items in queue"}` +
+		"__SYMPOZIUM_END__\n"
+
+	result, errMsg, usage, skipped := parseAgentResultFromLogs(logs, logr.Discard())
+	if !skipped {
+		t.Fatal("expected skipped=true")
+	}
+	if errMsg != "" {
+		t.Fatalf("unexpected error message: %q", errMsg)
+	}
+	if result != "no new items in queue" {
+		t.Fatalf("reason = %q, want %q", result, "no new items in queue")
+	}
+	if usage != nil {
+		t.Fatalf("expected nil usage on skip, got %+v", usage)
+	}
+}
+
+func TestParseAgentResultFromLogs_SkippedDefaultReason(t *testing.T) {
+	logs := "__SYMPOZIUM_RESULT__" + `{"status":"skipped"}` + "__SYMPOZIUM_END__\n"
+
+	result, _, _, skipped := parseAgentResultFromLogs(logs, logr.Discard())
+	if !skipped {
+		t.Fatal("expected skipped=true")
+	}
+	if result == "" {
+		t.Fatal("expected a default skip reason, got empty")
 	}
 }
 
@@ -456,7 +536,7 @@ func TestParseAgentResultFromLogs_MarkerBeyondOldTailLimit(t *testing.T) {
 	b.WriteString(`{"status":"success","response":"the final report","metrics":{"durationMs":5000,"inputTokens":100,"outputTokens":50,"toolCalls":200}}`)
 	b.WriteString("__SYMPOZIUM_END__\n")
 
-	result, errMsg, usage := parseAgentResultFromLogs(b.String(), logr.Discard())
+	result, errMsg, usage, _ := parseAgentResultFromLogs(b.String(), logr.Discard())
 	if errMsg != "" {
 		t.Fatalf("unexpected error: %s", errMsg)
 	}
@@ -473,7 +553,7 @@ func TestParseAgentResultFromLogs_LongMultilineResponse(t *testing.T) {
 	payload := fmt.Sprintf(`{"status":"success","response":%q,"metrics":{"durationMs":3000,"inputTokens":50,"outputTokens":100,"toolCalls":5}}`, longResponse)
 	logs := "__SYMPOZIUM_RESULT__" + payload + "__SYMPOZIUM_END__\n"
 
-	result, errMsg, _ := parseAgentResultFromLogs(logs, logr.Discard())
+	result, errMsg, _, _ := parseAgentResultFromLogs(logs, logr.Discard())
 	if errMsg != "" {
 		t.Fatalf("unexpected error: %s", errMsg)
 	}

@@ -15,6 +15,8 @@ import (
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/propagation"
 	oteltrace "go.opentelemetry.io/otel/trace"
+
+	"github.com/sympozium-ai/sympozium/internal/ipc"
 )
 
 // maxToolIterations is the maximum number of tool-call round-trips before
@@ -124,6 +126,29 @@ type streamChunk struct {
 func main() {
 	log.SetFlags(log.Ltime | log.Lmicroseconds)
 	log.Println("agent-runner starting")
+
+	// Skip mode: a preRun lifecycle hook wrote the skip marker on the shared
+	// /ipc volume to signal there is no work to do. Short-circuit before the
+	// LLM call (and before the empty-TASK guard below) so the run spends no
+	// tokens; the controller marks the AgentRun as Skipped.
+	if reason, skip := readSkipMarker(); skip {
+		log.Printf("SKIP mode — preRun hook requested skip: %s", reason)
+		// Brief pause to let the ipc-bridge sidecar set up its fsnotify
+		// watches on /ipc/output/ before we write the result and exit.
+		time.Sleep(3 * time.Second)
+		res := agentResult{
+			Status:   ipc.ResultStatusSkipped,
+			Response: reason,
+		}
+		_ = os.MkdirAll("/ipc/output", 0o755)
+		writeJSON("/ipc/output/result.json", res)
+		_ = os.WriteFile("/ipc/done", []byte("done"), 0o644)
+		if markerBytes, err := json.Marshal(res); err == nil {
+			fmt.Fprintf(os.Stdout, "\n__SYMPOZIUM_RESULT__%s__SYMPOZIUM_END__\n", string(markerBytes))
+		}
+		log.Println("agent-runner skipped")
+		os.Exit(0)
+	}
 
 	task := getEnv("TASK", "")
 	if task == "" {
@@ -566,6 +591,21 @@ func getEnv(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// readSkipMarker reports whether a preRun hook requested the run be skipped by
+// writing ipc.SkipMarkerPath on the shared /ipc volume. The trimmed file
+// contents are returned as the human-readable skip reason.
+func readSkipMarker() (string, bool) {
+	b, err := os.ReadFile(ipc.SkipMarkerPath)
+	if err != nil {
+		return "", false
+	}
+	reason := strings.TrimSpace(string(b))
+	if reason == "" {
+		reason = "preRun hook requested skip"
+	}
+	return reason, true
 }
 
 func firstNonEmpty(vals ...string) string {
