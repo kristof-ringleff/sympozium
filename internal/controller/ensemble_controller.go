@@ -591,6 +591,7 @@ func (r *EnsembleReconciler) buildAgent(
 					Lifecycle:                persona.Lifecycle,
 					Subagents:                persona.Subagents,
 					Env:                      persona.Env,
+					RunTimeout:               persona.RunTimeout,
 				},
 			},
 			AuthRefs: authRefs,
@@ -1413,6 +1414,7 @@ func (r *EnsembleReconciler) deliverStimulus(ctx context.Context, log logr.Logge
 			Volumes:          targetInst.Spec.Volumes,
 			VolumeMounts:     targetInst.Spec.VolumeMounts,
 			Env:              targetInst.Spec.Agents.Default.Env,
+			Timeout:          targetInst.Spec.Agents.Default.ParseRunTimeout(),
 		},
 	}
 

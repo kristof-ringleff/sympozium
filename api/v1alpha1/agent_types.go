@@ -1,6 +1,8 @@
 package v1alpha1
 
 import (
+	"time"
+
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
@@ -416,6 +418,23 @@ type AgentConfig struct {
 	// as-is.
 	// +optional
 	Env map[string]string `json:"env,omitempty"`
+}
+
+// ParseRunTimeout parses the configured RunTimeout string into a
+// *metav1.Duration suitable for AgentRunSpec.Timeout. It returns nil when
+// RunTimeout is empty or fails to parse, letting callers fall back to the
+// provider-appropriate default. A single persisted AgentRunSpec.Timeout then
+// drives all controller-side gates consistently (watchdog,
+// Job activeDeadlineSeconds, and the RUN_TIMEOUT env injection).
+func (c AgentConfig) ParseRunTimeout() *metav1.Duration {
+	if c.RunTimeout == "" {
+		return nil
+	}
+	d, err := time.ParseDuration(c.RunTimeout)
+	if err != nil || d <= 0 {
+		return nil
+	}
+	return &metav1.Duration{Duration: d}
 }
 
 // SandboxSpec defines sandbox configuration.
