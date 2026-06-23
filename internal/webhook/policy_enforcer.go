@@ -338,6 +338,40 @@ func (pe *PolicyEnforcer) validateEnvVars(run *sympoziumv1alpha1.AgentRun) error
 			return fmt.Errorf("environment variable %q is not allowed: overriding system variables is denied", key)
 		}
 	}
+	if run.Spec.Lifecycle != nil {
+		for _, h := range run.Spec.Lifecycle.PreRun {
+			if err := validateHookEnv("preRun", h.Name, h.Env); err != nil {
+				return err
+			}
+		}
+		for _, h := range run.Spec.Lifecycle.PostRun {
+			if err := validateHookEnv("postRun", h.Name, h.Env); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// validateHookEnv enforces that each lifecycle hook env entry uses either a
+// literal value or a secretKeyRef source (never both), and that a secretKeyRef
+// names both a Secret and a key.
+func validateHookEnv(phase, hook string, env []sympoziumv1alpha1.EnvVar) error {
+	for _, e := range env {
+		if e.ValueFrom == nil {
+			continue
+		}
+		if e.Value != "" {
+			return fmt.Errorf("%s hook %q env %q: value and valueFrom are mutually exclusive", phase, hook, e.Name)
+		}
+		ref := e.ValueFrom.SecretKeyRef
+		if ref == nil {
+			return fmt.Errorf("%s hook %q env %q: valueFrom must set secretKeyRef", phase, hook, e.Name)
+		}
+		if ref.Name == "" || ref.Key == "" {
+			return fmt.Errorf("%s hook %q env %q: secretKeyRef requires both name and key", phase, hook, e.Name)
+		}
+	}
 	return nil
 }
 

@@ -1145,6 +1145,76 @@ func TestBuildContainers_PreRunForwardsSpecEnv(t *testing.T) {
 	}
 }
 
+func TestBuildContainers_PreRunSecretKeyRefEnv(t *testing.T) {
+	r := &AgentRunReconciler{}
+	optional := true
+	run := newTestRunWithLifecycle(
+		[]sympoziumv1alpha1.LifecycleHookContainer{
+			{
+				Name:    "fetch",
+				Image:   "busybox:1.36",
+				Command: []string{"true"},
+				Env: []sympoziumv1alpha1.EnvVar{
+					{Name: "PLAIN", Value: "literal"},
+					{
+						Name: "GITHUB_TOKEN",
+						ValueFrom: &sympoziumv1alpha1.EnvVarSource{
+							SecretKeyRef: &sympoziumv1alpha1.SecretKeySelector{
+								Name:     "gh-pat",
+								Key:      "token",
+								Optional: &optional,
+							},
+						},
+					},
+				},
+			},
+		},
+		nil, nil,
+	)
+
+	_, initContainers := r.buildContainers(run, false, nil, nil, nil)
+
+	var hook *corev1.Container
+	for i := range initContainers {
+		if initContainers[i].Name == "pre-fetch" {
+			hook = &initContainers[i]
+			break
+		}
+	}
+	if hook == nil {
+		t.Fatal("pre-fetch init container not found")
+	}
+
+	var secretEnv *corev1.EnvVar
+	for i := range hook.Env {
+		if hook.Env[i].Name == "GITHUB_TOKEN" {
+			secretEnv = &hook.Env[i]
+		}
+		if hook.Env[i].Name == "PLAIN" && hook.Env[i].Value != "literal" {
+			t.Errorf("PLAIN env = %q, want literal", hook.Env[i].Value)
+		}
+	}
+	if secretEnv == nil {
+		t.Fatal("GITHUB_TOKEN env var not found on hook container")
+	}
+	if secretEnv.Value != "" {
+		t.Errorf("secret-sourced env should have empty literal Value, got %q", secretEnv.Value)
+	}
+	if secretEnv.ValueFrom == nil {
+		t.Fatal("GITHUB_TOKEN env missing valueFrom")
+	}
+	ref := secretEnv.ValueFrom.SecretKeyRef
+	if ref == nil {
+		t.Fatal("GITHUB_TOKEN env missing valueFrom.secretKeyRef")
+	}
+	if ref.Name != "gh-pat" || ref.Key != "token" {
+		t.Errorf("secretKeyRef = %s/%s, want gh-pat/token", ref.Name, ref.Key)
+	}
+	if ref.Optional == nil || !*ref.Optional {
+		t.Error("secretKeyRef Optional should be true")
+	}
+}
+
 func TestBuildContainers_PreRunAppearsAfterSystemInits(t *testing.T) {
 	r := &AgentRunReconciler{}
 	run := newTestRunWithLifecycle(

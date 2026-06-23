@@ -225,10 +225,43 @@ type HostPathMount struct {
 	ReadOnly *bool `json:"readOnly,omitempty"`
 }
 
-// EnvVar is a simplified environment variable (name + value).
+// EnvVar is a simplified environment variable. The value is either supplied
+// literally via Value or sourced from a Secret via ValueFrom. The two are
+// mutually exclusive.
 type EnvVar struct {
-	Name  string `json:"name"`
-	Value string `json:"value"`
+	Name string `json:"name"`
+
+	// Value is a literal environment variable value.
+	// +optional
+	Value string `json:"value,omitempty"`
+
+	// ValueFrom sources the value from outside the spec, e.g. a Secret key.
+	// When set, Value must be empty.
+	// +optional
+	ValueFrom *EnvVarSource `json:"valueFrom,omitempty"`
+}
+
+// EnvVarSource selects the origin of an EnvVar value. Only secretKeyRef is
+// supported; configMap, field and resource references are intentionally
+// omitted to keep the surface small and avoid leaking pod metadata.
+type EnvVarSource struct {
+	// SecretKeyRef selects a single key of a Secret in the AgentRun namespace.
+	// +optional
+	SecretKeyRef *SecretKeySelector `json:"secretKeyRef,omitempty"`
+}
+
+// SecretKeySelector identifies a key within a Secret.
+type SecretKeySelector struct {
+	// Name is the name of the Secret in the AgentRun namespace.
+	Name string `json:"name"`
+
+	// Key is the key within the Secret's data to expose.
+	Key string `json:"key"`
+
+	// Optional, when true, allows the Secret or key to be absent without
+	// failing pod startup.
+	// +optional
+	Optional *bool `json:"optional,omitempty"`
 }
 
 // SidecarResources defines resource requests and limits for a skill sidecar.
