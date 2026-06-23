@@ -216,7 +216,7 @@ func (r *EnsembleReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	}
 
 	// Validate the relationship graph for cycles and stimulus constraints before proceeding.
-	if err := validateRelationshipGraph(pack.Spec.AgentConfigs, pack.Spec.Relationships, pack.Spec.Stimulus); err != nil {
+	if err := validateRelationshipGraph(pack.Spec.AgentConfigs, pack.Spec.Relationships, pack.Spec.Stimulus, pack.Spec.WorkflowType); err != nil {
 		log.Error(err, "Invalid relationship graph")
 		pack.Status.Phase = "Error"
 		if statusErr := r.Status().Update(ctx, pack); statusErr != nil {
@@ -464,8 +464,17 @@ func (r *EnsembleReconciler) reconcileAgentConfig(
 	}
 
 	// --- SympoziumSchedule ---
+	// In a "pipeline" ensemble, a persona that is the target of a sequential
+	// edge runs only when its predecessor completes (see
+	// triggerSequentialSuccessors in agentrun_controller.go). Giving it an
+	// independent schedule would let it fire on its own clock — and because a
+	// freshly created schedule backdates its first tick and runs immediately,
+	// the successor starts in parallel with the pipeline head, bypassing the
+	// ordering. Suppress the schedule for such successors so the predecessor's
+	// completion is their only trigger.
 	schedName := instanceName + "-schedule"
-	if persona.Schedule != nil {
+	wantSchedule := persona.Schedule != nil && !isPipelineSuccessor(pack, persona.Name)
+	if wantSchedule {
 		ip.ScheduleName = schedName
 
 		desired := r.buildSchedule(pack, persona, instanceName, schedName, personaIndex)
@@ -504,7 +513,13 @@ func (r *EnsembleReconciler) reconcileAgentConfig(
 			}
 		}
 	} else {
-		// Persona no longer has a schedule configured — remove any stale one.
+		// Either the persona has no schedule, or it's a pipeline successor whose
+		// schedule is suppressed — remove any stale SympoziumSchedule so an
+		// ensemble that previously ran with independent schedules is cleaned up.
+		if persona.Schedule != nil && !wantSchedule {
+			log.Info("Suppressing schedule for pipeline successor — triggered by predecessor completion",
+				"persona", persona.Name)
+		}
 		existingSched := &sympoziumv1alpha1.SympoziumSchedule{}
 		err := r.Get(ctx, client.ObjectKey{Name: schedName, Namespace: pack.Namespace}, existingSched)
 		if err == nil {
@@ -661,6 +676,23 @@ func (r *EnsembleReconciler) buildAgent(
 	}
 
 	return inst
+}
+
+// isPipelineSuccessor reports whether a persona's execution is driven solely by
+// an upstream persona completing rather than by its own schedule. In a
+// "pipeline" ensemble, any persona that is the target of a sequential edge is
+// triggered by triggerSequentialSuccessors when its predecessor succeeds, so it
+// must not get an independent SympoziumSchedule.
+func isPipelineSuccessor(pack *sympoziumv1alpha1.Ensemble, personaName string) bool {
+	if pack.Spec.WorkflowType != "pipeline" {
+		return false
+	}
+	for _, rel := range pack.Spec.Relationships {
+		if rel.Type == "sequential" && rel.Target == personaName {
+			return true
+		}
+	}
+	return false
 }
 
 // buildSchedule creates a SympoziumSchedule from a persona's schedule config.
@@ -1450,8 +1482,24 @@ func (r *EnsembleReconciler) deliverStimulus(ctx context.Context, log logr.Logge
 // reference existing personas and that the sequential edges form a DAG (no
 // cycles). Delegation and supervision edges are not checked for cycles because
 // delegation is on-demand and supervision has no runtime effect.
-// It also validates stimulus relationship constraints.
-func validateRelationshipGraph(personas []sympoziumv1alpha1.AgentConfigSpec, relationships []sympoziumv1alpha1.AgentConfigRelationship, stimulus *sympoziumv1alpha1.StimulusSpec) error {
+// It also validates stimulus relationship constraints and that the declared
+// workflowType is backed by the relationship edges that drive it.
+func validateRelationshipGraph(personas []sympoziumv1alpha1.AgentConfigSpec, relationships []sympoziumv1alpha1.AgentConfigRelationship, stimulus *sympoziumv1alpha1.StimulusSpec, workflowType string) error {
+	// A declared workflowType must be backed by the relationship edges that
+	// drive it; otherwise the orchestration pattern silently does nothing. Only
+	// "pipeline" (sequential edges) and "delegation" (delegation edges) have
+	// runtime behaviour — "autonomous" is the implicit default and needs none.
+	switch workflowType {
+	case "pipeline":
+		if !hasRelationshipType(relationships, "sequential") {
+			return fmt.Errorf("workflowType %q requires at least one sequential relationship edge", workflowType)
+		}
+	case "delegation":
+		if !hasRelationshipType(relationships, "delegation") {
+			return fmt.Errorf("workflowType %q requires at least one delegation relationship edge", workflowType)
+		}
+	}
+
 	if len(relationships) == 0 && stimulus == nil {
 		return nil
 	}
@@ -1552,6 +1600,16 @@ func validateRelationshipGraph(personas []sympoziumv1alpha1.AgentConfigSpec, rel
 		}
 	}
 	return nil
+}
+
+// hasRelationshipType reports whether any relationship edge has the given type.
+func hasRelationshipType(relationships []sympoziumv1alpha1.AgentConfigRelationship, relType string) bool {
+	for _, rel := range relationships {
+		if rel.Type == relType {
+			return true
+		}
+	}
+	return false
 }
 
 // SetupWithManager registers the controller.

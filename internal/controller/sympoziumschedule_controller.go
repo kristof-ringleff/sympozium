@@ -137,6 +137,28 @@ func (r *SympoziumScheduleReconciler) Reconcile(ctx context.Context, req ctrl.Re
 		return ctrl.Result{RequeueAfter: delay}, nil
 	}
 
+	// Pipeline ordering: don't start a new pipeline pass while the previous one
+	// is still in flight. ConcurrencyPolicy below only guards this schedule's own
+	// previous run; a pipeline head can finish and hand off to a sequential
+	// successor that is still running, so we must also block re-triggering while
+	// any run in the ensemble is active.
+	if ensembleName := schedule.Labels["sympozium.ai/ensemble"]; ensembleName != "" {
+		ensemble := &sympoziumv1alpha1.Ensemble{}
+		if err := r.Get(ctx, client.ObjectKey{
+			Namespace: schedule.Namespace,
+			Name:      ensembleName,
+		}, ensemble); err == nil && ensemble.Spec.WorkflowType == "pipeline" {
+			if activeRun, inFlight, err := r.pipelineInFlight(ctx, schedule.Namespace, ensembleName); err != nil {
+				log.Error(err, "failed to check pipeline in-flight state")
+			} else if inFlight {
+				log.Info("Skipping trigger — pipeline still in flight",
+					"ensemble", ensembleName, "activeRun", activeRun)
+				_ = r.Status().Update(ctx, schedule)
+				return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+			}
+		}
+	}
+
 	// Check concurrency policy.
 	if schedule.Spec.ConcurrencyPolicy == "Forbid" && schedule.Status.LastRunName != "" {
 		lastAgentRun := &sympoziumv1alpha1.AgentRun{}
@@ -233,6 +255,11 @@ func (r *SympoziumScheduleReconciler) Reconcile(ctx context.Context, req ctrl.Re
 			VolumeMounts:     instance.Spec.VolumeMounts,
 			Env:              instance.Spec.Agents.Default.Env,
 		},
+	}
+
+	// Propagate the ensemble label so pipeline in-flight checks can see this run.
+	if ensembleName := schedule.Labels["sympozium.ai/ensemble"]; ensembleName != "" {
+		agentRun.Labels["sympozium.ai/ensemble"] = ensembleName
 	}
 
 	// Enable canary mode for system canary runs.
@@ -371,6 +398,31 @@ func (r *SympoziumScheduleReconciler) nextScheduledRunNumber(ctx context.Context
 		return maxObserved + 1, nil
 	}
 	return base, nil
+}
+
+// pipelineInFlight reports whether any AgentRun belonging to the given ensemble
+// is still active (pending, running, or serving). It is used to stop a pipeline
+// head's schedule from kicking off a second pass while a previous pass is still
+// working its way through the sequential successors. Returns the name of the
+// first active run found for diagnostics.
+func (r *SympoziumScheduleReconciler) pipelineInFlight(ctx context.Context, namespace, ensembleName string) (string, bool, error) {
+	var runs sympoziumv1alpha1.AgentRunList
+	if err := r.List(ctx, &runs,
+		client.InNamespace(namespace),
+		client.MatchingLabels{"sympozium.ai/ensemble": ensembleName},
+	); err != nil {
+		return "", false, err
+	}
+	for i := range runs.Items {
+		switch runs.Items[i].Status.Phase {
+		case sympoziumv1alpha1.AgentRunPhaseRunning,
+			sympoziumv1alpha1.AgentRunPhasePending,
+			sympoziumv1alpha1.AgentRunPhaseServing,
+			"":
+			return runs.Items[i].Name, true, nil
+		}
+	}
+	return "", false, nil
 }
 
 // readMemoryConfigMap reads the MEMORY.md content from the instance's memory
