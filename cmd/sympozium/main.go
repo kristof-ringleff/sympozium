@@ -2823,6 +2823,12 @@ func (m tuiModel) buildConversationContext(instName string) string {
 			sb.WriteString(fmt.Sprintf("Assistant: %s\n", r.Status.Result))
 		} else if phase == "Failed" {
 			sb.WriteString(fmt.Sprintf("Assistant: [error: %s]\n", r.Status.Error))
+		} else if phase == "Skipped" {
+			reason := r.Status.Result
+			if reason == "" {
+				reason = "no work to do"
+			}
+			sb.WriteString(fmt.Sprintf("Assistant: [skipped: %s]\n", reason))
 		} else {
 			sb.WriteString("Assistant: [pending]\n")
 		}
@@ -7369,6 +7375,8 @@ func (m tuiModel) renderDetailSkillRuns(width, height int) string {
 		switch phase {
 		case "Succeeded", "Completed":
 			phaseStyle = tuiSuccessStyle
+		case "Skipped":
+			phaseStyle = tuiDimStyle
 		case "Running":
 			phaseStyle = tuiRunningStyle
 		case "Failed", "Timeout":
@@ -7585,6 +7593,14 @@ func (m tuiModel) renderDetailFeed(width, height int) string {
 				allLines = append(allLines, tuiDimStyle.Render(fmt.Sprintf("   ⟠ %d in / %d out │ %d tools │ %dms",
 					u.InputTokens, u.OutputTokens, u.ToolCalls, u.DurationMs)))
 			}
+		case "Skipped":
+			skipMsg := run.Status.Result
+			if skipMsg == "" {
+				skipMsg = "Skipped"
+			}
+			for _, wl := range wrapText(skipMsg, contentW) {
+				allLines = append(allLines, tuiDimStyle.Render("   ⊘ "+wl))
+			}
 		case "Running":
 			allLines = append(allLines, tuiRunningStyle.Render("   ⏳ Running..."))
 		case "PostRunning":
@@ -7720,6 +7736,14 @@ func (m tuiModel) renderDetailPaneFullscreen() string {
 					}
 				} else {
 					allLines = append(allLines, tuiSuccessStyle.Render("   ✓ Completed"))
+				}
+			case "Skipped":
+				skipMsg := run.Status.Result
+				if skipMsg == "" {
+					skipMsg = "Skipped"
+				}
+				for _, wl := range wrapText(skipMsg, contentW) {
+					allLines = append(allLines, tuiDimStyle.Render("   ⊘ "+wl))
 				}
 			case "Running":
 				allLines = append(allLines, tuiRunningStyle.Render("   ⏳ Running..."))

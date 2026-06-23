@@ -877,7 +877,11 @@ func (r *AgentRunReconciler) reconcileAwaitingDelegate(ctx context.Context, log 
 					agentRun.Status.Delegates[i].Error = childRun.Status.Error
 				}
 			}
-			if childRun.Status.Phase == sympoziumv1alpha1.AgentRunPhaseSucceeded {
+			// Succeeded and Skipped both surface their text via Status.Result —
+			// a skipped delegate stores its skip reason there, so propagate it to
+			// the parent entry rather than dropping it.
+			if childRun.Status.Phase == sympoziumv1alpha1.AgentRunPhaseSucceeded ||
+				childRun.Status.Phase == sympoziumv1alpha1.AgentRunPhaseSkipped {
 				if agentRun.Status.Delegates[i].Result == "" {
 					agentRun.Status.Delegates[i].Result = childRun.Status.Result
 				}
@@ -1106,10 +1110,12 @@ func (r *AgentRunReconciler) pruneOldRuns(ctx context.Context, log logr.Logger, 
 		return fmt.Errorf("listing runs for instance %s: %w", instanceRef, err)
 	}
 
-	// Collect only completed (Succeeded/Failed) runs.
+	// Collect only completed (Succeeded/Failed/Skipped) runs. Skipped runs are
+	// terminal too and accumulate fastest (this feature exists to skip often),
+	// so they must be eligible for history-limit pruning.
 	var completed []sympoziumv1alpha1.AgentRun
 	for _, run := range allRuns.Items {
-		if run.Status.Phase == "Succeeded" || run.Status.Phase == "Failed" {
+		if run.Status.Phase == "Succeeded" || run.Status.Phase == "Failed" || run.Status.Phase == "Skipped" {
 			completed = append(completed, run)
 		}
 	}

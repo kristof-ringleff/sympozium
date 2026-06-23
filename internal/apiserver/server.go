@@ -3411,10 +3411,10 @@ func (s *Server) getGatewayMetrics(w http.ResponseWriter, r *http.Request) {
 
 		resp.TotalRequests++
 		isFailed := run.Status.Phase == sympoziumv1alpha1.AgentRunPhaseFailed
-		switch run.Status.Phase {
-		case sympoziumv1alpha1.AgentRunPhaseFailed:
+		switch {
+		case isFailed:
 			resp.ErrorCount++
-		case sympoziumv1alpha1.AgentRunPhaseSkipped:
+		case run.Status.Phase == sympoziumv1alpha1.AgentRunPhaseSkipped:
 			resp.SkippedCount++
 		default:
 			resp.SuccessCount++

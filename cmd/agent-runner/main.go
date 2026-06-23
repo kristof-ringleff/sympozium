@@ -106,7 +106,7 @@ func effectiveRunTimeout(provider string) time.Duration {
 }
 
 type agentResult struct {
-	Status   string `json:"status"`
+	Status   string `json:"status"` // "success", "error", or "skipped" (see ipc.ResultStatusSkipped)
 	Response string `json:"response,omitempty"`
 	Error    string `json:"error,omitempty"`
 	Metrics  struct {
@@ -131,7 +131,7 @@ func main() {
 	// /ipc volume to signal there is no work to do. Short-circuit before the
 	// LLM call (and before the empty-TASK guard below) so the run spends no
 	// tokens; the controller marks the AgentRun as Skipped.
-	if reason, skip := readSkipMarker(); skip {
+	if reason, skip := readSkipMarker(ipc.SkipMarkerPath); skip {
 		log.Printf("SKIP mode — preRun hook requested skip: %s", reason)
 		// Brief pause to let the ipc-bridge sidecar set up its fsnotify
 		// watches on /ipc/output/ before we write the result and exit.
@@ -594,10 +594,10 @@ func getEnv(key, fallback string) string {
 }
 
 // readSkipMarker reports whether a preRun hook requested the run be skipped by
-// writing ipc.SkipMarkerPath on the shared /ipc volume. The trimmed file
+// writing the skip marker at path on the shared /ipc volume. The trimmed file
 // contents are returned as the human-readable skip reason.
-func readSkipMarker() (string, bool) {
-	b, err := os.ReadFile(ipc.SkipMarkerPath)
+func readSkipMarker(path string) (string, bool) {
+	b, err := os.ReadFile(path)
 	if err != nil {
 		return "", false
 	}

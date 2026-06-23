@@ -37,7 +37,7 @@ type ModelConfig struct {
 
 // AgentResult is written to /ipc/output/result.json by the agent on completion.
 type AgentResult struct {
-	Status   string `json:"status"` // "success" or "error"
+	Status   string `json:"status"` // "success", "error", or "skipped" (see ResultStatusSkipped)
 	Response string `json:"response,omitempty"`
 	Error    string `json:"error,omitempty"`
 	Metrics  struct {
