@@ -426,6 +426,9 @@ type LifecycleHookContainer struct {
 	Args []string `json:"args,omitempty"`
 
 	// Env is a list of environment variables for this hook container.
+	// Each entry may carry a literal value or source it from a Secret key via
+	// valueFrom.secretKeyRef, allowing hooks to authenticate to private
+	// sources (e.g. a GitHub PAT) without embedding plaintext credentials.
 	// +optional
 	Env []EnvVar `json:"env,omitempty"`
 

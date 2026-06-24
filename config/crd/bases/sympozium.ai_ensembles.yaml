@@ -201,19 +201,52 @@ spec:
                                   type: string
                                 type: array
                               env:
-                                description: Env is a list of environment variables
-                                  for this hook container.
+                                description: |-
+                                  Env is a list of environment variables for this hook container.
+                                  Each entry may carry a literal value or source it from a Secret key via
+                                  valueFrom.secretKeyRef, allowing hooks to authenticate to private
+                                  sources (e.g. a GitHub PAT) without embedding plaintext credentials.
                                 items:
-                                  description: EnvVar is a simplified environment
-                                    variable (name + value).
+                                  description: |-
+                                    EnvVar is a simplified environment variable. The value is either supplied
+                                    literally via Value or sourced from a Secret via ValueFrom. The two are
+                                    mutually exclusive.
                                   properties:
                                     name:
                                       type: string
                                     value:
+                                      description: Value is a literal environment
+                                        variable value.
                                       type: string
+                                    valueFrom:
+                                      description: |-
+                                        ValueFrom sources the value from outside the spec, e.g. a Secret key.
+                                        When set, Value must be empty.
+                                      properties:
+                                        secretKeyRef:
+                                          description: SecretKeyRef selects a single
+                                            key of a Secret in the AgentRun namespace.
+                                          properties:
+                                            key:
+                                              description: Key is the key within the
+                                                Secret's data to expose.
+                                              type: string
+                                            name:
+                                              description: Name is the name of the
+                                                Secret in the AgentRun namespace.
+                                              type: string
+                                            optional:
+                                              description: |-
+                                                Optional, when true, allows the Secret or key to be absent without
+                                                failing pod startup.
+                                              type: boolean
+                                          required:
+                                          - key
+                                          - name
+                                          type: object
+                                      type: object
                                   required:
                                   - name
-                                  - value
                                   type: object
                                 type: array
                               gate:
@@ -267,19 +300,52 @@ spec:
                                   type: string
                                 type: array
                               env:
-                                description: Env is a list of environment variables
-                                  for this hook container.
+                                description: |-
+                                  Env is a list of environment variables for this hook container.
+                                  Each entry may carry a literal value or source it from a Secret key via
+                                  valueFrom.secretKeyRef, allowing hooks to authenticate to private
+                                  sources (e.g. a GitHub PAT) without embedding plaintext credentials.
                                 items:
-                                  description: EnvVar is a simplified environment
-                                    variable (name + value).
+                                  description: |-
+                                    EnvVar is a simplified environment variable. The value is either supplied
+                                    literally via Value or sourced from a Secret via ValueFrom. The two are
+                                    mutually exclusive.
                                   properties:
                                     name:
                                       type: string
                                     value:
+                                      description: Value is a literal environment
+                                        variable value.
                                       type: string
+                                    valueFrom:
+                                      description: |-
+                                        ValueFrom sources the value from outside the spec, e.g. a Secret key.
+                                        When set, Value must be empty.
+                                      properties:
+                                        secretKeyRef:
+                                          description: SecretKeyRef selects a single
+                                            key of a Secret in the AgentRun namespace.
+                                          properties:
+                                            key:
+                                              description: Key is the key within the
+                                                Secret's data to expose.
+                                              type: string
+                                            name:
+                                              description: Name is the name of the
+                                                Secret in the AgentRun namespace.
+                                              type: string
+                                            optional:
+                                              description: |-
+                                                Optional, when true, allows the Secret or key to be absent without
+                                                failing pod startup.
+                                              type: boolean
+                                          required:
+                                          - key
+                                          - name
+                                          type: object
+                                      type: object
                                   required:
                                   - name
-                                  - value
                                   type: object
                                 type: array
                               gate:

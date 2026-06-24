@@ -1233,7 +1233,7 @@ func (r *AgentRunReconciler) reconcilePendingServer(ctx context.Context, log log
 	// Build env vars for the web-proxy container.
 	var envVars []corev1.EnvVar
 	for _, e := range serverSidecar.sidecar.Env {
-		envVars = append(envVars, corev1.EnvVar{Name: e.Name, Value: e.Value})
+		envVars = append(envVars, toCoreEnvVar(e))
 	}
 	envVars = append(envVars,
 		corev1.EnvVar{Name: "INSTANCE_NAME", Value: agentRun.Spec.AgentRef},
@@ -2256,7 +2256,7 @@ func (r *AgentRunReconciler) buildContainers(
 			Value: sc.skillPackName,
 		})
 		for _, e := range sc.sidecar.Env {
-			envVars = append(envVars, corev1.EnvVar{Name: e.Name, Value: e.Value})
+			envVars = append(envVars, toCoreEnvVar(e))
 		}
 
 		mounts := []corev1.VolumeMount{
@@ -2436,7 +2436,7 @@ func (r *AgentRunReconciler) buildContainers(
 				hookContainer.Args = hook.Args
 			}
 			for _, e := range hook.Env {
-				hookContainer.Env = append(hookContainer.Env, corev1.EnvVar{Name: e.Name, Value: e.Value})
+				hookContainer.Env = append(hookContainer.Env, toCoreEnvVar(e))
 			}
 			// Forward custom env vars from spec.env.
 			for _, k := range envKeys {
@@ -2447,6 +2447,26 @@ func (r *AgentRunReconciler) buildContainers(
 	}
 
 	return containers, initContainers
+}
+
+// toCoreEnvVar converts a simplified API EnvVar into a corev1.EnvVar, honoring
+// an optional secretKeyRef source so hooks and sidecars can consume Secret
+// values without embedding plaintext credentials in the spec.
+func toCoreEnvVar(e sympoziumv1alpha1.EnvVar) corev1.EnvVar {
+	if e.ValueFrom != nil && e.ValueFrom.SecretKeyRef != nil {
+		ref := e.ValueFrom.SecretKeyRef
+		return corev1.EnvVar{
+			Name: e.Name,
+			ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: ref.Name},
+					Key:                  ref.Key,
+					Optional:             ref.Optional,
+				},
+			},
+		}
+	}
+	return corev1.EnvVar{Name: e.Name, Value: e.Value}
 }
 
 func buildObservabilityEnv(agentRun *sympoziumv1alpha1.AgentRun, obs *sympoziumv1alpha1.ObservabilitySpec) []corev1.EnvVar {
@@ -4225,7 +4245,7 @@ func (r *AgentRunReconciler) buildPostRunJob(
 		hookEnv := make([]corev1.EnvVar, len(baseEnv))
 		copy(hookEnv, baseEnv)
 		for _, e := range hook.Env {
-			hookEnv = append(hookEnv, corev1.EnvVar{Name: e.Name, Value: e.Value})
+			hookEnv = append(hookEnv, toCoreEnvVar(e))
 		}
 		if hook.Gate {
 			hookEnv = append(hookEnv, corev1.EnvVar{Name: "GATE_MODE", Value: "true"})

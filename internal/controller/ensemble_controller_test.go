@@ -93,6 +93,39 @@ func TestBuildInstance_ChannelAccessControlPrecedence(t *testing.T) {
 	}
 }
 
+func TestIsPipelineSuccessor(t *testing.T) {
+	rels := []sympoziumv1alpha1.AgentConfigRelationship{
+		{Source: "ops-check", Target: "incident-responder", Type: "stimulus"},
+		{Source: "incident-responder", Target: "cost-analyzer", Type: "sequential"},
+	}
+	tests := []struct {
+		name         string
+		workflowType string
+		persona      string
+		want         bool
+	}{
+		{"sequential target in pipeline is suppressed", "pipeline", "cost-analyzer", true},
+		{"sequential source (pipeline head) keeps its schedule", "pipeline", "incident-responder", false},
+		{"stimulus target is not a sequential successor", "pipeline", "incident-responder", false},
+		{"sequential target outside pipeline mode is not suppressed", "autonomous", "cost-analyzer", false},
+		{"empty workflowType defaults to not-suppressed", "", "cost-analyzer", false},
+		{"unrelated persona is not suppressed", "pipeline", "some-other-agent", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pack := &sympoziumv1alpha1.Ensemble{
+				Spec: sympoziumv1alpha1.EnsembleSpec{
+					WorkflowType:  tt.workflowType,
+					Relationships: rels,
+				},
+			}
+			if got := isPipelineSuccessor(pack, tt.persona); got != tt.want {
+				t.Errorf("isPipelineSuccessor(%q, %q) = %v, want %v", tt.workflowType, tt.persona, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestBuildInstance_SubagentsPropagated(t *testing.T) {
 	r := &EnsembleReconciler{}
 	pack := &sympoziumv1alpha1.Ensemble{
@@ -167,7 +200,7 @@ func TestValidateRelationshipGraph_NoCycle(t *testing.T) {
 		{Source: "a", Target: "b", Type: "sequential"},
 		{Source: "b", Target: "c", Type: "sequential"},
 	}
-	if err := validateRelationshipGraph(personas, rels, nil); err != nil {
+	if err := validateRelationshipGraph(personas, rels, nil, ""); err != nil {
 		t.Errorf("expected no error for linear pipeline, got: %v", err)
 	}
 }
@@ -179,7 +212,7 @@ func TestValidateRelationshipGraph_Cycle(t *testing.T) {
 		{Source: "b", Target: "c", Type: "sequential"},
 		{Source: "c", Target: "a", Type: "sequential"},
 	}
-	err := validateRelationshipGraph(personas, rels, nil)
+	err := validateRelationshipGraph(personas, rels, nil, "")
 	if err == nil {
 		t.Fatal("expected cycle error")
 	}
@@ -193,7 +226,7 @@ func TestValidateRelationshipGraph_SelfLoop(t *testing.T) {
 	rels := []sympoziumv1alpha1.AgentConfigRelationship{
 		{Source: "a", Target: "a", Type: "sequential"},
 	}
-	err := validateRelationshipGraph(personas, rels, nil)
+	err := validateRelationshipGraph(personas, rels, nil, "")
 	if err == nil {
 		t.Fatal("expected cycle error for self-loop")
 	}
@@ -204,7 +237,7 @@ func TestValidateRelationshipGraph_DanglingRef(t *testing.T) {
 	rels := []sympoziumv1alpha1.AgentConfigRelationship{
 		{Source: "a", Target: "nonexistent", Type: "sequential"},
 	}
-	err := validateRelationshipGraph(personas, rels, nil)
+	err := validateRelationshipGraph(personas, rels, nil, "")
 	if err == nil {
 		t.Fatal("expected error for dangling reference")
 	}
@@ -219,14 +252,14 @@ func TestValidateRelationshipGraph_IgnoresNonSequential(t *testing.T) {
 		{Source: "a", Target: "b", Type: "delegation"},
 		{Source: "b", Target: "a", Type: "supervision"},
 	}
-	if err := validateRelationshipGraph(personas, rels, nil); err != nil {
+	if err := validateRelationshipGraph(personas, rels, nil, ""); err != nil {
 		t.Errorf("non-sequential edges should not trigger cycle detection, got: %v", err)
 	}
 }
 
 func TestValidateRelationshipGraph_EmptyRelationships(t *testing.T) {
 	personas := testPersonas("a", "b")
-	if err := validateRelationshipGraph(personas, nil, nil); err != nil {
+	if err := validateRelationshipGraph(personas, nil, nil, ""); err != nil {
 		t.Errorf("empty relationships should pass, got: %v", err)
 	}
 }
@@ -243,7 +276,7 @@ func TestValidateRelationshipGraph_StimulusValid(t *testing.T) {
 		{Source: "kickoff", Target: "lead", Type: "stimulus"},
 		{Source: "lead", Target: "worker", Type: "sequential"},
 	}
-	if err := validateRelationshipGraph(personas, rels, stimulus); err != nil {
+	if err := validateRelationshipGraph(personas, rels, stimulus, ""); err != nil {
 		t.Errorf("expected valid stimulus config, got: %v", err)
 	}
 }
@@ -253,7 +286,7 @@ func TestValidateRelationshipGraph_StimulusNoSpec(t *testing.T) {
 	rels := []sympoziumv1alpha1.AgentConfigRelationship{
 		{Source: "kickoff", Target: "lead", Type: "stimulus"},
 	}
-	err := validateRelationshipGraph(personas, rels, nil)
+	err := validateRelationshipGraph(personas, rels, nil, "")
 	if err == nil {
 		t.Fatal("expected error when stimulus relationship exists without spec")
 	}
@@ -271,7 +304,7 @@ func TestValidateRelationshipGraph_StimulusNoRelationship(t *testing.T) {
 	rels := []sympoziumv1alpha1.AgentConfigRelationship{
 		{Source: "lead", Target: "lead", Type: "delegation"},
 	}
-	err := validateRelationshipGraph(personas, rels, stimulus)
+	err := validateRelationshipGraph(personas, rels, stimulus, "")
 	if err == nil {
 		t.Fatal("expected error when stimulus spec exists without relationship")
 	}
@@ -289,7 +322,7 @@ func TestValidateRelationshipGraph_StimulusEmptyPrompt(t *testing.T) {
 	rels := []sympoziumv1alpha1.AgentConfigRelationship{
 		{Source: "kickoff", Target: "lead", Type: "stimulus"},
 	}
-	err := validateRelationshipGraph(personas, rels, stimulus)
+	err := validateRelationshipGraph(personas, rels, stimulus, "")
 	if err == nil {
 		t.Fatal("expected error for empty stimulus prompt")
 	}
@@ -307,7 +340,7 @@ func TestValidateRelationshipGraph_StimulusSourceMismatch(t *testing.T) {
 	rels := []sympoziumv1alpha1.AgentConfigRelationship{
 		{Source: "wrong-name", Target: "lead", Type: "stimulus"},
 	}
-	err := validateRelationshipGraph(personas, rels, stimulus)
+	err := validateRelationshipGraph(personas, rels, stimulus, "")
 	if err == nil {
 		t.Fatal("expected error when stimulus source doesn't match name")
 	}
@@ -325,7 +358,7 @@ func TestValidateRelationshipGraph_StimulusDanglingTarget(t *testing.T) {
 	rels := []sympoziumv1alpha1.AgentConfigRelationship{
 		{Source: "kickoff", Target: "nonexistent", Type: "stimulus"},
 	}
-	err := validateRelationshipGraph(personas, rels, stimulus)
+	err := validateRelationshipGraph(personas, rels, stimulus, "")
 	if err == nil {
 		t.Fatal("expected error for dangling stimulus target")
 	}
@@ -344,7 +377,7 @@ func TestValidateRelationshipGraph_MultipleStimulusRelationships(t *testing.T) {
 		{Source: "kickoff", Target: "lead", Type: "stimulus"},
 		{Source: "kickoff", Target: "worker", Type: "stimulus"},
 	}
-	err := validateRelationshipGraph(personas, rels, stimulus)
+	err := validateRelationshipGraph(personas, rels, stimulus, "")
 	if err == nil {
 		t.Fatal("expected error for multiple stimulus relationships")
 	}
@@ -547,6 +580,54 @@ func TestBuildChannelSpec_SlackOptionsPrecedence(t *testing.T) {
 			}
 			if cs.Slack != tt.want {
 				t.Fatalf("Slack = %+v, want %+v", cs.Slack, tt.want)
+			}
+		})
+	}
+}
+
+// ── workflowType ⇄ relationship-edge consistency ───────────────────────────
+
+func TestValidateRelationshipGraph_WorkflowTypeConsistency(t *testing.T) {
+	personas := testPersonas("a", "b")
+	seqEdge := []sympoziumv1alpha1.AgentConfigRelationship{
+		{Source: "a", Target: "b", Type: "sequential"},
+	}
+	delEdge := []sympoziumv1alpha1.AgentConfigRelationship{
+		{Source: "a", Target: "b", Type: "delegation"},
+	}
+	supEdge := []sympoziumv1alpha1.AgentConfigRelationship{
+		{Source: "a", Target: "b", Type: "supervision"},
+	}
+
+	tests := []struct {
+		name         string
+		workflowType string
+		rels         []sympoziumv1alpha1.AgentConfigRelationship
+		wantErr      string // substring; "" means expect success
+	}{
+		{"pipeline with sequential edge ok", "pipeline", seqEdge, ""},
+		{"pipeline without sequential edge errors", "pipeline", delEdge, "requires at least one sequential"},
+		{"pipeline with no edges errors", "pipeline", nil, "requires at least one sequential"},
+		{"delegation with delegation edge ok", "delegation", delEdge, ""},
+		{"delegation without delegation edge errors", "delegation", supEdge, "requires at least one delegation"},
+		{"delegation with no edges errors", "delegation", nil, "requires at least one delegation"},
+		{"autonomous needs no edges", "autonomous", nil, ""},
+		{"empty workflowType needs no edges", "", nil, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateRelationshipGraph(personas, tt.rels, nil, tt.workflowType)
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("expected success, got: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("expected error containing %q, got nil", tt.wantErr)
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Errorf("error = %q, want substring %q", err.Error(), tt.wantErr)
 			}
 		})
 	}

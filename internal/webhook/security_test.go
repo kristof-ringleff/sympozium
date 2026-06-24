@@ -158,6 +158,127 @@ func TestPolicyEnforcer_DeniesDisallowedLifecycleImage(t *testing.T) {
 	}
 }
 
+func TestPolicyEnforcer_DeniesHookEnvValueAndValueFrom(t *testing.T) {
+	scheme := newTestScheme(t)
+	instance := newTestInstance("inst", "default", "p")
+	policy := &sympoziumv1alpha1.SympoziumPolicy{
+		ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: "default"},
+	}
+
+	run := &sympoziumv1alpha1.AgentRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "r", Namespace: "default"},
+		Spec: sympoziumv1alpha1.AgentRunSpec{
+			AgentRef: "inst",
+			Task:     "x",
+			Lifecycle: &sympoziumv1alpha1.LifecycleHooks{
+				PreRun: []sympoziumv1alpha1.LifecycleHookContainer{
+					{
+						Name:  "fetch",
+						Image: "busybox:1.36",
+						Env: []sympoziumv1alpha1.EnvVar{
+							{
+								Name:  "TOKEN",
+								Value: "plaintext",
+								ValueFrom: &sympoziumv1alpha1.EnvVarSource{
+									SecretKeyRef: &sympoziumv1alpha1.SecretKeySelector{Name: "s", Key: "k"},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(instance, policy).Build()
+	pe := &PolicyEnforcer{Client: cl, Log: logr.Discard(), Decoder: decoderFor(t, scheme)}
+
+	resp := pe.Handle(context.Background(), admissionCreateRequest(t, run))
+	if resp.Allowed {
+		t.Fatal("expected webhook to DENY hook env that sets both value and valueFrom")
+	}
+}
+
+func TestPolicyEnforcer_DeniesHookEnvIncompleteSecretKeyRef(t *testing.T) {
+	scheme := newTestScheme(t)
+	instance := newTestInstance("inst", "default", "p")
+	policy := &sympoziumv1alpha1.SympoziumPolicy{
+		ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: "default"},
+	}
+
+	run := &sympoziumv1alpha1.AgentRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "r", Namespace: "default"},
+		Spec: sympoziumv1alpha1.AgentRunSpec{
+			AgentRef: "inst",
+			Task:     "x",
+			Lifecycle: &sympoziumv1alpha1.LifecycleHooks{
+				PreRun: []sympoziumv1alpha1.LifecycleHookContainer{
+					{
+						Name:  "fetch",
+						Image: "busybox:1.36",
+						Env: []sympoziumv1alpha1.EnvVar{
+							{
+								Name: "TOKEN",
+								ValueFrom: &sympoziumv1alpha1.EnvVarSource{
+									SecretKeyRef: &sympoziumv1alpha1.SecretKeySelector{Name: "s"},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(instance, policy).Build()
+	pe := &PolicyEnforcer{Client: cl, Log: logr.Discard(), Decoder: decoderFor(t, scheme)}
+
+	resp := pe.Handle(context.Background(), admissionCreateRequest(t, run))
+	if resp.Allowed {
+		t.Fatal("expected webhook to DENY secretKeyRef missing key")
+	}
+}
+
+func TestPolicyEnforcer_AllowsHookEnvSecretKeyRef(t *testing.T) {
+	scheme := newTestScheme(t)
+	instance := newTestInstance("inst", "default", "p")
+	policy := &sympoziumv1alpha1.SympoziumPolicy{
+		ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: "default"},
+	}
+
+	run := &sympoziumv1alpha1.AgentRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "r", Namespace: "default"},
+		Spec: sympoziumv1alpha1.AgentRunSpec{
+			AgentRef: "inst",
+			Task:     "x",
+			Lifecycle: &sympoziumv1alpha1.LifecycleHooks{
+				PreRun: []sympoziumv1alpha1.LifecycleHookContainer{
+					{
+						Name:  "fetch",
+						Image: "busybox:1.36",
+						Env: []sympoziumv1alpha1.EnvVar{
+							{
+								Name: "TOKEN",
+								ValueFrom: &sympoziumv1alpha1.EnvVarSource{
+									SecretKeyRef: &sympoziumv1alpha1.SecretKeySelector{Name: "gh-pat", Key: "token"},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(instance, policy).Build()
+	pe := &PolicyEnforcer{Client: cl, Log: logr.Discard(), Decoder: decoderFor(t, scheme)}
+
+	resp := pe.Handle(context.Background(), admissionCreateRequest(t, run))
+	if !resp.Allowed {
+		t.Fatalf("expected webhook to ALLOW valid hook secretKeyRef; got denied: %s", resp.Result.Message)
+	}
+}
+
 func TestPolicyEnforcer_AllowsAllowedLifecycleImage(t *testing.T) {
 	scheme := newTestScheme(t)
 	instance := newTestInstance("inst", "default", "image-policy")
