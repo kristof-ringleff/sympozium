@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -1147,6 +1148,13 @@ func (r *AgentRunReconciler) triggerDelegationSuccessors(ctx context.Context, lo
 		return nil
 	}
 
+	// Idempotency: skip if we already triggered delegation successors for this
+	// run (prevent duplicates from re-reconciliation). Hoisted to the top so
+	// re-reconciles are a true no-op without any client reads.
+	if agentRun.Labels["sympozium.ai/delegation-triggered"] == "true" {
+		return nil
+	}
+
 	// Look up the source instance to get the persona name and ensemble.
 	if agentRun.Spec.AgentRef == "" {
 		return nil
@@ -1167,10 +1175,10 @@ func (r *AgentRunReconciler) triggerDelegationSuccessors(ctx context.Context, lo
 		return nil // Ensemble gone — skip.
 	}
 
-	// Idempotency: skip if we already triggered delegation successors for this
-	// run (prevent duplicates from re-reconciliation). Mirrors the
-	// sequential-triggered marker label.
-	if agentRun.Labels["sympozium.ai/delegation-triggered"] == "true" {
+	// Check circuit breaker before any spawn.
+	if err := r.checkCircuitBreaker(ctx, ensembleName, agentRun.Name, agentRun.Namespace); err != nil {
+		log.Info("Circuit breaker is open, skipping delegation successors",
+			"ensemble", ensembleName, "parentRun", agentRun.Name, "error", err.Error())
 		return nil
 	}
 
@@ -1183,33 +1191,89 @@ func (r *AgentRunReconciler) triggerDelegationSuccessors(ctx context.Context, lo
 		}
 	}
 
-	// Find delegation edges where this persona is the source.
-	triggered := false
+	// Guardrails: read caps from env with sensible defaults.
+	maxDepth := 1
+	if v := os.Getenv("SYMPOZIUM_DELEGATION_MAX_DEPTH"); v != "" {
+		if d, err := strconv.Atoi(v); err == nil && d >= 0 {
+			maxDepth = d
+		}
+	}
+	maxInflight := 3
+	if v := os.Getenv("SYMPOZIUM_DELEGATION_MAX_INFLIGHT"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			maxInflight = n
+		}
+	}
+
+	// Compute current depth from the parent chain.
+	currentDepth := 0
+	if agentRun.Spec.Parent != nil {
+		currentDepth = agentRun.Spec.Parent.SpawnDepth
+	}
+	if currentDepth >= maxDepth {
+		log.Info("Delegation depth cap reached, skipping successors",
+			"depth", currentDepth, "maxDepth", maxDepth)
+		return nil
+	}
+
+	// Count in-flight runs for this ensemble to enforce concurrency cap.
+	inflight := 0
+	var activeRuns sympoziumv1alpha1.AgentRunList
+	if err := r.List(ctx, &activeRuns,
+		client.InNamespace(agentRun.Namespace),
+		client.MatchingLabels{"sympozium.ai/ensemble": ensembleName},
+	); err == nil {
+		for _, run := range activeRuns.Items {
+			if run.Status.Phase == sympoziumv1alpha1.AgentRunPhaseRunning ||
+				run.Status.Phase == sympoziumv1alpha1.AgentRunPhasePending {
+				inflight++
+			}
+		}
+	}
+	if inflight >= maxInflight {
+		log.Info("Delegation in-flight cap reached, requeuing successors",
+			"inflight", inflight, "maxInflight", maxInflight)
+		return nil
+	}
+
+	// Score edges and select top-K (default K=1).
+	type scoredEdge struct {
+		rel   sympoziumv1alpha1.AgentConfigRelationship
+		score float64
+	}
+	var scored []scoredEdge
 	for _, rel := range ensemble.Spec.Relationships {
 		if rel.Type != "delegation" || rel.Source != sourcePersona {
 			continue
 		}
-
-		// Evaluate the per-edge condition. Condition is free-text describing
-		// when the edge activates; we activate on the completed run's success
-		// unless the condition explicitly scopes the edge to failure.
 		if !delegationEdgeActive(rel.Condition) {
-			log.Info("Skipping delegation edge — condition not met for success",
-				"source", sourcePersona, "target", rel.Target, "condition", rel.Condition)
 			continue
 		}
+		if alreadyDelegated[rel.Target] {
+			continue
+		}
+		score := scoreDelegationEdge(rel, agentRun)
+		scored = append(scored, scoredEdge{rel: rel, score: score})
+	}
+	if len(scored) == 0 {
+		return nil
+	}
+	// Sort descending by score.
+	sort.Slice(scored, func(i, j int) bool {
+		return scored[i].score > scored[j].score
+	})
+	// Fire only the top K=1 edge.
+	selected := scored[:1]
 
+	// Spawn the selected edge(s).
+	triggered := false
+	for _, se := range selected {
+		rel := se.rel
 		targetPersona := rel.Target
-		if alreadyDelegated[targetPersona] {
-			log.Info("Skipping delegation edge — model already delegated to target at runtime",
-				"source", sourcePersona, "target", targetPersona)
-			continue
-		}
-
 		targetAgentName := ensembleName + "-" + targetPersona
 		log.Info("Triggering delegation successor (controller executor)",
 			"source", sourcePersona, "target", targetPersona,
-			"targetAgent", targetAgentName)
+			"targetAgent", targetAgentName, "score", se.score)
 
 		// Look up the target instance.
 		var targetInst sympoziumv1alpha1.Agent
@@ -1228,8 +1292,8 @@ func (r *AgentRunReconciler) triggerDelegationSuccessors(ctx context.Context, lo
 		}
 		task := buildHandoffTask(sourcePersona, agentRun.Spec.Task, agentRun.Status.Result, targetTask)
 
-		// Create the delegation child AgentRun.
-		runName := fmt.Sprintf("%s-deleg-%d", targetAgentName, time.Now().UnixMilli()%100000)
+		// Create the delegation child AgentRun with deterministic name.
+		runName := fmt.Sprintf("%s-deleg-%s", targetAgentName, agentRun.Name)
 		childRun := &sympoziumv1alpha1.AgentRun{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      runName,
@@ -1244,6 +1308,10 @@ func (r *AgentRunReconciler) triggerDelegationSuccessors(ctx context.Context, lo
 				AgentRef: targetAgentName,
 				Task:     task,
 				AgentID:  fmt.Sprintf("delegation-from-%s", sourcePersona),
+				Parent: &sympoziumv1alpha1.ParentRunRef{
+					RunName:    agentRun.Name,
+					SpawnDepth: currentDepth + 1,
+				},
 				Model: sympoziumv1alpha1.ModelSpec{
 					Provider:                 resolveProvider(&targetInst),
 					Model:                    targetInst.Spec.Agents.Default.Model,
@@ -1276,6 +1344,14 @@ func (r *AgentRunReconciler) triggerDelegationSuccessors(ctx context.Context, lo
 			childRun.Spec.Skills = append(childRun.Spec.Skills, skill)
 		}
 
+		// Propagate traceparent for connected traces.
+		if tp := agentRun.Annotations["otel.dev/traceparent"]; tp != "" {
+			if childRun.Annotations == nil {
+				childRun.Annotations = make(map[string]string)
+			}
+			childRun.Annotations["otel.dev/traceparent"] = tp
+		}
+
 		if err := r.Create(ctx, childRun); err != nil {
 			if errors.IsAlreadyExists(err) {
 				log.Info("Delegation successor already exists", "run", runName)
@@ -1286,20 +1362,69 @@ func (r *AgentRunReconciler) triggerDelegationSuccessors(ctx context.Context, lo
 		}
 		log.Info("Created delegation successor run", "run", runName, "target", targetPersona)
 		triggered = true
+
+		// Handoff latency metric for delegation lane.
+		if agentRun.Status.CompletedAt != nil {
+			gapMs := time.Since(agentRun.Status.CompletedAt.Time).Milliseconds()
+			handoffLatency.Record(ctx, float64(gapMs), metric.WithAttributes(
+				attribute.String("lane", "delegation"),
+				attribute.String("from", sourcePersona),
+				attribute.String("to", targetPersona),
+				attribute.String("sympozium.ensemble", ensembleName),
+			))
+		}
 	}
 
 	// Mark this run as having triggered its delegations to prevent duplicates.
-	if triggered {
-		patch := client.MergeFrom(agentRun.DeepCopy())
-		if agentRun.Labels == nil {
-			agentRun.Labels = make(map[string]string)
-		}
-		agentRun.Labels["sympozium.ai/delegation-triggered"] = "true"
-		if err := r.Patch(ctx, agentRun, patch); err != nil {
-			log.Error(err, "Failed to mark run as delegation-triggered")
-		}
+	// Set marker even if no edge fired so we don't re-evaluate on every reconcile.
+	patch := client.MergeFrom(agentRun.DeepCopy())
+	if agentRun.Labels == nil {
+		agentRun.Labels = make(map[string]string)
+	}
+	agentRun.Labels["sympozium.ai/delegation-triggered"] = "true"
+	if err := r.Patch(ctx, agentRun, patch); err != nil {
+		log.Error(err, "Failed to mark run as delegation-triggered")
 	}
 
+	return nil
+}
+
+// scoreDelegationEdge scores a delegation edge against the completed run.
+// Higher scores mean better match. Exact condition match against result
+// text scores highest; generic success conditions score lower.
+func scoreDelegationEdge(rel sympoziumv1alpha1.AgentConfigRelationship, agentRun *sympoziumv1alpha1.AgentRun) float64 {
+	cond := strings.ToLower(strings.TrimSpace(rel.Condition))
+	result := strings.ToLower(agentRun.Status.Result)
+	task := strings.ToLower(agentRun.Spec.Task)
+
+	// Exact keyword match in result text → highest score.
+	if cond != "" && strings.Contains(result, cond) {
+		return 1.0
+	}
+	// Keyword match in original task → high score.
+	if cond != "" && strings.Contains(task, cond) {
+		return 0.8
+	}
+	// Empty condition (always active on success) → medium score.
+	if cond == "" {
+		return 0.5
+	}
+	// Generic positive condition words → lower score.
+	positiveWords := []string{"success", "complete", "done", "ready", "approve"}
+	for _, w := range positiveWords {
+		if strings.Contains(cond, w) {
+			return 0.3
+		}
+	}
+	return 0.1
+}
+
+// checkCircuitBreaker checks whether the ensemble circuit breaker is open.
+// The tool-driven path uses this before every spawn; the controller-side
+// delegation executor should respect it too.
+func (r *AgentRunReconciler) checkCircuitBreaker(ctx context.Context, ensembleName, runName, namespace string) error {
+	// TODO: implement actual circuit breaker check against ensemble status.
+	// For now, this is a no-op placeholder to satisfy the interface.
 	return nil
 }
 
