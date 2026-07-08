@@ -321,35 +321,24 @@ func (r *EnsembleReconciler) reconcileAgentConfig(
 			needsUpdate = true
 		}
 
-		// Propagate authRefs changes.
-		if !authRefsEqual(existingInst.Spec.AuthRefs, pack.Spec.AuthRefs) {
-			existingInst.Spec.AuthRefs = pack.Spec.AuthRefs
+		// Propagate authRefs changes (filtered by persona provider).
+		wantAuthRefs := resolveAuthRefs(pack, persona, modelEndpoint)
+		if !authRefsEqual(existingInst.Spec.AuthRefs, wantAuthRefs) {
+			existingInst.Spec.AuthRefs = wantAuthRefs
 			needsUpdate = true
 		}
 
-		// Propagate model changes from persona definition.
-		if persona.Model != "" && existingInst.Spec.Agents.Default.Model != persona.Model {
-			existingInst.Spec.Agents.Default.Model = persona.Model
+		// Propagate model changes (with same defaults as buildAgent).
+		wantModel := resolveModel(pack, persona, modelEndpoint)
+		if existingInst.Spec.Agents.Default.Model != wantModel {
+			existingInst.Spec.Agents.Default.Model = wantModel
 			needsUpdate = true
 		}
 
 		// Propagate baseURL changes (e.g. switching to/from a local provider).
-		// Per-persona baseURL overrides take precedence, then modelRef, then ensemble-level.
-		wantBaseURL := pack.Spec.BaseURL
-		if modelEndpoint != "" {
-			wantBaseURL = modelEndpoint
-		}
-		if persona.BaseURL != "" {
-			wantBaseURL = persona.BaseURL
-		}
+		wantBaseURL := resolveBaseURL(pack, persona, modelEndpoint)
 		if existingInst.Spec.Agents.Default.BaseURL != wantBaseURL {
 			existingInst.Spec.Agents.Default.BaseURL = wantBaseURL
-			needsUpdate = true
-		}
-
-		// When using a local model (and no per-persona provider override), clear auth refs.
-		if modelEndpoint != "" && persona.Provider == "" && len(existingInst.Spec.AuthRefs) > 0 {
-			existingInst.Spec.AuthRefs = nil
 			needsUpdate = true
 		}
 
@@ -424,10 +413,7 @@ func (r *EnsembleReconciler) reconcileAgentConfig(
 			existingInst.Spec.Agents.Default.ProviderHeaders = wantProviderHeaders
 			needsUpdate = true
 		}
-		wantHeadersSecretRef := pack.Spec.ProviderHeadersSecretRef
-		if persona.ProviderHeadersSecretRef != "" {
-			wantHeadersSecretRef = persona.ProviderHeadersSecretRef
-		}
+		wantHeadersSecretRef := resolveProviderHeadersSecretRef(pack, persona)
 		if existingInst.Spec.Agents.Default.ProviderHeadersSecretRef != wantHeadersSecretRef {
 			existingInst.Spec.Agents.Default.ProviderHeadersSecretRef = wantHeadersSecretRef
 			needsUpdate = true
@@ -461,6 +447,36 @@ func (r *EnsembleReconciler) reconcileAgentConfig(
 		// maxDepth, maxConcurrent, or maxChildrenPerAgent reach existing Agents.
 		if !reflect.DeepEqual(existingInst.Spec.Agents.Default.Subagents, persona.Subagents) {
 			existingInst.Spec.Agents.Default.Subagents = persona.Subagents
+			needsUpdate = true
+		}
+
+		// Propagate volumes from ensemble.
+		if !reflect.DeepEqual(existingInst.Spec.Volumes, pack.Spec.Volumes) {
+			existingInst.Spec.Volumes = pack.Spec.Volumes
+			needsUpdate = true
+		}
+
+		// Propagate volume mounts from ensemble.
+		if !reflect.DeepEqual(existingInst.Spec.VolumeMounts, pack.Spec.VolumeMounts) {
+			existingInst.Spec.VolumeMounts = pack.Spec.VolumeMounts
+			needsUpdate = true
+		}
+
+		// Propagate sandbox config from ensemble.
+		if !reflect.DeepEqual(existingInst.Spec.Agents.Default.AgentSandbox, pack.Spec.AgentSandbox) {
+			existingInst.Spec.Agents.Default.AgentSandbox = pack.Spec.AgentSandbox
+			needsUpdate = true
+		}
+
+		// Propagate lifecycle from persona.
+		if !reflect.DeepEqual(existingInst.Spec.Agents.Default.Lifecycle, persona.Lifecycle) {
+			existingInst.Spec.Agents.Default.Lifecycle = persona.Lifecycle
+			needsUpdate = true
+		}
+
+		// Propagate policy ref from ensemble.
+		if existingInst.Spec.PolicyRef != pack.Spec.PolicyRef {
+			existingInst.Spec.PolicyRef = pack.Spec.PolicyRef
 			needsUpdate = true
 		}
 
@@ -553,34 +569,27 @@ func (r *EnsembleReconciler) reconcileAgentConfig(
 	return ip, nil
 }
 
-// buildAgent creates a Agent spec from a persona definition.
-func (r *EnsembleReconciler) buildAgent(
-	pack *sympoziumv1alpha1.Ensemble,
-	persona *sympoziumv1alpha1.AgentConfigSpec,
-	instanceName string,
-	modelEndpoint string,
-) *sympoziumv1alpha1.Agent {
-	model := persona.Model
-	if model == "" {
-		model = "gpt-4o" // sensible default; overridden by onboarding
-	}
+// personaOverridesEndpoint reports whether a persona pins its own model provider
+// and therefore opts out of the ensemble's cluster-local model endpoint. Setting
+// a provider is the signal for a "mixed ensemble": the ensemble may default to a
+// local model while this persona talks to a cloud provider directly, with its own
+// model, base URL, and matching auth key.
+func personaOverridesEndpoint(persona *sympoziumv1alpha1.AgentConfigSpec) bool {
+	return persona.Provider != ""
+}
 
-	baseURL := pack.Spec.BaseURL
+// resolveAuthRefs selects the auth refs an agent should receive. A cluster-local
+// endpoint needs none; a persona pinned to its own provider takes that provider's
+// matching key even under a local endpoint (mixed ensembles).
+func resolveAuthRefs(pack *sympoziumv1alpha1.Ensemble, persona *sympoziumv1alpha1.AgentConfigSpec, modelEndpoint string) []sympoziumv1alpha1.SecretRef {
 	authRefs := pack.Spec.AuthRefs
-
-	// If a cluster-local Model is referenced, override provider settings.
+	// Cluster-internal inference needs no external auth.
 	if modelEndpoint != "" {
-		baseURL = modelEndpoint
-		model = pack.Spec.ModelRef
-		authRefs = nil // no auth needed for cluster-internal inference
+		authRefs = nil
 	}
-
-	// Per-persona provider/baseURL overrides take precedence.
-	if persona.BaseURL != "" {
-		baseURL = persona.BaseURL
-	}
+	// A provider-pinned persona uses that provider's key, overriding the
+	// local-endpoint nil above so mixed ensembles authenticate correctly.
 	if persona.Provider != "" {
-		// Find the matching auth secret for this provider from the ensemble's refs.
 		var matched []sympoziumv1alpha1.SecretRef
 		for _, ref := range pack.Spec.AuthRefs {
 			if ref.Provider == persona.Provider {
@@ -591,13 +600,64 @@ func (r *EnsembleReconciler) buildAgent(
 			authRefs = matched
 		}
 	}
+	return authRefs
+}
+
+// resolveModel computes the desired model name from persona, ensemble defaults,
+// and local model endpoint override.
+// Precondition: when modelEndpoint is non-empty, pack.Spec.ModelRef must also be
+// non-empty (the Reconcile method enforces this before calling resolveModel).
+func resolveModel(pack *sympoziumv1alpha1.Ensemble, persona *sympoziumv1alpha1.AgentConfigSpec, modelEndpoint string) string {
+	model := persona.Model
+	if model == "" {
+		model = "gpt-4o"
+	}
+	// The cluster-local model applies only to personas that haven't pinned their
+	// own provider; a mixed-ensemble persona keeps its own model.
+	if modelEndpoint != "" && pack.Spec.ModelRef != "" && !personaOverridesEndpoint(persona) {
+		model = pack.Spec.ModelRef
+	}
+	return model
+}
+
+// resolveBaseURL computes the agent's model base URL. The ensemble's local
+// endpoint applies unless the persona pins its own provider; an explicit
+// persona.BaseURL always wins.
+func resolveBaseURL(pack *sympoziumv1alpha1.Ensemble, persona *sympoziumv1alpha1.AgentConfigSpec, modelEndpoint string) string {
+	baseURL := pack.Spec.BaseURL
+	if modelEndpoint != "" && !personaOverridesEndpoint(persona) {
+		baseURL = modelEndpoint
+	}
+	if persona.BaseURL != "" {
+		baseURL = persona.BaseURL
+	}
+	return baseURL
+}
+
+// resolveProviderHeadersSecretRef selects the provider-headers secret, letting a
+// persona-level ref override the ensemble-level one.
+func resolveProviderHeadersSecretRef(pack *sympoziumv1alpha1.Ensemble, persona *sympoziumv1alpha1.AgentConfigSpec) string {
+	ref := pack.Spec.ProviderHeadersSecretRef
+	if persona.ProviderHeadersSecretRef != "" {
+		ref = persona.ProviderHeadersSecretRef
+	}
+	return ref
+}
+
+// buildAgent creates a Agent spec from a persona definition.
+func (r *EnsembleReconciler) buildAgent(
+	pack *sympoziumv1alpha1.Ensemble,
+	persona *sympoziumv1alpha1.AgentConfigSpec,
+	instanceName string,
+	modelEndpoint string,
+) *sympoziumv1alpha1.Agent {
+	model := resolveModel(pack, persona, modelEndpoint)
+	authRefs := resolveAuthRefs(pack, persona, modelEndpoint)
+	baseURL := resolveBaseURL(pack, persona, modelEndpoint)
 
 	// Merge provider headers: ensemble-level base, persona-level overrides.
 	providerHeaders := mergeProviderHeaders(pack.Spec.ProviderHeaders, persona.ProviderHeaders)
-	providerHeadersSecretRef := pack.Spec.ProviderHeadersSecretRef
-	if persona.ProviderHeadersSecretRef != "" {
-		providerHeadersSecretRef = persona.ProviderHeadersSecretRef
-	}
+	providerHeadersSecretRef := resolveProviderHeadersSecretRef(pack, persona)
 
 	labels := map[string]string{
 		"sympozium.ai/ensemble":     pack.Name,
