@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.10.41](https://github.com/sympozium-ai/sympozium/compare/v0.10.40...v0.10.41) (2026-07-08)
+
+
+### Features
+
+* **serve:** auto-login web UI via token in the URL fragment ([5aa40ba](https://github.com/sympozium-ai/sympozium/commit/5aa40ba8233c826f44fa9e7b8a7f102b35d51433))
+* **serve:** URL auto-login; standalone agent topology nodes ([f19d0be](https://github.com/sympozium-ai/sympozium/commit/f19d0bed5e25738a1eca6994ac338114e4961d42))
+* **web:** render standalone agents on the topology with model edges ([ba22b3e](https://github.com/sympozium-ai/sympozium/commit/ba22b3e82f48bdaf9295ad3cb7d839bdb5ab773a))
+
+
+### Bug Fixes
+
+* **web:** repair type errors that broke npm run build ([20ce832](https://github.com/sympozium-ai/sympozium/commit/20ce8323dcd9bbb0b2c44d2ce193ef06d25feb04))
+
 ## [0.10.40](https://github.com/sympozium-ai/sympozium/compare/v0.10.39...v0.10.40) (2026-07-08)
 
 
