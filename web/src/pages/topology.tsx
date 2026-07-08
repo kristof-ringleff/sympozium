@@ -145,6 +145,15 @@ function ModelNode({ data }: NodeProps<Node<ModelNodeData>>) {
         {data.gpu > 0 && <span>GPU:{data.gpu}</span>}
         <Badge variant="outline" className="text-[9px]">{data.phase}</Badge>
       </div>
+      {data.phase !== "Ready" && (data.message || data.placementMessage) && (
+        <div
+          className={`mt-1.5 max-w-[220px] truncate text-[10px] ${data.phase === "Failed" ? "text-red-400/90" : "text-yellow-400/80"}`}
+          title={[data.message, data.placementMessage].filter(Boolean).join("\n")}
+        >
+          {data.phase === "Failed" ? "" : "waiting: "}
+          {data.message || data.placementMessage}
+        </div>
+      )}
     </div>
   );
 }
@@ -388,6 +397,8 @@ interface ModelNodeData {
   serverType: string;
   gpu: number;
   placedNode?: string;
+  message?: string;
+  placementMessage?: string;
   [key: string]: unknown;
 }
 
@@ -659,6 +670,8 @@ function buildTopology(
         serverType: m.spec.inference?.serverType || "llama-cpp",
         gpu: m.spec.resources?.gpu ?? 0,
         placedNode: m.status?.placedNode,
+        message: m.status?.message,
+        placementMessage: m.status?.placementMessage,
       },
     });
     if (m.status?.placedNode) {
