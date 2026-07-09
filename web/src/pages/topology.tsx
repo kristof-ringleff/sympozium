@@ -38,6 +38,7 @@ import {
   useModels,
   useGatewayConfig,
   useDensityNodes,
+  useDraNodes,
 } from "@/hooks/use-api";
 import { StimulusDialogProvider, StimulusDialogCtx } from "@/components/canvas-primitives";
 import type { StimulusNodeData } from "@/components/canvas-primitives";
@@ -71,6 +72,8 @@ import type {
   NodeProvider,
   GatewayConfigResponse,
   DensityNodeSummary,
+  DraNodeSummary,
+  DraDevice,
 } from "@/lib/api";
 import { Link } from "react-router-dom";
 import { useArrowKeyPan, KeyboardGuide } from "@/hooks/use-arrow-key-pan";
@@ -119,8 +122,37 @@ function K8sNodeNode({ data }: NodeProps<Node<K8sNodeData>>) {
           ))}
         </div>
       )}
+      {(data.accelerators?.length ?? 0) > 0 && (
+        <div className="flex flex-wrap gap-1 mt-1">
+          {data.accelerators!.filter((d) => d.kind !== "cpu").map((d) => (
+            <Badge
+              key={d.name}
+              variant={d.healthy ? "outline" : "destructive"}
+              className={
+                d.healthy
+                  ? "text-[9px] border-primary/40 text-primary"
+                  : "text-[9px]"
+              }
+              title={d.healthy ? d.name : `${d.name} — ${d.healthReason || "unhealthy"}`}
+            >
+              {draDeviceLabel(d)}
+            </Badge>
+          ))}
+        </div>
+      )}
     </div>
   );
+}
+
+/** Compact chip text for a DRA device: kind + the fact that matters most. */
+function draDeviceLabel(d: DraDevice): string {
+  if (d.kind === "nic") {
+    const rate = d.rateGbps ? ` ${d.rateGbps}G` : "";
+    return `nic · ${d.linkLayer || "rdma"}${rate}`;
+  }
+  const model = d.model ? ` · ${d.model}` : "";
+  const mem = d.memoryGi ? ` ${d.memoryGi}Gi` : "";
+  return `${d.kind}${model}${mem}`;
 }
 
 function ModelNode({ data }: NodeProps<Node<ModelNodeData>>) {
@@ -414,6 +446,7 @@ interface K8sNodeData {
   name: string;
   ip: string;
   providers: { name: string; models: string[] }[];
+  accelerators?: DraDevice[];
   fitness?: {
     totalRamGb: number;
     availableRamGb: number;
@@ -554,9 +587,11 @@ function entityFingerprint(
   ensembles: Ensemble[],
   agents: Agent[],
   hasGateway: boolean,
+  draNodes?: DraNodeSummary[],
 ): string {
   const parts = [
     providerNodes.map((n) => n.nodeName).sort().join(","),
+    (draNodes || []).map((n) => n.nodeName).sort().join(","),
     models.map((m) => m.metadata.name).sort().join(","),
     ensembles.map((e) => e.metadata.name).sort().join(","),
     agents.map((a) => a.metadata.name).sort().join(","),
@@ -580,6 +615,7 @@ function buildTopology(
   runPhases: RunPhaseMap,
   activeRuns: AgentRun[],
   densityNodes?: DensityNodeSummary[],
+  draNodes?: DraNodeSummary[],
 ): { nodes: Node[]; edges: Edge[] } {
   const nodes: Node[] = [];
   const edges: Edge[] = [];
@@ -683,6 +719,9 @@ function buildTopology(
   const densityMap = new Map(
     (densityNodes || []).map((fn) => [fn.nodeName, fn]),
   );
+  const draMap = new Map(
+    (draNodes || []).map((dn) => [dn.nodeName, dn.devices]),
+  );
   for (const pn of providerNodes) {
     const fn = densityMap.get(pn.nodeName);
     nodes.push({
@@ -693,6 +732,7 @@ function buildTopology(
         name: pn.nodeName,
         ip: pn.nodeIP,
         providers: pn.providers.map((p) => ({ name: p.name, models: p.models })),
+        accelerators: draMap.get(pn.nodeName),
         fitness: fn
           ? {
               totalRamGb: fn.system.total_ram_gb,
@@ -706,6 +746,24 @@ function buildTopology(
               backend: fn.system.backend,
             }
           : undefined,
+      },
+    });
+  }
+  // Nodes known only through DRA slices (accelerators but no discovered
+  // inference provider) still deserve a card — the inventory is the point.
+  const providerNodeNames = new Set(providerNodes.map((pn) => pn.nodeName));
+  for (const [nodeName, devices] of draMap) {
+    if (providerNodeNames.has(nodeName)) continue;
+    nodes.push({
+      id: `node-${nodeName}`,
+      type: "k8sNode",
+      position: P,
+      data: {
+        name: nodeName,
+        ip: "",
+        providers: [],
+        accelerators: devices,
+        fitness: undefined,
       },
     });
   }
@@ -1157,6 +1215,7 @@ function TopologyCanvas() {
   const { data: providerNodes } = useProviderNodes(true);
   const { data: gateway } = useGatewayConfig();
   const { data: densityData } = useDensityNodes();
+  const { data: draData } = useDraNodes();
   const { fitView } = useReactFlow();
   useArrowKeyPan();
 
@@ -1272,6 +1331,7 @@ function TopologyCanvas() {
       ensembles || [],
       agents || [],
       !!gateway,
+      draData?.nodes,
     ) + "|runs:" + activeRunFingerprint;
 
     const entitiesChanged = fp !== prevFingerprintRef.current;
@@ -1289,6 +1349,7 @@ function TopologyCanvas() {
         runPhases,
         activeRuns,
         densityData?.nodes,
+        draData?.nodes,
       );
 
       // Apply saved positions if available.
@@ -1324,6 +1385,7 @@ function TopologyCanvas() {
           runPhases,
           activeRuns,
           densityData?.nodes,
+          draData?.nodes,
         );
         const freshMap = new Map(freshNodes.map((n) => [n.id, n]));
         return prev.map((n) => {
@@ -1346,11 +1408,12 @@ function TopologyCanvas() {
           runPhases,
           activeRuns,
           densityData?.nodes,
+          draData?.nodes,
         );
         return freshEdges;
       });
     }
-  }, [providerNodes, models, ensembles, agents, gateway, runningByEnsemble, webEndpointAgents, runPhases, activeRuns, activeRunFingerprint, densityData]);
+  }, [providerNodes, models, ensembles, agents, gateway, runningByEnsemble, webEndpointAgents, runPhases, activeRuns, activeRunFingerprint, densityData, draData]);
 
   // Save positions to localStorage after any node drag ends.
   const handleNodesChange = useCallback(
