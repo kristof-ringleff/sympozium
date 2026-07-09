@@ -32,9 +32,13 @@ jobs:
           cache: true
 
       - name: Create Kind cluster
-        uses: helm/kind-action@v1.10.0
+        # node_image pinned ≥ v1.34: the chart bundles llmfit-dra (enabled by
+        # default), whose DeviceClasses need the GA resource.k8s.io/v1 DRA API.
+        uses: helm/kind-action@v1.12.0
         with:
           cluster_name: sympozium-ci
+          version: v0.30.0
+          node_image: kindest/node:v1.35.0
           wait: 120s
 
       - name: Build all Sympozium images
