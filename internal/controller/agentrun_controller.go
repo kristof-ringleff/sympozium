@@ -93,6 +93,12 @@ const systemNamespace = "sympozium-system"
 // completed run cannot double-count it.
 const tokenBudgetCountedAnnotation = "sympozium.ai/token-budget-counted"
 
+// maxAgentReportedMetric caps token/tool-call/duration values parsed from the
+// agent's result marker. The marker comes from the agent pod's own stdout, so
+// anything above this ceiling (10B tokens, far beyond any real run) is treated
+// as forged rather than trusted into budget accounting.
+const maxAgentReportedMetric = 10_000_000_000
+
 // allowedAuthSecretKeys lists the only Secret keys that will be injected from
 // an auth secret into the agent container. This prevents wholesale secret
 // leakage when a secret contains extra keys.
@@ -3035,7 +3041,10 @@ func (r *AgentRunReconciler) updateTokenBudget(ctx context.Context, log logr.Log
 	if packName == "" {
 		return nil
 	}
-	if agentRun.Status.TokenUsage == nil || agentRun.Status.TokenUsage.TotalTokens == 0 {
+	// <= 0 rather than == 0: the ledger below only ever adds, so a negative
+	// total (which parseAgentResultFromLogs already rejects) must never reach
+	// it — decrementing TokenBudgetUsed would defeat halt-mode budgets.
+	if agentRun.Status.TokenUsage == nil || agentRun.Status.TokenUsage.TotalTokens <= 0 {
 		return nil
 	}
 
@@ -3661,6 +3670,28 @@ func parseAgentResultFromLogs(logs string, log logr.Logger) (result string, errM
 		}
 		return reason, "", nil, true
 	}
+
+	// The marker is printed by the (adversarial, prompt-injectable) agent pod
+	// itself, so its metrics are untrusted. A negative count would flow into
+	// Ensemble.status.tokenBudgetUsed and decrement the shared ledger,
+	// defeating halt-mode budgets; an absurdly large one would exhaust the
+	// budget instantly. Drop negative metrics entirely and clamp the rest.
+	if parsed.Metrics.InputTokens < 0 || parsed.Metrics.OutputTokens < 0 ||
+		parsed.Metrics.ToolCalls < 0 || parsed.Metrics.DurationMs < 0 {
+		log.Info("dropping negative agent-reported metrics",
+			"inputTokens", parsed.Metrics.InputTokens,
+			"outputTokens", parsed.Metrics.OutputTokens,
+			"toolCalls", parsed.Metrics.ToolCalls,
+			"durationMs", parsed.Metrics.DurationMs)
+		parsed.Metrics.InputTokens = 0
+		parsed.Metrics.OutputTokens = 0
+		parsed.Metrics.ToolCalls = 0
+		parsed.Metrics.DurationMs = 0
+	}
+	parsed.Metrics.InputTokens = min(parsed.Metrics.InputTokens, maxAgentReportedMetric)
+	parsed.Metrics.OutputTokens = min(parsed.Metrics.OutputTokens, maxAgentReportedMetric)
+	parsed.Metrics.ToolCalls = min(parsed.Metrics.ToolCalls, maxAgentReportedMetric)
+	parsed.Metrics.DurationMs = min(parsed.Metrics.DurationMs, int64(maxAgentReportedMetric))
 
 	if parsed.Metrics.InputTokens > 0 || parsed.Metrics.OutputTokens > 0 {
 		usage = &sympoziumv1alpha1.TokenUsage{
