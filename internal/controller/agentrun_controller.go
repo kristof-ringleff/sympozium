@@ -1068,6 +1068,7 @@ func (r *AgentRunReconciler) triggerSequentialSuccessors(ctx context.Context, lo
 				VolumeMounts:     targetInst.Spec.VolumeMounts,
 				Env:              targetInst.Spec.Agents.Default.Env,
 				Timeout:          targetInst.Spec.Agents.Default.ParseRunTimeout(),
+				ToolPolicy:       lookupToolPolicyForAgent(ctx, r.Client, &targetInst),
 			},
 		}
 
