@@ -1102,7 +1102,7 @@ func (r *AgentRunReconciler) triggerSequentialSuccessors(ctx context.Context, lo
 				Volumes:          targetInst.Spec.Volumes,
 				VolumeMounts:     targetInst.Spec.VolumeMounts,
 				Env:              targetInst.Spec.Agents.Default.Env,
-				Timeout:          targetInst.Spec.Agents.Default.ParseRunTimeout(),
+				Timeout:          sequentialRunTimeout(rel, &targetInst),
 				ToolPolicy:       toolpolicy.ForAgent(ctx, r.Client, &targetInst),
 			},
 		}
@@ -1502,6 +1502,22 @@ func delegationEdgeActive(condition string) bool {
 // buildHandoffTask produces a structured handoff card for sequential pipeline
 // transitions. The card clearly separates what the predecessor was asked to do,
 // what it produced, and what the successor should do next.
+// sequentialRunTimeout bounds the successor run of a sequential edge. The
+// edge's relationships[].timeout wins over the target Agent's runTimeout; a
+// persisted AgentRunSpec.Timeout then drives every controller-side gate
+// together (watchdog, Job activeDeadlineSeconds, RUN_TIMEOUT env). An edge with
+// no timeout, or a malformed one, falls back to the target's own default.
+//
+// Unlike a delegation edge, nothing blocks on a sequential successor, so there
+// is no waiter to unblock — bounding the successor's own run is what the edge
+// timeout means here.
+func sequentialRunTimeout(rel sympoziumv1alpha1.AgentConfigRelationship, target *sympoziumv1alpha1.Agent) *metav1.Duration {
+	if d := rel.ParseTimeout(); d != nil {
+		return d
+	}
+	return target.Spec.Agents.Default.ParseRunTimeout()
+}
+
 func buildHandoffTask(sourcePersona, predecessorTask, predecessorResult, targetTask string) string {
 	originalTask := extractOriginalTask(predecessorTask)
 	if len(originalTask) > 200 {

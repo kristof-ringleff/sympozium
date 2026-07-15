@@ -104,6 +104,19 @@ func effectiveRunTimeout(provider string) time.Duration {
 	return 10 * time.Minute
 }
 
+// delegateWaitBudget bounds how long delegate_to_persona and spawn_subagents
+// block on a child's IPC result. The per-edge deadline lives in the Ensemble's
+// relationships[].timeout and is enforced by the SpawnRouter, which unblocks the
+// tool early with an error result. This is only the backstop that stops a tool
+// call outliving the run itself, for when the router never answers. The
+// 10-minute fallback applies to a context with no deadline (tests).
+func delegateWaitBudget(ctx context.Context) time.Duration {
+	if deadline, ok := ctx.Deadline(); ok {
+		return time.Until(deadline).Round(time.Second)
+	}
+	return 10 * time.Minute
+}
+
 type agentResult struct {
 	Status   string `json:"status"` // "success", "error", or "skipped" (see ipc.ResultStatusSkipped)
 	Response string `json:"response,omitempty"`
