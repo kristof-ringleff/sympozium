@@ -583,6 +583,12 @@ export interface AgentConfigRelationship {
 export interface StimulusSpec {
   name: string;
   prompt: string;
+  /**
+   * When the stimulus fires. "onReady" (the server-side default) delivers it
+   * automatically once every agent is ready; "manual" leaves the ensemble idle
+   * until someone triggers it.
+   */
+  trigger?: "onReady" | "manual";
 }
 
 export interface EnsembleSpec {
