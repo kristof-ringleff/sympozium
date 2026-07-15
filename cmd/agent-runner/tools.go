@@ -112,14 +112,24 @@ func defaultTools() []ToolDef {
 			},
 		},
 		{
-			Name:        ToolReadFile,
-			Description: "Read the contents of a file from the pod filesystem. Paths under /workspace, /skills, /tmp, and /ipc are accessible.",
+			Name: ToolReadFile,
+			Description: "Read the contents of a file from the pod filesystem. Paths under /workspace, /skills, /tmp, and /ipc are accessible. " +
+				"Responses are capped at 8000 bytes; for larger files use 'offset' and 'limit' to read a specific line range, " +
+				"following the continuation hint appended to truncated output.",
 			Parameters: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
 					"path": map[string]any{
 						"type":        "string",
 						"description": "Absolute path to the file to read.",
+					},
+					"offset": map[string]any{
+						"type":        "integer",
+						"description": "1-based line number to start reading from. Defaults to 1.",
+					},
+					"limit": map[string]any{
+						"type":        "integer",
+						"description": "Maximum number of lines to return. Defaults to the whole file (subject to the 8000-byte response cap).",
 					},
 				},
 				"required": []string{"path"},
@@ -406,11 +416,52 @@ func readFileTool(args map[string]any) string {
 		return fmt.Sprintf("Error reading file: %v", err)
 	}
 
-	content := string(data)
-	if len(content) > 8_000 {
-		content = content[:8_000] + fmt.Sprintf("\n... (truncated, file is %d bytes)", len(data))
+	offset := 1
+	if v, ok := args["offset"].(float64); ok && v > 1 {
+		offset = int(v)
 	}
-	return content
+	limit := 0 // 0 means no line limit
+	if v, ok := args["limit"].(float64); ok && v > 0 {
+		limit = int(v)
+	}
+
+	content := string(data)
+	if offset == 1 && limit == 0 && len(content) <= 8_000 {
+		return content
+	}
+
+	lines := strings.Split(content, "\n")
+	total := len(lines)
+	if strings.HasSuffix(content, "\n") {
+		total-- // don't count the empty tail after a trailing newline
+	}
+
+	if offset > total {
+		return fmt.Sprintf("Error: offset %d is past the end of the file (%d lines)", offset, total)
+	}
+
+	end := total
+	if limit > 0 && offset-1+limit < end {
+		end = offset - 1 + limit
+	}
+	selected := strings.Join(lines[offset-1:end], "\n")
+
+	// Cap the response, cutting at the last complete line so the
+	// continuation hint stays exact.
+	if len(selected) > 8_000 {
+		cut := strings.LastIndexByte(selected[:8_000], '\n')
+		if cut < 0 {
+			// A single line longer than the cap: hard-cut, no line-based continuation possible.
+			return selected[:8_000] + fmt.Sprintf("\n... (truncated mid-line %d of %d; line exceeds the 8000-byte cap)", offset, total)
+		}
+		lastLine := offset - 1 + strings.Count(selected[:cut], "\n") + 1
+		return selected[:cut] + fmt.Sprintf("\n... (truncated at line %d of %d; continue with offset=%d)", lastLine, total, lastLine+1)
+	}
+
+	if end < total {
+		selected += fmt.Sprintf("\n... (showing lines %d-%d of %d; continue with offset=%d)", offset, end, total, end+1)
+	}
+	return selected
 }
 
 func listDirectoryTool(args map[string]any) string {
