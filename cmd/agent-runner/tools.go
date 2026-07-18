@@ -335,6 +335,7 @@ func defaultTools() []ToolDef {
 // executeToolCall dispatches a tool call and returns the result string.
 func executeToolCall(ctx context.Context, name string, argsJSON string) string {
 	log.Printf("tool call: %s args=%s", name, truncateStr(argsJSON, 200))
+	detailedLog.LogAgent("tool_call", map[string]any{"tool": name, "args": argsJSON})
 
 	var args map[string]any
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
@@ -580,6 +581,7 @@ func delegateToPersonaTool(ctx context.Context, args map[string]any) string {
 
 	log.Printf("Delegating to persona %q in pack %q (requestID=%s): task=%s",
 		targetPersona, packName, requestID, truncateStr(task, 100))
+	detailedLog.LogAgent("delegate", map[string]any{"persona": targetPersona, "pack": packName, "request_id": requestID, "task": task})
 
 	var result ipc.DelegateResult
 	if err := ipcRoundTrip(ctx, reqPath, resPath, spawnPollInterval,
@@ -1061,6 +1063,7 @@ func dispatchExecRequest(req execRequest, label string) string {
 	}
 
 	log.Printf("Wrote exec request %s: %s", req.ID, label)
+	detailedLog.LogAgent("exec_request", map[string]any{"request_id": req.ID, "command": label})
 
 	// Poll for result with a deadline.
 	deadline := time.Now().Add(time.Duration(timeoutSec+10) * time.Second)
