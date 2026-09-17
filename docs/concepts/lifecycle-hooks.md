@@ -288,6 +288,8 @@ postRun:
     command: ["sh", "-c", "sleep 86400"]
 ```
 
+The `requireApproval` toggle in the API and UI configures exactly this, with a 24-hour window.
+
 In the web UI, gated runs show an amber "Approval" badge on the runs list and an approval bar on the run detail page with Approve and Reject buttons. A warning toast fires when a run requires approval.
 
 Via the API:
