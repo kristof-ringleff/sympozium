@@ -8,6 +8,14 @@
 //
 // Membrane extensions add visibility-based permeability (public/trusted/private),
 // provenance tracking (source_agent, parent_id), event sequencing, and time decay.
+//
+// Storage is append-only. Every row is one version of a memory: `id` is the
+// memory's stable id, shared by all its versions, and the version with the
+// highest `seq` is the current one. An update appends a version with new
+// content; a forget appends a version with NULL content. Search, list and
+// provenance only see current versions with content, and the FTS index holds
+// exactly those rows. Every version stays readable through the admin-only
+// GET /history endpoint.
 package main
 
 import (
@@ -15,6 +23,7 @@ import (
 	"crypto/subtle"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -143,6 +152,7 @@ type apiResponse struct {
 type memoryEntry struct {
 	ID          int64          `json:"id"`
 	Content     string         `json:"content"`
+	Forgotten   bool           `json:"forgotten,omitempty"` // content is NULL; only seen in /history
 	Tags        []string       `json:"tags,omitempty"`
 	Visibility  string         `json:"visibility,omitempty"`
 	SourceAgent string         `json:"source_agent,omitempty"`
@@ -168,9 +178,10 @@ func main() {
 	dbPath := envOr("MEMORY_DB_PATH", defaultDBPath)
 	port := envOr("MEMORY_PORT", "8080")
 
-	// Admin-only delete is gated on a bearer token supplied via a Secret and
-	// injected only into this pod's env (never into agent pods). When unset,
-	// DELETE /delete is disabled, so existing deployments are unaffected.
+	// Admin-only endpoints (DELETE /delete, GET /history) are gated on a
+	// bearer token supplied via a Secret and injected only into this pod's env
+	// (never into agent pods). When unset, both are disabled, so existing
+	// deployments are unaffected.
 	adminToken := os.Getenv("MEMORY_ADMIN_TOKEN")
 
 	// Ensure database directory exists.
@@ -178,22 +189,11 @@ func main() {
 		log.Fatalf("failed to create db directory: %v", err)
 	}
 
-	// Open SQLite database and initialize schema.
-	db, err := sql.Open("sqlite", dbPath+"?_pragma=journal_mode(wal)&_pragma=busy_timeout(5000)")
+	db, err := openDB(dbPath)
 	if err != nil {
-		log.Fatalf("failed to open database: %v", err)
+		log.Fatalf("%v", err)
 	}
 	defer db.Close()
-
-	if err := initSchema(db); err != nil {
-		log.Fatalf("failed to initialize schema: %v", err)
-	}
-	if err := migrateMembraneColumns(db); err != nil {
-		log.Fatalf("failed to run membrane migration: %v", err)
-	}
-	if err := migrateEvidenceColumn(db); err != nil {
-		log.Fatalf("failed to run evidence migration: %v", err)
-	}
 
 	// Bootstrap OTel (ISI-1406 gap 6). No-op when no OTLP endpoint is set.
 	initMemObservability(context.Background())
@@ -206,10 +206,13 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /search", searchHandler(db))
 	mux.HandleFunc("POST /store", storeHandler(db))
+	mux.HandleFunc("POST /update", updateHandler(db))
+	mux.HandleFunc("POST /forget", forgetHandler(db))
 	mux.HandleFunc("GET /list", listHandler(db))
 	mux.HandleFunc("GET /stats", statsHandler(db))
 	mux.HandleFunc("GET /provenance", provenanceHandler(db))
 	mux.HandleFunc("DELETE /delete", deleteHandler(db, adminToken))
+	mux.HandleFunc("GET /history", historyHandler(db, adminToken))
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprint(w, "ok")
@@ -331,6 +334,124 @@ func storeHandler(db *sql.DB) http.HandlerFunc {
 	}
 }
 
+// updateHandler replaces the content of an existing memory. It appends a new
+// version with the same id; the old content drops out of search and list.
+func updateHandler(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			ID          int64           `json:"id"`
+			Content     string          `json:"content"`
+			Tags        []string        `json:"tags"`
+			Visibility  string          `json:"visibility"`
+			SourceAgent string          `json:"source_agent"`
+			Evidence    json.RawMessage `json:"evidence"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			log.Printf("[update] bad request: %v", err)
+			writeJSON(w, http.StatusBadRequest, apiResponse{Error: "invalid JSON body"})
+			return
+		}
+		evidence, clearEvidence, err := parseEvidenceUpdate(req.Evidence)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, apiResponse{Error: "'evidence' must be an object or null"})
+			return
+		}
+		if req.ID <= 0 {
+			writeJSON(w, http.StatusBadRequest, apiResponse{Error: "'id' is required"})
+			return
+		}
+		if req.Content == "" {
+			writeJSON(w, http.StatusBadRequest, apiResponse{Error: "'content' is required (use /forget to remove an entry)"})
+			return
+		}
+
+		log.Printf("[update] id=%d content=%d bytes source=%s", req.ID, len(req.Content), req.SourceAgent)
+		writeNewVersion(w, r, "update", db, versionRequest{
+			ID:            req.ID,
+			Content:       req.Content,
+			Tags:          req.Tags,
+			Visibility:    req.Visibility,
+			SourceAgent:   req.SourceAgent,
+			Evidence:      evidence,
+			ClearEvidence: clearEvidence,
+		})
+	}
+}
+
+// parseEvidenceUpdate reads the evidence field of an update. An omitted field
+// returns (nil, false): keep the current evidence. null or an empty object
+// returns (nil, true): clear it. Anything else must be an evidence object.
+func parseEvidenceUpdate(raw json.RawMessage) (*EvidenceTrace, bool, error) {
+	if len(raw) == 0 {
+		return nil, false, nil
+	}
+	if string(raw) == "null" {
+		return nil, true, nil
+	}
+	var ev EvidenceTrace
+	if err := json.Unmarshal(raw, &ev); err != nil {
+		return nil, false, err
+	}
+	if ev.Kind == "" && ev.ToolCall == "" && ev.RawResult == "" && ev.Source == "" && ev.Confidence == 0 && len(ev.DerivedFrom) == 0 {
+		return nil, true, nil
+	}
+	return &ev, false, nil
+}
+
+// forgetHandler removes a memory from search and list. It appends a version
+// with NULL content, so the history is kept.
+func forgetHandler(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			ID          int64  `json:"id"`
+			SourceAgent string `json:"source_agent"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			log.Printf("[forget] bad request: %v", err)
+			writeJSON(w, http.StatusBadRequest, apiResponse{Error: "invalid JSON body"})
+			return
+		}
+		if req.ID <= 0 {
+			writeJSON(w, http.StatusBadRequest, apiResponse{Error: "'id' is required"})
+			return
+		}
+
+		log.Printf("[forget] id=%d source=%s", req.ID, req.SourceAgent)
+		writeNewVersion(w, r, "forget", db, versionRequest{
+			ID:            req.ID,
+			SourceAgent:   req.SourceAgent,
+			ClearEvidence: true,
+		})
+	}
+}
+
+// writeNewVersion runs appendVersion and maps its errors to HTTP statuses.
+func writeNewVersion(w http.ResponseWriter, r *http.Request, op string, db *sql.DB, req versionRequest) {
+	seq, storedAt, err := appendVersion(db, req)
+	switch {
+	case errors.Is(err, errMemoryNotFound):
+		writeJSON(w, http.StatusNotFound, apiResponse{Error: fmt.Sprintf("no memory entry with id %d", req.ID)})
+		return
+	case errors.Is(err, errMemoryForgotten):
+		writeJSON(w, http.StatusConflict, apiResponse{Error: fmt.Sprintf("memory entry %d has been forgotten; store a new entry instead", req.ID)})
+		return
+	case errors.Is(err, errMemoryConflict):
+		writeJSON(w, http.StatusConflict, apiResponse{Error: fmt.Sprintf("memory entry %d was changed concurrently; retry", req.ID)})
+		return
+	case err != nil:
+		log.Printf("[%s] error: %v", op, err)
+		memObs.recordWrite(r.Context(), "error", req.SourceAgent)
+		writeJSON(w, http.StatusInternalServerError, apiResponse{Error: err.Error()})
+		return
+	}
+	log.Printf("[%s] saved id=%d seq=%d", op, req.ID, seq)
+	memObs.recordWrite(r.Context(), op, req.SourceAgent)
+	writeJSON(w, http.StatusOK, apiResponse{
+		Success: true,
+		Content: map[string]any{"id": req.ID, "seq": seq, "stored_at": storedAt},
+	})
+}
+
 func listHandler(db *sql.DB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		tags := r.URL.Query().Get("tags")
@@ -370,12 +491,14 @@ func statsHandler(db *sql.DB) http.HandlerFunc {
 			Visibility  string `json:"visibility"`
 			Count       int    `json:"count"`
 		}
+		// Count memories, not versions: only current versions with content.
 		rows, err := db.Query(`
-			SELECT COALESCE(source_agent, '') as source_agent,
-			       COALESCE(visibility, 'public') as visibility,
+			SELECT COALESCE(m.source_agent, '') as source_agent,
+			       COALESCE(m.visibility, 'public') as visibility,
 			       COUNT(*) as count
-			FROM memories
-			GROUP BY source_agent, visibility
+			FROM memories m
+			WHERE 1=1 ` + currentOnlyFilter + `
+			GROUP BY m.source_agent, m.visibility
 			ORDER BY count DESC
 		`)
 		if err != nil {
@@ -433,26 +556,68 @@ func provenanceHandler(db *sql.DB) http.HandlerFunc {
 	}
 }
 
-// deleteHandler removes a single entry by its exact id. It is a manual admin
-// backstop (corrupted or sensitive entries) — not wired to agents or skills.
-// Access is gated on a bearer token injected only into this pod's env; when the
-// token is unset the endpoint is disabled, so existing deployments are
-// unaffected. The delete is a hard row removal; the memories_ad FTS trigger
-// keeps memories_fts in sync automatically.
-func deleteHandler(db *sql.DB, adminToken string) http.HandlerFunc {
+// authorizeAdmin checks the admin bearer token. It writes the error response
+// and returns false when the request must be rejected. An empty adminToken
+// disables the endpoint.
+func authorizeAdmin(w http.ResponseWriter, r *http.Request, op, adminToken string) bool {
+	if adminToken == "" {
+		log.Printf("[%s] rejected: MEMORY_ADMIN_TOKEN not configured", op)
+		writeJSON(w, http.StatusForbidden, apiResponse{Error: op + " is disabled: MEMORY_ADMIN_TOKEN is not configured"})
+		return false
+	}
+	token := ""
+	if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
+		token = strings.TrimPrefix(auth, "Bearer ")
+	}
+	if subtle.ConstantTimeCompare([]byte(token), []byte(adminToken)) != 1 {
+		log.Printf("[%s] rejected: invalid or missing bearer token", op)
+		writeJSON(w, http.StatusUnauthorized, apiResponse{Error: "unauthorized"})
+		return false
+	}
+	return true
+}
+
+// historyHandler returns every version of the memory with the given id,
+// oldest first, including replaced content and forget versions. It is the
+// audit view of the append-only store, so it shares the admin token with
+// /delete and is never exposed to agents.
+func historyHandler(db *sql.DB, adminToken string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if adminToken == "" {
-			log.Printf("[delete] rejected: MEMORY_ADMIN_TOKEN not configured")
-			writeJSON(w, http.StatusForbidden, apiResponse{Error: "delete is disabled: MEMORY_ADMIN_TOKEN is not configured"})
+		if !authorizeAdmin(w, r, "history", adminToken) {
 			return
 		}
-		token := ""
-		if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
-			token = strings.TrimPrefix(auth, "Bearer ")
+		id, err := strconv.ParseInt(r.URL.Query().Get("id"), 10, 64)
+		if err != nil || id <= 0 {
+			writeJSON(w, http.StatusBadRequest, apiResponse{Error: "valid 'id' query parameter is required"})
+			return
 		}
-		if subtle.ConstantTimeCompare([]byte(token), []byte(adminToken)) != 1 {
-			log.Printf("[delete] rejected: invalid or missing bearer token")
-			writeJSON(w, http.StatusUnauthorized, apiResponse{Error: "unauthorized"})
+
+		versions, err := getMemoryHistory(db, id)
+		if err != nil {
+			log.Printf("[history] error: %v", err)
+			memObs.recordRead(r.Context(), "history", "error", "")
+			writeJSON(w, http.StatusInternalServerError, apiResponse{Error: err.Error()})
+			return
+		}
+		if len(versions) == 0 {
+			writeJSON(w, http.StatusNotFound, apiResponse{Error: fmt.Sprintf("no memory entry with id %d", id)})
+			return
+		}
+		memObs.recordRead(r.Context(), "history", "ok", "")
+		writeJSON(w, http.StatusOK, apiResponse{Success: true, Content: versions})
+	}
+}
+
+// deleteHandler hard-deletes versions of a memory: one version with
+// ?id=N&seq=S, or every version with ?id=N. It is a manual admin backstop
+// (corrupted or sensitive entries) — not wired to agents or skills. Access is
+// gated on a bearer token injected only into this pod's env; when the token is
+// unset the endpoint is disabled, so existing deployments are unaffected. The
+// memories_ad trigger keeps memories_fts in sync: deleting the current version
+// makes the previous version current and searchable again.
+func deleteHandler(db *sql.DB, adminToken string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !authorizeAdmin(w, r, "delete", adminToken) {
 			return
 		}
 
@@ -466,32 +631,42 @@ func deleteHandler(db *sql.DB, adminToken string) http.HandlerFunc {
 			writeJSON(w, http.StatusBadRequest, apiResponse{Error: "invalid 'id' parameter"})
 			return
 		}
+		var seq int64 // 0 = all versions
+		if seqStr := r.URL.Query().Get("seq"); seqStr != "" {
+			if seq, err = strconv.ParseInt(seqStr, 10, 64); err != nil || seq <= 0 {
+				writeJSON(w, http.StatusBadRequest, apiResponse{Error: "invalid 'seq' parameter"})
+				return
+			}
+		}
 
-		entry, found, err := getMemoryByID(db, id)
+		deleted, err := deleteMemory(db, id, seq)
 		if err != nil {
-			log.Printf("[delete] lookup error: %v", err)
+			log.Printf("[delete] error: %v", err)
 			memObs.recordWrite(r.Context(), "error", "")
 			writeJSON(w, http.StatusInternalServerError, apiResponse{Error: err.Error()})
 			return
 		}
-		if !found {
+		if len(deleted) == 0 {
 			writeJSON(w, http.StatusNotFound, apiResponse{Error: fmt.Sprintf("no memory entry with id %d", id)})
 			return
 		}
-
-		if err := deleteMemory(db, id); err != nil {
-			log.Printf("[delete] error: %v", err)
-			memObs.recordWrite(r.Context(), "error", entry.SourceAgent)
-			writeJSON(w, http.StatusInternalServerError, apiResponse{Error: err.Error()})
-			return
+		for _, e := range deleted {
+			log.Printf("[delete] removed id=%d seq=%d source=%s", e.ID, e.Seq, e.SourceAgent)
+			memObs.recordWrite(r.Context(), "delete", e.SourceAgent)
 		}
-		log.Printf("[delete] removed id=%d seq=%d source=%s", entry.ID, entry.Seq, entry.SourceAgent)
-		memObs.recordWrite(r.Context(), "delete", entry.SourceAgent)
-		writeJSON(w, http.StatusOK, apiResponse{Success: true, Content: map[string]any{"deleted": entry}})
+		writeJSON(w, http.StatusOK, apiResponse{Success: true, Content: map[string]any{"deleted": deleted}})
 	}
 }
 
 // --- Core database operations ---
+
+// currentOnlyFilter keeps only the current version of each memory, and only
+// if it has content (not forgotten). The (id, seq) unique index serves the
+// MAX lookup. Queries using it must alias memories as m.
+const currentOnlyFilter = `AND m.content IS NOT NULL AND m.seq = (SELECT MAX(x.seq) FROM memories x WHERE x.id = m.id)`
+
+// memoryColumns is the column list read by scanEntry, qualified with alias m.
+const memoryColumns = `m.id, m.content, m.tags, m.visibility, m.source_agent, m.parent_id, m.seq, m.created_at, m.updated_at, m.evidence`
 
 func searchMemories(db *sql.DB, query string, topK int, callerAgent string, trustPeers, acceptTags []string, maxAge, minKind string) ([]memoryEntry, error) {
 	// Build visibility filter.
@@ -515,14 +690,14 @@ func searchMemories(db *sql.DB, query string, topK int, callerAgent string, trus
 	allArgs = append(allArgs, topK)
 
 	q := fmt.Sprintf(`
-		SELECT m.id, m.content, m.tags, m.visibility, m.source_agent, m.parent_id, m.seq, m.created_at, m.updated_at, m.evidence
+		SELECT %s
 		FROM memories_fts fts
-		JOIN memories m ON m.id = fts.rowid
+		JOIN memories m ON m.version_id = fts.rowid
 		WHERE memories_fts MATCH ?
-		%s %s %s %s
+		%s %s %s %s %s
 		ORDER BY rank
 		LIMIT ?
-	`, visFilter, ageFilter, tagFilter, kindFilter)
+	`, memoryColumns, currentOnlyFilter, visFilter, ageFilter, tagFilter, kindFilter)
 
 	rows, err := db.Query(q, allArgs...)
 	if err != nil {
@@ -535,13 +710,13 @@ func searchMemories(db *sql.DB, query string, topK int, callerAgent string, trus
 		allArgs = append(allArgs, topK)
 
 		q = fmt.Sprintf(`
-			SELECT id, content, tags, visibility, source_agent, parent_id, seq, created_at, updated_at, evidence
-			FROM memories
+			SELECT %s
+			FROM memories m
 			WHERE content LIKE ?
-			%s %s %s %s
+			%s %s %s %s %s
 			ORDER BY updated_at DESC
 			LIMIT ?
-		`, visFilter, ageFilter, tagFilter, kindFilter)
+		`, memoryColumns, currentOnlyFilter, visFilter, ageFilter, tagFilter, kindFilter)
 
 		rows, err = db.Query(q, allArgs...)
 		if err != nil {
@@ -556,13 +731,9 @@ func storeMemory(db *sql.DB, content string, tags []string, visibility, sourceAg
 	tagsStr := strings.Join(tags, ",")
 	now := time.Now().UTC().Format(time.RFC3339)
 
-	var evidenceStr string
-	if evidence != nil {
-		b, err := json.Marshal(evidence)
-		if err != nil {
-			return 0, 0, "", fmt.Errorf("marshal evidence: %w", err)
-		}
-		evidenceStr = string(b)
+	evidenceStr, err := marshalEvidence(evidence)
+	if err != nil {
+		return 0, 0, "", err
 	}
 
 	tx, err := db.Begin()
@@ -571,23 +742,40 @@ func storeMemory(db *sql.DB, content string, tags []string, visibility, sourceAg
 	}
 	defer tx.Rollback()
 
+	// Allocate a new memory id. The counter never goes back, so an id freed
+	// by an admin delete is never handed to a different memory.
+	var id int64
+	if err := tx.QueryRow(`UPDATE memory_ids SET next = next + 1 RETURNING next - 1`).Scan(&id); err != nil {
+		return 0, 0, "", fmt.Errorf("store allocate id: %w", err)
+	}
+
 	// Get next monotonic sequence number.
 	var nextSeq int64
 	_ = tx.QueryRow(`SELECT COALESCE(MAX(seq), 0) + 1 FROM memories`).Scan(&nextSeq)
 
-	result, err := tx.Exec(`
-		INSERT INTO memories (content, tags, visibility, source_agent, parent_id, seq, created_at, updated_at, evidence)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, content, tagsStr, visibility, sourceAgent, parentID, nextSeq, now, now, evidenceStr)
+	_, err = tx.Exec(`
+		INSERT INTO memories (id, seq, content, tags, visibility, source_agent, parent_id, created_at, updated_at, evidence)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, id, nextSeq, content, tagsStr, visibility, sourceAgent, parentID, now, now, evidenceStr)
 	if err != nil {
 		return 0, 0, "", fmt.Errorf("store failed: %w", err)
 	}
-	id, _ := result.LastInsertId()
 
 	if err := tx.Commit(); err != nil {
 		return 0, 0, "", fmt.Errorf("store commit: %w", err)
 	}
 	return id, nextSeq, now, nil
+}
+
+func marshalEvidence(evidence *EvidenceTrace) (string, error) {
+	if evidence == nil {
+		return "", nil
+	}
+	b, err := json.Marshal(evidence)
+	if err != nil {
+		return "", fmt.Errorf("marshal evidence: %w", err)
+	}
+	return string(b), nil
 }
 
 func listMemories(db *sql.DB, tags string, limit int, callerAgent string, trustPeers []string, maxAge, minKind, sourceAgent string) ([]memoryEntry, error) {
@@ -611,24 +799,22 @@ func listMemories(db *sql.DB, tags string, limit int, callerAgent string, trustP
 	args = append(args, ageArgs...)
 	args = append(args, kindArgs...)
 
-	where := ""
+	// currentOnlyFilter, visFilter, ageFilter, and kindFilter all start with
+	// "AND", so the WHERE clause always needs a leading condition.
+	where := "WHERE 1=1"
 	if len(conditions) > 0 {
 		where = "WHERE " + strings.Join(conditions, " AND ")
-	}
-	// visFilter, ageFilter, and kindFilter already include "AND" prefix when non-empty.
-	if where == "" && (visFilter != "" || ageFilter != "" || kindFilter != "") {
-		where = "WHERE 1=1"
 	}
 
 	args = append(args, limit)
 
 	q := fmt.Sprintf(`
-		SELECT id, content, tags, visibility, source_agent, parent_id, seq, created_at, updated_at, evidence
-		FROM memories
-		%s %s %s %s
+		SELECT %s
+		FROM memories m
+		%s %s %s %s %s
 		ORDER BY updated_at DESC
 		LIMIT ?
-	`, where, visFilter, ageFilter, kindFilter)
+	`, memoryColumns, where, currentOnlyFilter, visFilter, ageFilter, kindFilter)
 
 	rows, err := db.Query(q, args...)
 	if err != nil {
@@ -638,35 +824,24 @@ func listMemories(db *sql.DB, tags string, limit int, callerAgent string, trustP
 	return scanEntries(rows)
 }
 
+// getProvenanceChain walks parent_id links from id back to the root and
+// returns the chain root first. parent_id holds memory ids, so each step reads
+// the current version of that memory. Forgotten memories are walked through but
+// left out, so their content cannot be read back through provenance.
 func getProvenanceChain(db *sql.DB, id int64) ([]memoryEntry, error) {
-	var chain []memoryEntry
+	chain := []memoryEntry{}
 	seen := map[int64]bool{}
 	current := id
 
 	for current > 0 && !seen[current] {
 		seen[current] = true
-		row := db.QueryRow(`
-			SELECT id, content, tags, visibility, source_agent, parent_id, seq, created_at, updated_at, evidence
-			FROM memories WHERE id = ?
-		`, current)
-
-		var e memoryEntry
-		var tags string
-		var evidenceStr string
-		err := row.Scan(&e.ID, &e.Content, &tags, &e.Visibility, &e.SourceAgent, &e.ParentID, &e.Seq, &e.CreatedAt, &e.UpdatedAt, &evidenceStr)
-		if err != nil {
+		e, found, err := getMemoryByID(db, current)
+		if err != nil || !found {
 			break
 		}
-		if tags != "" {
-			e.Tags = strings.Split(tags, ",")
+		if !e.Forgotten {
+			chain = append(chain, e)
 		}
-		if evidenceStr != "" {
-			var ev EvidenceTrace
-			if err := json.Unmarshal([]byte(evidenceStr), &ev); err == nil {
-				e.Evidence = &ev
-			}
-		}
-		chain = append(chain, e)
 		current = e.ParentID
 	}
 
@@ -674,30 +849,181 @@ func getProvenanceChain(db *sql.DB, id int64) ([]memoryEntry, error) {
 	for i, j := 0, len(chain)-1; i < j; i, j = i+1, j-1 {
 		chain[i], chain[j] = chain[j], chain[i]
 	}
-	if chain == nil {
-		chain = []memoryEntry{}
-	}
 	return chain, nil
 }
 
-// getMemoryByID fetches a single entry by its exact primary key. found is false
-// (with a nil error) when no such row exists.
+// getMemoryByID fetches the current version of a memory, including a forget
+// version (Forgotten set). found is false (with a nil error) when no version
+// exists.
 func getMemoryByID(db *sql.DB, id int64) (memoryEntry, bool, error) {
-	row := db.QueryRow(`
-		SELECT id, content, tags, visibility, source_agent, parent_id, seq, created_at, updated_at, evidence
-		FROM memories WHERE id = ?
-	`, id)
+	return latestVersion(db, id)
+}
 
+// latestVersion reads the current version of memory id through q, which is a
+// *sql.DB or *sql.Tx.
+func latestVersion(q interface {
+	QueryRow(string, ...any) *sql.Row
+}, id int64) (memoryEntry, bool, error) {
 	var e memoryEntry
-	var tags string
-	var evidenceStr string
-	err := row.Scan(&e.ID, &e.Content, &tags, &e.Visibility, &e.SourceAgent, &e.ParentID, &e.Seq, &e.CreatedAt, &e.UpdatedAt, &evidenceStr)
+	err := scanEntry(q.QueryRow(`SELECT `+memoryColumns+` FROM memories m WHERE m.id = ? ORDER BY m.seq DESC LIMIT 1`, id), &e)
 	if err == sql.ErrNoRows {
 		return memoryEntry{}, false, nil
 	}
 	if err != nil {
 		return memoryEntry{}, false, fmt.Errorf("lookup by id: %w", err)
 	}
+	return e, true, nil
+}
+
+// getMemoryHistory returns every version of memory id, oldest first. It
+// returns an empty slice when id does not exist.
+func getMemoryHistory(db *sql.DB, id int64) ([]memoryEntry, error) {
+	rows, err := db.Query(`SELECT `+memoryColumns+` FROM memories m WHERE m.id = ? ORDER BY m.seq`, id)
+	if err != nil {
+		return nil, fmt.Errorf("history: %w", err)
+	}
+	defer rows.Close()
+	return scanEntries(rows)
+}
+
+var (
+	// errMemoryNotFound is returned when the memory does not exist or belongs
+	// to a different source agent. Both cases share one error so a caller
+	// cannot probe for other agents' private entries.
+	errMemoryNotFound = errors.New("memory entry not found")
+	// errMemoryForgotten is returned when the current version is a forget.
+	errMemoryForgotten = errors.New("memory entry has been forgotten")
+	// errMemoryConflict is returned when another write to the same memory
+	// took the (id, seq) slot first.
+	errMemoryConflict = errors.New("concurrent write to memory entry")
+)
+
+// versionRequest describes a new version of an existing memory. An empty
+// Content makes it a forget (stored as NULL content). Nil Tags, empty
+// Visibility and nil Evidence keep the current version's values;
+// ClearEvidence stores the new version without evidence.
+type versionRequest struct {
+	ID            int64
+	Content       string
+	Tags          []string
+	Visibility    string
+	SourceAgent   string
+	Evidence      *EvidenceTrace
+	ClearEvidence bool
+}
+
+// appendVersion adds a new version of memory req.ID and returns its seq and
+// timestamp. The memory's current version must have content and the same
+// source_agent as the caller. The new version keeps the memory's parent_id.
+// No existing row is changed; the FTS triggers move the index to the new
+// version.
+func appendVersion(db *sql.DB, req versionRequest) (int64, string, error) {
+	now := time.Now().UTC().Format(time.RFC3339)
+
+	tx, err := db.Begin()
+	if err != nil {
+		return 0, "", fmt.Errorf("version begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	current, found, err := latestVersion(tx, req.ID)
+	if err != nil {
+		return 0, "", err
+	}
+	if !found || current.SourceAgent != req.SourceAgent {
+		return 0, "", errMemoryNotFound
+	}
+	if current.Forgotten {
+		return 0, "", errMemoryForgotten
+	}
+
+	tags := req.Tags
+	if tags == nil {
+		tags = current.Tags
+	}
+	visibility := req.Visibility
+	if visibility == "" {
+		visibility = current.Visibility
+	}
+	evidence := req.Evidence
+	if evidence == nil && !req.ClearEvidence {
+		evidence = current.Evidence
+	}
+	evidenceStr, err := marshalEvidence(evidence)
+	if err != nil {
+		return 0, "", err
+	}
+	content := sql.NullString{String: req.Content, Valid: req.Content != ""}
+
+	var nextSeq int64
+	_ = tx.QueryRow(`SELECT COALESCE(MAX(seq), 0) + 1 FROM memories`).Scan(&nextSeq)
+
+	_, err = tx.Exec(`
+		INSERT INTO memories (id, seq, content, tags, visibility, source_agent, parent_id, created_at, updated_at, evidence)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, req.ID, nextSeq, content, strings.Join(tags, ","), visibility, current.SourceAgent, current.ParentID, now, now, evidenceStr)
+	if err != nil {
+		if strings.Contains(err.Error(), "UNIQUE constraint failed") {
+			return 0, "", errMemoryConflict
+		}
+		return 0, "", fmt.Errorf("version insert: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return 0, "", fmt.Errorf("version commit: %w", err)
+	}
+	return nextSeq, now, nil
+}
+
+// deleteMemory hard-deletes versions of memory id: the version with the given
+// seq, or every version when seq is 0. It returns the deleted rows. The
+// memories_ad trigger keeps memories_fts in sync.
+func deleteMemory(db *sql.DB, id, seq int64) ([]memoryEntry, error) {
+	tx, err := db.Begin()
+	if err != nil {
+		return nil, fmt.Errorf("delete begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	where := `m.id = ?`
+	args := []any{id}
+	if seq > 0 {
+		where += ` AND m.seq = ?`
+		args = append(args, seq)
+	}
+	rows, err := tx.Query(`SELECT `+memoryColumns+` FROM memories m WHERE `+where+` ORDER BY m.seq`, args...)
+	if err != nil {
+		return nil, fmt.Errorf("delete lookup: %w", err)
+	}
+	deleted, err := scanEntries(rows)
+	rows.Close()
+	if err != nil {
+		return nil, err
+	}
+	if _, err := tx.Exec(`DELETE FROM memories AS m WHERE `+where, args...); err != nil {
+		return nil, fmt.Errorf("delete failed: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("delete commit: %w", err)
+	}
+	return deleted, nil
+}
+
+// rowScanner is satisfied by *sql.Row and *sql.Rows.
+type rowScanner interface {
+	Scan(dest ...any) error
+}
+
+// scanEntry reads the memoryColumns list into e.
+func scanEntry(row rowScanner, e *memoryEntry) error {
+	var content sql.NullString
+	var tags string
+	var evidenceStr string
+	if err := row.Scan(&e.ID, &content, &tags, &e.Visibility, &e.SourceAgent, &e.ParentID, &e.Seq, &e.CreatedAt, &e.UpdatedAt, &evidenceStr); err != nil {
+		return err
+	}
+	e.Content = content.String
+	e.Forgotten = !content.Valid
 	if tags != "" {
 		e.Tags = strings.Split(tags, ",")
 	}
@@ -707,40 +1033,17 @@ func getMemoryByID(db *sql.DB, id int64) (memoryEntry, bool, error) {
 			e.Evidence = &ev
 		}
 	}
-	return e, true, nil
-}
-
-// deleteMemory hard-deletes the row with the given id. The memories_ad FTS
-// trigger removes the matching FTS entry, so search/list stop returning it.
-func deleteMemory(db *sql.DB, id int64) error {
-	if _, err := db.Exec(`DELETE FROM memories WHERE id = ?`, id); err != nil {
-		return fmt.Errorf("delete failed: %w", err)
-	}
 	return nil
 }
 
 func scanEntries(rows *sql.Rows) ([]memoryEntry, error) {
-	var results []memoryEntry
+	results := []memoryEntry{}
 	for rows.Next() {
 		var e memoryEntry
-		var tags string
-		var evidenceStr string
-		if err := rows.Scan(&e.ID, &e.Content, &tags, &e.Visibility, &e.SourceAgent, &e.ParentID, &e.Seq, &e.CreatedAt, &e.UpdatedAt, &evidenceStr); err != nil {
+		if err := scanEntry(rows, &e); err != nil {
 			continue
 		}
-		if tags != "" {
-			e.Tags = strings.Split(tags, ",")
-		}
-		if evidenceStr != "" {
-			var ev EvidenceTrace
-			if err := json.Unmarshal([]byte(evidenceStr), &ev); err == nil {
-				e.Evidence = &ev
-			}
-		}
 		results = append(results, e)
-	}
-	if results == nil {
-		results = []memoryEntry{}
 	}
 	return results, nil
 }
@@ -806,41 +1109,63 @@ func buildAcceptTagsFilter(acceptTags []string) (string, []any) {
 
 // --- Schema ---
 
-// initSchema creates the memories table and FTS5 virtual table.
+// memoriesTableSQL is the versioned memories table. Every row is one version
+// of a memory: id is shared by all versions of a memory, and the row with the
+// highest seq for an id is its current version. NULL content is a forget.
+// version_id is internal: it is the FTS rowid, and an explicit INTEGER PRIMARY
+// KEY so VACUUM cannot renumber it.
+const memoriesTableSQL = `
+	CREATE TABLE IF NOT EXISTS %s (
+		version_id   INTEGER PRIMARY KEY AUTOINCREMENT,
+		id           INTEGER NOT NULL,
+		seq          INTEGER NOT NULL,
+		content      TEXT,
+		tags         TEXT DEFAULT '',
+		visibility   TEXT DEFAULT 'public',
+		source_agent TEXT DEFAULT '',
+		parent_id    INTEGER DEFAULT 0,
+		evidence     TEXT DEFAULT '',
+		created_at   TEXT NOT NULL,
+		updated_at   TEXT NOT NULL,
+		UNIQUE (id, seq)
+	)`
+
+// openDB opens the SQLite database at dbPath and brings its schema up to date.
+// Transactions start with BEGIN IMMEDIATE (_txlock), so a write transaction
+// takes the write lock before its first read. Concurrent writers then wait on
+// busy_timeout instead of failing with SQLITE_BUSY when a read-then-write
+// transaction (MAX(seq), current version) tries to upgrade its lock.
+func openDB(dbPath string) (*sql.DB, error) {
+	db, err := sql.Open("sqlite", dbPath+"?_pragma=journal_mode(wal)&_pragma=busy_timeout(5000)&_txlock=immediate")
+	if err != nil {
+		return nil, fmt.Errorf("failed to open database: %w", err)
+	}
+	for _, step := range []struct {
+		name string
+		run  func(*sql.DB) error
+	}{
+		{"initialize schema", initSchema},
+		{"run membrane migration", migrateMembraneColumns},
+		{"run evidence migration", migrateEvidenceColumn},
+		{"run versioned schema migration", migrateVersionedSchema},
+		{"set up search index", ensureSearchIndex},
+	} {
+		if err := step.run(db); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("failed to %s: %w", step.name, err)
+		}
+	}
+	return db, nil
+}
+
+// initSchema creates the versioned memories table on a fresh database. On a
+// database from an older release the table already exists and is left alone;
+// the migrations below bring it up to date.
 func initSchema(db *sql.DB) error {
-	_, err := db.Exec(`
-		CREATE TABLE IF NOT EXISTS memories (
-			id         INTEGER PRIMARY KEY AUTOINCREMENT,
-			content    TEXT NOT NULL,
-			tags       TEXT DEFAULT '',
-			created_at TEXT NOT NULL,
-			updated_at TEXT NOT NULL
-		);
-
-		CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
-			content,
-			content=memories,
-			content_rowid=id,
-			tokenize='porter unicode61'
-		);
-
-		-- Triggers to keep FTS index in sync.
-		CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN
-			INSERT INTO memories_fts(rowid, content) VALUES (new.id, new.content);
-		END;
-
-		CREATE TRIGGER IF NOT EXISTS memories_ad AFTER DELETE ON memories BEGIN
-			INSERT INTO memories_fts(memories_fts, rowid, content) VALUES('delete', old.id, old.content);
-		END;
-
-		CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories BEGIN
-			INSERT INTO memories_fts(memories_fts, rowid, content) VALUES('delete', old.id, old.content);
-			INSERT INTO memories_fts(rowid, content) VALUES (new.id, new.content);
-		END;
-
-		CREATE INDEX IF NOT EXISTS idx_memories_updated ON memories(updated_at DESC);
-		CREATE INDEX IF NOT EXISTS idx_memories_tags ON memories(tags);
-	`)
+	if _, err := db.Exec(fmt.Sprintf(memoriesTableSQL, "memories")); err != nil {
+		return err
+	}
+	_, err := db.Exec(`CREATE TABLE IF NOT EXISTS memory_ids (next INTEGER NOT NULL)`)
 	return err
 }
 
@@ -901,6 +1226,163 @@ func migrateEvidenceColumn(db *sql.DB) error {
 	}
 	log.Printf("[memory-server] evidence migration complete")
 	return nil
+}
+
+// migrateVersionedSchema rebuilds a memories table from an older release (id
+// as the primary key, one row per memory) into the versioned table. Each old
+// row becomes version seq of memory id, so ids agents already know keep
+// working. It then makes sure the indexes and the id counter exist.
+// Idempotent: the rebuild is skipped once version_id exists.
+func migrateVersionedSchema(db *sql.DB) error {
+	var count int
+	err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('memories') WHERE name='version_id'`).Scan(&count)
+	if err != nil {
+		return fmt.Errorf("versioned migration check: %w", err)
+	}
+
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("versioned migration begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	if count == 0 {
+		log.Printf("[memory-server] running versioned schema migration")
+		for _, stmt := range []string{
+			fmt.Sprintf(memoriesTableSQL, "memories_new"),
+			`INSERT INTO memories_new (version_id, id, seq, content, tags, visibility, source_agent, parent_id, evidence, created_at, updated_at)
+			 SELECT id, id, COALESCE(seq, 0), content, COALESCE(tags, ''), COALESCE(visibility, 'public'),
+			        COALESCE(source_agent, ''), COALESCE(parent_id, 0), COALESCE(evidence, ''), created_at, updated_at
+			 FROM memories`,
+			// Seed the id counter past every id the old AUTOINCREMENT handed
+			// out, including deleted ones above MAX(id). sqlite_sequence
+			// loses that row when the old table is dropped, so read it first.
+			`CREATE TABLE IF NOT EXISTS memory_ids (next INTEGER NOT NULL)`,
+			`INSERT INTO memory_ids (next)
+			 SELECT MAX(COALESCE((SELECT MAX(id) FROM memories), 0),
+			            COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'memories'), 0)) + 1
+			 WHERE NOT EXISTS (SELECT 1 FROM memory_ids)`,
+			// The old FTS table uses memories as external content; it is
+			// recreated on the new table by ensureSearchIndex. Dropping the
+			// old table also drops its triggers and indexes.
+			`DROP TABLE IF EXISTS memories_fts`,
+			`DROP TABLE memories`,
+			`ALTER TABLE memories_new RENAME TO memories`,
+		} {
+			if _, err := tx.Exec(stmt); err != nil {
+				return fmt.Errorf("versioned migration: %w", err)
+			}
+		}
+	}
+
+	for _, stmt := range []string{
+		`CREATE INDEX IF NOT EXISTS idx_memories_updated ON memories(updated_at DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_memories_tags ON memories(tags)`,
+		`CREATE INDEX IF NOT EXISTS idx_memories_visibility ON memories(visibility)`,
+		`CREATE INDEX IF NOT EXISTS idx_memories_source_agent ON memories(source_agent)`,
+		`CREATE INDEX IF NOT EXISTS idx_memories_seq ON memories(seq DESC)`,
+		`CREATE TABLE IF NOT EXISTS memory_ids (next INTEGER NOT NULL)`,
+		`INSERT INTO memory_ids (next)
+		 SELECT COALESCE((SELECT MAX(id) FROM memories), 0) + 1
+		 WHERE NOT EXISTS (SELECT 1 FROM memory_ids)`,
+	} {
+		if _, err := tx.Exec(stmt); err != nil {
+			return fmt.Errorf("versioned schema: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("versioned migration commit: %w", err)
+	}
+	if count == 0 {
+		log.Printf("[memory-server] versioned schema migration complete")
+	}
+	return nil
+}
+
+// searchIndexSQL creates the FTS index over exactly the current versions that
+// have content. memories_current is the FTS external content, so 'rebuild'
+// and 'integrity-check' work against that set. The triggers keep the index in
+// step with inserts and admin deletes, and only issue an FTS 'delete' for a
+// row that is indexed, which keeps the index from being corrupted. Rows are
+// never updated; memories_no_update enforces that.
+const searchIndexSQL = `
+	CREATE VIEW memories_current AS
+		SELECT m.version_id, m.content FROM memories m
+		WHERE m.content IS NOT NULL
+		  AND m.seq = (SELECT MAX(x.seq) FROM memories x WHERE x.id = m.id);
+
+	CREATE VIRTUAL TABLE memories_fts USING fts5(
+		content,
+		content='memories_current',
+		content_rowid='version_id',
+		tokenize='porter unicode61'
+	);
+
+	-- A new version that is now the latest replaces the previous latest.
+	CREATE TRIGGER memories_ai AFTER INSERT ON memories
+	WHEN NOT EXISTS (SELECT 1 FROM memories x WHERE x.id = new.id AND x.seq > new.seq)
+	BEGIN
+		INSERT INTO memories_fts(memories_fts, rowid, content)
+			SELECT 'delete', p.version_id, p.content FROM memories p
+			WHERE p.id = new.id AND p.content IS NOT NULL
+			  AND p.seq = (SELECT MAX(x.seq) FROM memories x WHERE x.id = new.id AND x.seq < new.seq);
+		INSERT INTO memories_fts(rowid, content)
+			SELECT new.version_id, new.content WHERE new.content IS NOT NULL;
+	END;
+
+	-- Deleting the latest version makes the previous version current.
+	CREATE TRIGGER memories_ad AFTER DELETE ON memories
+	WHEN NOT EXISTS (SELECT 1 FROM memories x WHERE x.id = old.id AND x.seq > old.seq)
+	BEGIN
+		INSERT INTO memories_fts(memories_fts, rowid, content)
+			SELECT 'delete', old.version_id, old.content WHERE old.content IS NOT NULL;
+		INSERT INTO memories_fts(rowid, content)
+			SELECT p.version_id, p.content FROM memories p
+			WHERE p.id = old.id AND p.content IS NOT NULL
+			  AND p.seq = (SELECT MAX(x.seq) FROM memories x WHERE x.id = old.id);
+	END;
+
+	CREATE TRIGGER memories_no_update BEFORE UPDATE ON memories
+	BEGIN
+		SELECT RAISE(ABORT, 'memories is append-only');
+	END;
+
+	INSERT INTO memories_fts(memories_fts) VALUES('rebuild');
+`
+
+// ensureSearchIndex creates the FTS index, its content view and triggers when
+// they are missing or still in the pre-versioning form, and rebuilds the
+// index from memories_current. Idempotent.
+func ensureSearchIndex(db *sql.DB) error {
+	var ftsSQL string
+	err := db.QueryRow(`SELECT sql FROM sqlite_master WHERE name = 'memories_fts'`).Scan(&ftsSQL)
+	if err != nil && err != sql.ErrNoRows {
+		return fmt.Errorf("search index check: %w", err)
+	}
+	if strings.Contains(ftsSQL, "memories_current") {
+		return nil
+	}
+
+	log.Printf("[memory-server] building search index")
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("search index begin tx: %w", err)
+	}
+	defer tx.Rollback()
+	for _, stmt := range []string{
+		`DROP TABLE IF EXISTS memories_fts`,
+		`DROP VIEW IF EXISTS memories_current`,
+		`DROP TRIGGER IF EXISTS memories_ai`,
+		`DROP TRIGGER IF EXISTS memories_ad`,
+		`DROP TRIGGER IF EXISTS memories_au`,
+		`DROP TRIGGER IF EXISTS memories_no_update`,
+		searchIndexSQL,
+	} {
+		if _, err := tx.Exec(stmt); err != nil {
+			return fmt.Errorf("search index: %w", err)
+		}
+	}
+	return tx.Commit()
 }
 
 // evidenceKindRank maps evidence kinds to quality ranks for filtering.
