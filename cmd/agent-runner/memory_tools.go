@@ -639,33 +639,7 @@ func workflowMemoryToolDefs() []ToolDef {
 				"description": "Tags for categorization (e.g., ['kafka', 'consumer-lag']). Your persona name is added automatically.",
 			},
 		}
-		storeProps["evidence"] = map[string]any{
-			"type":        "object",
-			"description": "Evidence trace for provenance tracking. Attach this when storing findings backed by tool outputs or external sources.",
-			"properties": map[string]any{
-				"kind": map[string]any{
-					"type":        "string",
-					"enum":        []string{"tool_result", "external_source", "llm_interpretation", "agent_opinion"},
-					"description": "Evidence quality tier: tool_result (direct tool output), external_source (URL/doc reference), llm_interpretation (model analysis), agent_opinion (subjective assessment).",
-				},
-				"tool_call": map[string]any{
-					"type":        "string",
-					"description": "Tool name and arguments that produced this finding (for tool_result kind).",
-				},
-				"raw_result": map[string]any{
-					"type":        "string",
-					"description": "Unmodified tool output or source content (truncated to key details).",
-				},
-				"source": map[string]any{
-					"type":        "string",
-					"description": "URL, document reference, or upstream memory entry ID.",
-				},
-				"confidence": map[string]any{
-					"type":        "number",
-					"description": "Confidence level from 0.0 to 1.0.",
-				},
-			},
-		}
+		storeProps["evidence"] = evidenceParam("Evidence trace for provenance tracking. Attach this when storing findings backed by tool outputs or external sources.")
 		storeDesc := "Store a finding in the shared team memory so other personas in the workflow can access it. Entries are automatically tagged with your persona name for attribution. You can attach an evidence trace to record how the finding was derived."
 
 		// Add membrane parameters when configured.
@@ -693,7 +667,7 @@ func workflowMemoryToolDefs() []ToolDef {
 		}, ToolDef{
 			Name:        ToolWorkflowMemoryUpdate,
 			Description: "Correct a shared team memory entry that you stored. The entry keeps its ID; the new content replaces the old content in all future searches and lists for every persona. Use this when a finding is wrong or out of date, instead of storing a second, conflicting entry.",
-			Parameters:  memoryUpdateParams("the corrected finding in full. It replaces the old content; it is not appended."),
+			Parameters:  workflowMemoryUpdateParams(),
 		}, ToolDef{
 			Name:        ToolWorkflowMemoryForget,
 			Description: "Forget a shared team memory entry that you stored. Future searches and lists no longer return it for any persona. Use this for findings that are wrong and have no correct replacement.",
@@ -704,7 +678,49 @@ func workflowMemoryToolDefs() []ToolDef {
 	return defs
 }
 
-// executeWorkflowMemoryTool dispatches a workflow memory tool call to the shared memory server.
+// workflowMemoryUpdateParams is the memory_update schema plus evidence, so a
+// correction can restate how the finding is known. The membrane's min_kind
+// filter ranks entries by evidence kind.
+func workflowMemoryUpdateParams() map[string]any {
+	params := memoryUpdateParams("the corrected finding in full. It replaces the old content; it is not appended.")
+	params["properties"].(map[string]any)["evidence"] = evidenceParam(
+		"Evidence trace for the corrected finding. Omit to keep the entry's current evidence; pass {} to clear it.")
+	return params
+}
+
+// evidenceParam is the evidence trace schema shared by workflow_memory_store
+// and workflow_memory_update.
+func evidenceParam(description string) map[string]any {
+	return map[string]any{
+		"type":        "object",
+		"description": description,
+		"properties": map[string]any{
+			"kind": map[string]any{
+				"type":        "string",
+				"enum":        []string{"tool_result", "external_source", "llm_interpretation", "agent_opinion"},
+				"description": "Evidence quality tier: tool_result (direct tool output), external_source (URL/doc reference), llm_interpretation (model analysis), agent_opinion (subjective assessment).",
+			},
+			"tool_call": map[string]any{
+				"type":        "string",
+				"description": "Tool name and arguments that produced this finding (for tool_result kind).",
+			},
+			"raw_result": map[string]any{
+				"type":        "string",
+				"description": "Unmodified tool output or source content (truncated to key details).",
+			},
+			"source": map[string]any{
+				"type":        "string",
+				"description": "URL, document reference, or upstream memory entry ID.",
+			},
+			"confidence": map[string]any{
+				"type":        "number",
+				"description": "Confidence level from 0.0 to 1.0.",
+			},
+		},
+	}
+}
+
+// executeWorkflowMemoryTooldispatches a workflow memory tool call to the shared memory server.
 func executeWorkflowMemoryTool(ctx context.Context, toolName string, argsJSON string) string {
 	if workflowMemoryServerURL == "" {
 		return "Error: shared workflow memory not configured (WORKFLOW_MEMORY_SERVER_URL not set)"
@@ -766,6 +782,11 @@ func executeWorkflowMemoryTool(ctx context.Context, toolName string, argsJSON st
 			}
 		}
 		version["source_agent"] = instanceName
+		// Only update takes evidence. An omitted field keeps the entry's
+		// current evidence on the server; {} clears it.
+		if ev, ok := args["evidence"].(map[string]any); ok && toolName == ToolWorkflowMemoryUpdate {
+			version["evidence"] = ev
+		}
 	}
 
 	// Inject membrane fields for search and list calls.

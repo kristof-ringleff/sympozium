@@ -805,9 +805,9 @@ func TestExecuteMemoryTool_UpdateAndForget(t *testing.T) {
 	memoryServerURL = srv.URL
 	defer func() { memoryServerURL = old }()
 
-	// Extra fields from the model (source_agent, visibility) must not be forwarded.
+	// Extra fields from the model (source_agent, visibility, evidence) must not be forwarded.
 	result := executeMemoryTool(context.Background(), ToolMemoryUpdate,
-		`{"id":3,"content":"corrected","tags":["kafka"],"source_agent":"someone-else","visibility":"public"}`)
+		`{"id":3,"content":"corrected","tags":["kafka"],"source_agent":"someone-else","visibility":"public","evidence":{"kind":"tool_result"}}`)
 	if strings.HasPrefix(result, "Error") || strings.HasPrefix(result, "Memory") {
 		t.Fatalf("unexpected result: %s", result)
 	}
@@ -865,8 +865,8 @@ func TestWorkflowMemoryUpdate_Attribution(t *testing.T) {
 	membraneExposeTags = []string{"findings"}
 
 	executeWorkflowMemoryTool(context.Background(), ToolWorkflowMemoryUpdate,
-		`{"id":3,"content":"fixed","tags":["debug"],"source_agent":"lead"}`)
-	executeWorkflowMemoryTool(context.Background(), ToolWorkflowMemoryForget, `{"id":3,"source_agent":"lead"}`)
+		`{"id":3,"content":"fixed","tags":["debug"],"source_agent":"lead","evidence":{"kind":"tool_result","tool_call":"kubectl get pods"}}`)
+	executeWorkflowMemoryTool(context.Background(), ToolWorkflowMemoryForget, `{"id":3,"source_agent":"lead","evidence":{"kind":"tool_result"}}`)
 
 	if len(bodies) != 2 {
 		t.Fatalf("expected 2 requests, got %d", len(bodies))
@@ -884,6 +884,24 @@ func TestWorkflowMemoryUpdate_Attribution(t *testing.T) {
 	}
 	if _, ok := bodies[1]["visibility"]; ok {
 		t.Errorf("forget should not send visibility, got %v", bodies[1]["visibility"])
+	}
+	// Update forwards evidence so a correction can restate how it is known;
+	// forget has no content, so it never carries evidence.
+	if ev, _ := bodies[0]["evidence"].(map[string]any); ev["kind"] != "tool_result" || ev["tool_call"] != "kubectl get pods" {
+		t.Errorf("update evidence = %v, want the model's evidence trace", bodies[0]["evidence"])
+	}
+	if _, ok := bodies[1]["evidence"]; ok {
+		t.Errorf("forget should not send evidence, got %v", bodies[1]["evidence"])
+	}
+
+	for _, def := range workflowMemoryToolDefs() {
+		if def.Name != ToolWorkflowMemoryUpdate {
+			continue
+		}
+		props := def.Parameters["properties"].(map[string]any)
+		if _, ok := props["evidence"]; !ok {
+			t.Errorf("%s should expose an evidence parameter", def.Name)
+		}
 	}
 }
 

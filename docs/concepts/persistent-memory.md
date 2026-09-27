@@ -254,7 +254,7 @@ A `wait-for-shared-memory` init container ensures the server is ready before the
 | `workflow_memory_search(query, top_k?)` | Full-text search across all team knowledge |
 | `workflow_memory_store(content, tags?)` | Store findings for other personas (auto-tagged with source persona) |
 | `workflow_memory_list(tags?, limit?)` | List entries, filterable by tag or persona |
-| `workflow_memory_update(id, content, tags?)` | Correct an entry this persona stored (see [Correcting and Forgetting](#correcting-and-forgetting)) |
+| `workflow_memory_update(id, content, tags?, evidence?)` | Correct an entry this persona stored. Omitted `evidence` is kept; `{}` clears it (see [Correcting and Forgetting](#correcting-and-forgetting)) |
 | `workflow_memory_forget(id)` | Remove an entry this persona stored from search and list |
 
 The `workflow_memory_store`, `workflow_memory_update` and `workflow_memory_forget` tools are only available to personas with `read-write` access. The source persona name is automatically added as a tag for attribution.
