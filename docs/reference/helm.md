@@ -55,6 +55,8 @@ See [Celln Backend](../concepts/celln-backend.md).
 - **`celln.dispatcher.*`** is the single in-cluster dispatcher used by the
   one-shot router when no fleet is configured. It carries no node selector
   but mounts the node's `/dev/kvm`, so the node it lands on must provide KVM.
+  `celln.dispatcher.tolerations` lets it run on a tainted KVM node (for
+  example a single-node cluster's control plane).
 - **`celln.installer.enabled`** deploys the legacy privileged host-installer
   DaemonSet (bare-metal systemd dispatcher, labelled nodes only); it is
   mutually exclusive with the in-cluster dispatcher. Only this path reads `celln.anthropicApiKey`,
