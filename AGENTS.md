@@ -17,7 +17,7 @@ Sympozium is a **Kubernetes-native agent orchestration platform** written in Go.
 ## Repository Layout
 
 ```
-api/v1alpha1/           # CRD type definitions (Agent, AgentRun, SympoziumPolicy, SkillPack, SympoziumSchedule, Ensemble, Model, MCPServer, SympoziumConfig)
+api/v1alpha1/           # CRD type definitions (Agent, AgentRun, SympoziumPolicy, SkillPack, SympoziumSchedule, Ensemble, Model, MCPServer, SympoziumConfig, ModelConnection)
 cmd/
   agent-runner/         # Agent container — LLM loop + tool execution
   apiserver/            # HTTP + WebSocket API server
@@ -72,6 +72,7 @@ docs/                   # Design & contributor documentation
 | `Model` | Cluster-local inference — GGUF/HuggingFace source, llama-cpp/vllm/tgi backend, OpenAI-compatible endpoint |
 | `MCPServer` | Managed MCP server lifecycle — stdio or HTTP transport, tool discovery, allow/deny filtering |
 | `SympoziumConfig` | Platform-wide singleton — gateway, canary, and pricing settings |
+| `ModelConnection` | Reusable namespaced model route for persistent harnesses and native Celln runs |
 
 Type definitions live in `api/v1alpha1/`. After modifying types, regenerate with:
 
@@ -141,6 +142,7 @@ make build              # Build all binaries
 make test               # Run unit tests with race detector
 make test-short         # Run short tests only
 make test-integration   # Run all integration tests (requires Kind + API key)
+(cd web && npm run test:stubbed)  # Console Cypress specs that stub every API call (no cluster; needs `npx vite` running; CI runs these on web/** PRs)
 make vet                # go vet
 make fmt                # gofmt
 make tidy               # go mod tidy

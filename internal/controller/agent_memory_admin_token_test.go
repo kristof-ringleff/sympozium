@@ -14,7 +14,7 @@ import (
 	sympoziumv1alpha1 "github.com/sympozium-ai/sympozium/api/v1alpha1"
 )
 
-// ── syncMemoryServerEnv ──────────────────────────────────────────────────
+// ── syncMemoryAdminTokenEnv ──────────────────────────────────────────────────
 //
 // reconcileMemoryDeployment is create-only for the bulk of the Deployment spec,
 // so an existing memory Deployment would never pick up the admin-delete token
@@ -62,8 +62,8 @@ func TestSyncMemoryAdminTokenEnv_AddsWhenEnabled(t *testing.T) {
 	})
 	_, cl := newInstanceTestReconciler(t, deploy)
 
-	if err := syncMemoryServerEnv(context.Background(), cl, logr.Discard(), deploy); err != nil {
-		t.Fatalf("syncMemoryServerEnv: %v", err)
+	if err := syncMemoryAdminTokenEnv(context.Background(), cl, logr.Discard(), deploy); err != nil {
+		t.Fatalf("syncMemoryAdminTokenEnv: %v", err)
 	}
 
 	env, ok := tokenEnvOf(t, cl, "agent-memory", "default")
@@ -99,8 +99,8 @@ func TestSyncMemoryAdminTokenEnv_RemovesWhenDisabled(t *testing.T) {
 	})
 	_, cl := newInstanceTestReconciler(t, deploy)
 
-	if err := syncMemoryServerEnv(context.Background(), cl, logr.Discard(), deploy); err != nil {
-		t.Fatalf("syncMemoryServerEnv: %v", err)
+	if err := syncMemoryAdminTokenEnv(context.Background(), cl, logr.Discard(), deploy); err != nil {
+		t.Fatalf("syncMemoryAdminTokenEnv: %v", err)
 	}
 
 	if _, ok := tokenEnvOf(t, cl, "agent-memory", "default"); ok {
@@ -133,8 +133,8 @@ func TestSyncMemoryAdminTokenEnv_RepointsToNewSecret(t *testing.T) {
 	})
 	_, cl := newInstanceTestReconciler(t, deploy)
 
-	if err := syncMemoryServerEnv(context.Background(), cl, logr.Discard(), deploy); err != nil {
-		t.Fatalf("syncMemoryServerEnv: %v", err)
+	if err := syncMemoryAdminTokenEnv(context.Background(), cl, logr.Discard(), deploy); err != nil {
+		t.Fatalf("syncMemoryAdminTokenEnv: %v", err)
 	}
 
 	env, ok := tokenEnvOf(t, cl, "agent-memory", "default")
@@ -158,8 +158,8 @@ func TestSyncMemoryAdminTokenEnv_NoWriteWhenAlreadyCorrect(t *testing.T) {
 		t.Fatalf("get deployment: %v", err)
 	}
 
-	if err := syncMemoryServerEnv(context.Background(), cl, logr.Discard(), deploy); err != nil {
-		t.Fatalf("syncMemoryServerEnv: %v", err)
+	if err := syncMemoryAdminTokenEnv(context.Background(), cl, logr.Discard(), deploy); err != nil {
+		t.Fatalf("syncMemoryAdminTokenEnv: %v", err)
 	}
 
 	var after appsv1.Deployment
@@ -182,8 +182,8 @@ func TestSyncMemoryAdminTokenEnv_MatchesContainerByName(t *testing.T) {
 	deploy := memoryDeploy("agent-memory", "default", nil, sidecar)
 	_, cl := newInstanceTestReconciler(t, deploy)
 
-	if err := syncMemoryServerEnv(context.Background(), cl, logr.Discard(), deploy); err != nil {
-		t.Fatalf("syncMemoryServerEnv: %v", err)
+	if err := syncMemoryAdminTokenEnv(context.Background(), cl, logr.Discard(), deploy); err != nil {
+		t.Fatalf("syncMemoryAdminTokenEnv: %v", err)
 	}
 
 	var got appsv1.Deployment
@@ -215,8 +215,33 @@ func TestSyncMemoryAdminTokenEnv_NoMemoryServerContainer(t *testing.T) {
 	}
 	_, cl := newInstanceTestReconciler(t, deploy)
 
-	if err := syncMemoryServerEnv(context.Background(), cl, logr.Discard(), deploy); err != nil {
+	if err := syncMemoryAdminTokenEnv(context.Background(), cl, logr.Discard(), deploy); err != nil {
 		t.Fatalf("expected a no-op, got error: %v", err)
+	}
+}
+
+func TestSyncMemoryDeployment_UpdatesOnlyMemoryServerImage(t *testing.T) {
+	t.Setenv("MEMORY_ADMIN_TOKEN_SECRET", "")
+
+	sidecar := corev1.Container{Name: "sidecar", Image: "sidecar:v1"}
+	deploy := memoryDeploy("agent-memory", "default", nil, sidecar)
+	memoryServerContainer(&deploy.Spec.Template.Spec).Image = "ghcr.io/sympozium-ai/sympozium/skill-memory:retired"
+	_, cl := newInstanceTestReconciler(t, deploy)
+
+	const wanted = "ghcr.io/sympozium-ai/sympozium/skill-memory:latest"
+	if err := syncMemoryDeployment(context.Background(), cl, logr.Discard(), deploy, wanted); err != nil {
+		t.Fatalf("syncMemoryDeployment: %v", err)
+	}
+
+	var got appsv1.Deployment
+	if err := cl.Get(context.Background(), types.NamespacedName{Name: "agent-memory", Namespace: "default"}, &got); err != nil {
+		t.Fatalf("get deployment: %v", err)
+	}
+	if image := memoryServerContainer(&got.Spec.Template.Spec).Image; image != wanted {
+		t.Errorf("memory-server image = %q, want %q", image, wanted)
+	}
+	if image := got.Spec.Template.Spec.Containers[0].Image; image != "sidecar:v1" {
+		t.Errorf("sidecar image changed to %q", image)
 	}
 }
 
@@ -245,6 +270,31 @@ func TestReconcileMemoryDeployment_UpdatesTokenOnExisting(t *testing.T) {
 
 	if _, ok := tokenEnvOf(t, cl, "agent-memory", "default"); !ok {
 		t.Error("existing memory Deployment did not pick up MEMORY_ADMIN_TOKEN on reconcile")
+	}
+}
+
+func TestReconcileMemoryDeployment_UpdatesImageOnExisting(t *testing.T) {
+	t.Setenv("SYMPOZIUM_IMAGE_REGISTRY", "registry.example/sympozium")
+
+	instance := &sympoziumv1alpha1.Agent{
+		ObjectMeta: metav1.ObjectMeta{Name: "agent", Namespace: "default"},
+		Spec:       sympoziumv1alpha1.AgentSpec{Skills: []sympoziumv1alpha1.SkillRef{{SkillPackRef: "memory"}}},
+	}
+	deploy := memoryDeploy("agent-memory", "default", nil)
+	memoryServerContainer(&deploy.Spec.Template.Spec).Image = "registry.example/sympozium/skill-memory:retired"
+	r, cl := newInstanceTestReconciler(t, instance, deploy)
+	r.ImageTag = "latest"
+
+	if err := r.reconcileMemoryDeployment(context.Background(), logr.Discard(), instance); err != nil {
+		t.Fatalf("reconcileMemoryDeployment: %v", err)
+	}
+
+	var got appsv1.Deployment
+	if err := cl.Get(context.Background(), types.NamespacedName{Name: "agent-memory", Namespace: "default"}, &got); err != nil {
+		t.Fatalf("get deployment: %v", err)
+	}
+	if image := memoryServerContainer(&got.Spec.Template.Spec).Image; image != "registry.example/sympozium/skill-memory:latest" {
+		t.Errorf("memory-server image = %q, want latest configured image", image)
 	}
 }
 
@@ -279,5 +329,32 @@ func TestReconcileSharedMemory_UpdatesTokenOnExisting(t *testing.T) {
 
 	if _, ok := tokenEnvOf(t, cl, "crew-shared-memory", "default"); !ok {
 		t.Error("existing shared memory Deployment did not pick up MEMORY_ADMIN_TOKEN on reconcile")
+	}
+}
+
+func TestReconcileSharedMemory_UpdatesImageOnExisting(t *testing.T) {
+	t.Setenv("SYMPOZIUM_IMAGE_REGISTRY", "registry.example/sympozium")
+	t.Setenv("SYMPOZIUM_IMAGE_TAG", "latest")
+
+	pack := &sympoziumv1alpha1.Ensemble{
+		ObjectMeta: metav1.ObjectMeta{Name: "crew", Namespace: "default"},
+		Spec:       sympoziumv1alpha1.EnsembleSpec{SharedMemory: &sympoziumv1alpha1.SharedMemorySpec{Enabled: true}},
+	}
+	pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: "crew-shared-memory-db", Namespace: "default"}}
+	deploy := memoryDeploy("crew-shared-memory", "default", nil)
+	memoryServerContainer(&deploy.Spec.Template.Spec).Image = "registry.example/sympozium/skill-memory:retired"
+
+	agentR, cl := newInstanceTestReconciler(t, pack, pvc, deploy)
+	r := &EnsembleReconciler{Client: cl, Scheme: agentR.Scheme, Log: logr.Discard()}
+	if err := r.reconcileSharedMemory(context.Background(), logr.Discard(), pack); err != nil {
+		t.Fatalf("reconcileSharedMemory: %v", err)
+	}
+
+	var got appsv1.Deployment
+	if err := cl.Get(context.Background(), types.NamespacedName{Name: "crew-shared-memory", Namespace: "default"}, &got); err != nil {
+		t.Fatalf("get deployment: %v", err)
+	}
+	if image := memoryServerContainer(&got.Spec.Template.Spec).Image; image != "registry.example/sympozium/skill-memory:latest" {
+		t.Errorf("memory-server image = %q, want latest configured image", image)
 	}
 }

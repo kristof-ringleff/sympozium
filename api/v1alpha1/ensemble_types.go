@@ -178,6 +178,14 @@ type EnsembleSpec struct {
 	// stamped out by this ensemble and applied to the agent container.
 	// +optional
 	VolumeMounts []corev1.VolumeMount `json:"volumeMounts,omitempty"`
+
+	// Workspace configures the /workspace volume policy applied to every
+	// Agent stamped out by this ensemble. Useful for opting an entire
+	// team of harness-backed agents (codex, claude-code, etc.) into
+	// per-session PVCs in one place. Per-persona Workspace overrides in
+	// AgentConfigSpec.Workspace take precedence.
+	// +optional
+	Workspace *WorkspaceSpec `json:"workspace,omitempty"`
 }
 
 // AgentConfigSpec defines a single agent configuration within an Ensemble.
@@ -262,6 +270,12 @@ type AgentConfigSpec struct {
 	// +optional
 	Lifecycle *LifecycleHooks `json:"lifecycle,omitempty"`
 
+	// Tolerations allow agent pods spawned for this agent configuration
+	// to schedule onto tainted nodes. Propagated to the generated
+	// Agent's AgentConfig.Tolerations.
+	// +optional
+	Tolerations []corev1.Toleration `json:"tolerations,omitempty"`
+
 	// ChannelAccessControl maps channel types to per-agent-configuration access control
 	// overrides. When set, these take priority over ensemble-level
 	// ChannelAccessControl for this agent configuration. Use AllowedChats with Discord
@@ -313,6 +327,12 @@ type AgentConfigSpec struct {
 	// When empty, the provider-appropriate default applies.
 	// +optional
 	RunTimeout string `json:"runTimeout,omitempty"`
+
+	// Workspace overrides the ensemble-level Workspace policy for this
+	// agent configuration. When non-nil, replaces (not merges with) the
+	// ensemble-level value entirely.
+	// +optional
+	Workspace *WorkspaceSpec `json:"workspace,omitempty"`
 }
 
 // AgentConfigWebEndpoint configures the web endpoint for an agent configuration.

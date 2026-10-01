@@ -18,6 +18,7 @@ import (
 
 	sympoziumv1alpha1 "github.com/sympozium-ai/sympozium/api/v1alpha1"
 	"github.com/sympozium-ai/sympozium/internal/eventbus"
+	"github.com/sympozium-ai/sympozium/internal/sessionkey"
 )
 
 // ChatCompletionRequest is the OpenAI-compatible chat completions request.
@@ -192,7 +193,7 @@ func (p *Proxy) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		Spec: sympoziumv1alpha1.AgentRunSpec{
 			AgentRef:     inst.Name,
 			AgentID:      "primary",
-			SessionKey:   fmt.Sprintf("web-%s-%d", inst.Name, time.Now().UnixNano()),
+			SessionKey:   sessionkey.ForWebProxy(inst.Name, requestHash),
 			Task:         sympoziumv1alpha1.NewStringTask(task),
 			SystemPrompt: systemPrompt,
 			Model: sympoziumv1alpha1.ModelSpec{
@@ -208,6 +209,7 @@ func (p *Proxy) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			Timeout:          inst.Spec.Agents.Default.ParseRunTimeout(),
 			ImagePullSecrets: inst.Spec.ImagePullSecrets,
 			Lifecycle:        inst.Spec.Agents.Default.Lifecycle,
+			Tolerations:      inst.Spec.Agents.Default.Tolerations,
 			Env:              inst.Spec.Agents.Default.Env,
 		},
 	}
@@ -440,10 +442,7 @@ func (p *Proxy) findRecentWebRun(ctx context.Context, namespace, instanceName, r
 		}
 		// Skip terminal runs — subscribing to events for a completed run
 		// would hang because the event already fired.
-		phase := run.Status.Phase
-		if phase == sympoziumv1alpha1.AgentRunPhaseSucceeded ||
-			phase == sympoziumv1alpha1.AgentRunPhaseFailed ||
-			phase == sympoziumv1alpha1.AgentRunPhaseSkipped {
+		if run.Status.Phase.IsTerminal() {
 			continue
 		}
 		candidates = append(candidates, run)

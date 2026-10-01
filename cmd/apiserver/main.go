@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -21,13 +22,17 @@ import (
 
 	sympoziumv1alpha1 "github.com/sympozium-ai/sympozium/api/v1alpha1"
 	"github.com/sympozium-ai/sympozium/internal/apiserver"
+	"github.com/sympozium-ai/sympozium/internal/collector"
 	"github.com/sympozium-ai/sympozium/internal/controller"
-	"github.com/sympozium-ai/sympozium/internal/eventbus"
 	"github.com/sympozium-ai/sympozium/pkg/telemetry"
 	webui "github.com/sympozium-ai/sympozium/web"
 )
 
 var scheme = runtime.NewScheme()
+
+// version is set via -ldflags at build time (images/apiserver/Dockerfile
+// passes the image tag).
+var version = "dev"
 
 func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
@@ -74,13 +79,12 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Connect to event bus (retry in background if unavailable).
-	var bus eventbus.EventBus
-	natsbus, err := eventbus.NewNATSEventBus(eventBusURL)
+	// Optional streaming must not prevent the HTTP API from starting. An initial
+	// failure leaves streaming disabled until restart; only an established bus
+	// reconnects in the background. Empty URL explicitly disables the event bus.
+	bus, err := connectOptionalEventBus(eventBusURL)
 	if err != nil {
 		log.Error(err, "event bus not available, starting without streaming support")
-	} else {
-		bus = natsbus
 	}
 
 	kubeClient, err := kubernetes.NewForConfig(cfg)
@@ -111,6 +115,13 @@ func main() {
 	}
 
 	server := apiserver.NewServer(k8sClient.GetClient(), bus, kubeClient, log.WithName("apiserver"))
+	server.SetVersion(version)
+	if path := os.Getenv("CELLN_PERMISSION_PREVIEW_CONFIG"); path != "" {
+		if err := server.LoadCellnPreview(path, k8sClient.GetAPIReader()); err != nil {
+			log.Error(err, "invalid Celln permission preview configuration")
+			os.Exit(1)
+		}
+	}
 
 	// Start llmfit density poller for fitness API endpoints.
 	{
@@ -127,6 +138,27 @@ func main() {
 		}()
 		server.SetDensityCache(densityCache)
 		log.Info("llmfit density poller enabled for API server")
+	}
+
+	// Energy collector (optional): discovers any Service labelled
+	// sympozium.ai/collector=energy in an allowlisted namespace and serves its
+	// per-accelerator power readings on GET /api/v1/power. Absent collector ⇒
+	// the endpoint reports unavailable and the UI omits the power surface.
+	//
+	// The namespace list is an allowlist, not a filter: it is what prevents an
+	// arbitrary pod from labelling itself a collector and forging power data.
+	// See internal/collector.New.
+	if nsList := os.Getenv("SYMPOZIUM_ENERGY_COLLECTOR_NAMESPACES"); nsList != "" {
+		var namespaces []string
+		for _, ns := range strings.Split(nsList, ",") {
+			if ns = strings.TrimSpace(ns); ns != "" {
+				namespaces = append(namespaces, ns)
+			}
+		}
+		if len(namespaces) > 0 {
+			server.SetPowerClient(collector.New(kubeClient, namespaces, 2*time.Second))
+			log.Info("energy collector discovery enabled", "namespaces", namespaces)
+		}
 	}
 
 	// Build the token reader. Prefer the file (production path: Secret
@@ -146,12 +178,12 @@ func main() {
 			os.Exit(1)
 		}
 		log.Info("Serving web UI", "addr", addr, "auth", expected.Current() != "")
-		if err := server.StartWithUI(addr, expected, frontendFS); err != nil {
+		if err := server.ServeContext(ctx, addr, expected, frontendFS); err != nil {
 			log.Error(err, "api server failed")
 			os.Exit(1)
 		}
 	} else {
-		if err := server.Start(addr, expected); err != nil {
+		if err := server.ServeContext(ctx, addr, expected, nil); err != nil {
 			log.Error(err, "api server failed")
 			os.Exit(1)
 		}

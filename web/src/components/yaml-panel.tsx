@@ -10,29 +10,27 @@ import { FileCode, Copy, Check } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { toYaml, type YamlValue } from "@/lib/yaml";
 import type { WizardResult } from "@/components/onboarding-wizard";
-import type { Agent, Ensemble } from "@/lib/api";
+import { executionFromWizard, modelConnectionName, modelConnectionEndpoint } from "@/lib/agent-execution";
+import { skillParamsFromWizard } from "@/lib/create-fields";
+import type { Agent, Ensemble, ModelConnection } from "@/lib/api";
 
 // ── YAML builders ─────────────────────────────────────────────────────────────
 
-/** Build a Agent YAML manifest from wizard form state. */
-export function instanceYamlFromWizard(result: WizardResult): string {
+/**
+ * Build a Agent YAML manifest from wizard form state. A Celln Agent passes its
+ * own connection spec; it names the Secret and never carries the key.
+ */
+export function instanceYamlFromWizard(result: WizardResult, ownConnection?: ModelConnection["spec"]): string {
+  const wizardSkillParams = skillParamsFromWizard(result);
   const skills = result.skills
     .filter((s) => s !== "memory")
     .map((s) => {
       const ref: Record<string, YamlValue> = { skillPackRef: s };
-      if (s === "web-endpoint") {
-        const params: Record<string, string> = {};
-        if (result.webEndpointRPM && result.webEndpointRPM !== "60")
-          params.rate_limit_rpm = result.webEndpointRPM;
-        if (result.webEndpointHostname)
-          params.hostname = result.webEndpointHostname;
-        if (Object.keys(params).length > 0) ref.params = params;
-      }
+      if (wizardSkillParams[s]) ref.params = wizardSkillParams[s];
       return ref;
     });
 
-  // Always include the memory skill
-  skills.unshift({ skillPackRef: "memory" });
+  if (result.skills.includes("memory")) skills.unshift({ skillPackRef: "memory" });
 
   const channels = result.channels.map((type) => {
     const ch: Record<string, YamlValue> = { type };
@@ -43,7 +41,13 @@ export function instanceYamlFromWizard(result: WizardResult): string {
   });
 
   const agentConfig: Record<string, YamlValue> = { model: result.model };
-  if (result.baseURL) agentConfig.baseURL = result.baseURL;
+  // Native Celln routes the model through a namespaced ModelConnection; a
+  // persistent Kubernetes harness does too. Both reference it by name instead
+  // of carrying an inline endpoint.
+  const usesConnection = result.executionBackend === "celln" || !!result.runtimeRef;
+  const connectionName = modelConnectionName(result.name || "agent");
+  if (!usesConnection && result.baseURL) agentConfig.baseURL = result.baseURL;
+  if (result.runTimeout) agentConfig.runTimeout = result.runTimeout;
   if (result.nodeSelector && Object.keys(result.nodeSelector).length > 0)
     agentConfig.nodeSelector = result.nodeSelector;
   if (result.agentSandboxEnabled)
@@ -57,6 +61,20 @@ export function instanceYamlFromWizard(result: WizardResult): string {
     authRefs.push({ provider: result.provider, secret: result.secretName });
   }
 
+  const execution = usesConnection
+    ? executionFromWizard({
+        executionBackend: result.executionBackend,
+        executionLifecycle: result.executionLifecycle,
+        borrowedTools: result.borrowedTools,
+        clusterTools: result.clusterTools,
+        runtimeRef: result.runtimeRef,
+        model: result.model,
+        provider: result.provider,
+        modelConnectionRef: connectionName,
+        enduringDefaults: result.enduringDefaults,
+      })
+    : executionFromWizard(result);
+
   const obj: Record<string, YamlValue> = {
     apiVersion: "sympozium.ai/v1alpha1",
     kind: "Agent",
@@ -64,13 +82,32 @@ export function instanceYamlFromWizard(result: WizardResult): string {
     spec: {
       agents: { default: agentConfig },
       skills,
+      ...(result.runtimeRef ? { runtimeRef: result.runtimeRef } : {}),
+      ...(result.policyRef ? { policyRef: result.policyRef } : {}),
+      execution: execution as unknown as YamlValue,
       ...(channels.length > 0 ? { channels } : {}),
       ...(authRefs.length > 0 ? { authRefs } : {}),
-      memory: { enabled: true },
+      memory: { enabled: result.executionBackend !== "celln" },
     },
   };
 
-  return toYaml(obj);
+  const agentYaml = toYaml(obj);
+  if (!usesConnection) return agentYaml;
+
+  const connection: Record<string, YamlValue> = {
+    apiVersion: "sympozium.ai/v1alpha1",
+    kind: "ModelConnection",
+    metadata: { name: connectionName },
+    spec: (ownConnection as unknown as YamlValue) || {
+      provider: result.provider,
+      protocol: "openai-chat",
+      endpoint: modelConnectionEndpoint(result.baseURL, result.provider),
+      ...(result.secretName ? { secretRef: result.secretName } : {}),
+      models: [result.model],
+    },
+  };
+
+  return `${toYaml(connection)}\n---\n${agentYaml}`;
 }
 
 /** Build a Ensemble activation YAML (the full Ensemble CR is already in the cluster;
@@ -90,10 +127,7 @@ export function ensembleYamlFromWizard(
     if (secret) channelConfigs[ch] = secret;
   }
 
-  const skillParams: Record<string, Record<string, string>> = {};
-  if (result.skills.includes("github-gitops") && result.githubRepo) {
-    skillParams["github-gitops"] = { repo: result.githubRepo };
-  }
+  const skillParams = skillParamsFromWizard(result);
 
   const spec: Record<string, YamlValue> = {
     enabled: true,
@@ -140,6 +174,8 @@ export function instanceYamlFromResource(inst: Agent): string {
     spec.authRefs = inst.spec.authRefs as unknown as YamlValue;
   if (inst.spec.memory) spec.memory = inst.spec.memory as unknown as YamlValue;
   if (inst.spec.policyRef) spec.policyRef = inst.spec.policyRef;
+  if (inst.spec.runtimeRef) spec.runtimeRef = inst.spec.runtimeRef;
+  if (inst.spec.execution) spec.execution = inst.spec.execution as unknown as YamlValue;
 
   const obj: Record<string, YamlValue> = {
     apiVersion: "sympozium.ai/v1alpha1",

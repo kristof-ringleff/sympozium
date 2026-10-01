@@ -37,9 +37,32 @@ type SympoziumPolicySpec struct {
 	// +optional
 	ImagePolicy *ImagePolicySpec `json:"imagePolicy,omitempty"`
 
+	// HarnessPolicy controls whether an Agent bound to this policy may replace
+	// Sympozium's trusted agent-runner with an external harness adapter image.
+	// External harnesses are disabled unless this field is present and enabled.
+	// +optional
+	HarnessPolicy *HarnessPolicySpec `json:"harnessPolicy,omitempty"`
+
 	// LifecyclePolicy defines bounds on lifecycle hook RBAC requests.
 	// +optional
 	LifecyclePolicy *LifecyclePolicySpec `json:"lifecyclePolicy,omitempty"`
+}
+
+// HarnessPolicySpec controls access to the experimental external harness
+// runtime. Image restrictions are configured separately through ImagePolicy.
+type HarnessPolicySpec struct {
+	// Enabled explicitly opts Agents bound to this policy into external harness
+	// execution. It defaults to false because the harness becomes the pod's
+	// primary process and receives the run's model and MCP credentials.
+	// +kubebuilder:default=false
+	Enabled bool `json:"enabled,omitempty"`
+
+	// AllowUnmetered permits a harness adapter that does not report token usage.
+	// External adapters own their model loop, so Sympozium cannot infer usage;
+	// without this opt-in, an ensemble token budget could appear enforced while
+	// silently receiving no accounting data. Defaults to false.
+	// +optional
+	AllowUnmetered bool `json:"allowUnmetered,omitempty"`
 }
 
 // ModelPolicySpec defines model access restrictions.

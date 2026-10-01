@@ -23,16 +23,16 @@ CONTROLLER_GEN ?= $(LOCALBIN)/controller-gen
 BIN_DIR = bin
 
 # All binaries
-BINARIES = controller apiserver ipc-bridge webhook agent-runner sympozium web-proxy node-probe
+BINARIES = controller apiserver ipc-bridge webhook agent-runner sympozium web-proxy node-probe model-gateway
 
 # All channel binaries
 CHANNELS = telegram whatsapp discord slack
 
 # All images
-IMAGES = controller apiserver ipc-bridge webhook agent-runner web-proxy node-probe \
+IMAGES = controller apiserver ipc-bridge webhook agent-runner web-proxy node-probe model-gateway \
          channel-telegram channel-whatsapp channel-discord channel-slack \
 		 skill-k8s-ops skill-sre-observability skill-github-gitops skill-llmfit skill-memory \
-		 llmfit-daemon mcp-bridge
+		 llmfit-daemon mcp-bridge harness-reference
 
 .PHONY: all build test clean generate manifests docker-build docker-push install help web-build web-dev web-dev-serve web-clean web-install setup-hooks integration-tests ux-tests tail-agents
 
@@ -62,7 +62,40 @@ test: ## Run tests
 test-short: ## Run short tests
 	$(GOTEST) -short ./...
 
+.PHONY: test-celln-tenancy-local test-celln-tenancy-integration
+
+test-celln-tenancy-local: ## Run pinned Go/Rust/database/live API/actual gateway process and real-KVM prerequisites (not release qualification)
+	bash ./test/integration/test-celln-tenancy-security.sh --local-kvm
+
+test-celln-tenancy-integration: ## Run explicit component-tier tenancy proof (isolated kubeconfig, PostgreSQL and pinned Celln source required)
+	bash ./test/integration/test-celln-tenancy-security.sh --components
+
+test-celln-model-gateway-live: ## Test gateway against configured Kubernetes API and PostgreSQL (creates temporary namespaces)
+	@test "$$CELLN_GATEWAY_LIVE_KUBERNETES" = 1 || (echo "CELLN_GATEWAY_LIVE_KUBERNETES=1 is required" >&2; exit 1)
+	@test -n "$$CELLN_MODEL_BUDGET_DATABASE_URL" || (echo "CELLN_MODEL_BUDGET_DATABASE_URL is required" >&2; exit 1)
+	go test -race ./internal/modelgateway -run TestLiveKubernetesGatewayTenantCredentialIsolation -count=1 -v
+
+test-celln-model-budget: ## Run real PostgreSQL accounting proof (database URL required)
+	@test -n "$$CELLN_MODEL_BUDGET_DATABASE_URL" || (echo "CELLN_MODEL_BUDGET_DATABASE_URL is required" >&2; exit 1)
+	go test -race ./internal/modelbudget -run Postgres -count=1 -v
+
+test-celln-authorisation-contract: ## Verify the v1 Celln namespace-authorisation fixtures (no cluster, no KVM)
+	go run ./cmd/celln-authorisation-fixture verify -fixtures test/fixtures/celln-authorisation/v1
+
+celln-authorisation-fixtures-gen: ## Regenerate the v1 Celln namespace-authorisation fixtures (test keys only)
+	go run ./cmd/celln-authorisation-fixture gen -fixtures test/fixtures/celln-authorisation/v1
+
+test-hermes-model-connection: ## Test persistent Hermes with a real llama-server (LLAMA_SERVER_URL required)
+	./test/integration/test-hermes-model-connection.sh
+
 test-integration: ## Run integration tests (requires Kind cluster + API keys)
+	@if [ -n "$$CELLN_CATALOGUE_KUBECONFIG" ]; then \
+		bash ./test/integration/test-celln-tool-catalogue.sh && \
+		bash ./test/integration/test-celln-runtime-profile.sh && \
+		bash ./test/integration/test-celln-json-contract.sh; \
+	else \
+		echo "SKIP Celln catalogue metadata proof: explicit isolated CELLN_CATALOGUE_KUBECONFIG required"; \
+	fi
 	./test/integration/test-write-file.sh
 	./test/integration/test-anthropic-write-file.sh
 	./test/integration/test-k8s-ops-nodes.sh
@@ -71,6 +104,8 @@ test-integration: ## Run integration tests (requires Kind cluster + API keys)
 	./test/integration/test-slack-channel.sh
 	./test/integration/test-mcp-bridge.sh
 	./test/integration/test-lifecycle-hooks.sh
+	./test/integration/test-harness-mode.sh
+	./test/integration/test-persistent-harness-session.sh
 
 integration-tests: ## Run API smoke regression tests (Ensembles, ad-hoc Instances, Skills, Policies, Schedules)
 	bash ./test/integration/test-api-smoke.sh
@@ -119,8 +154,19 @@ ux-tests-serve-open: web-install ## Open Cypress interactive runner against `sym
 test-web-proxy: ## Run web-proxy HTTP API tests (requires a running web-endpoint service)
 	bash ./test/integration/test-web-proxy-api.sh
 
-vet: ## Run go vet
+vet: vet-tags ## Run go vet (including build-tagged code, see vet-tags)
 	$(GOVET) ./...
+
+# Files behind a build constraint are invisible to `go build|vet|test ./...`, so
+# they can stop compiling without anything noticing: the envtest suite did, for
+# six weeks. Vet only type-checks — it needs no envtest assets and runs nothing.
+# Every constraint in the repo is listed here; add a line when you add a tag
+# (`grep -rn '^//go:build' --include='*.go' .`).
+.PHONY: vet-tags
+vet-tags: ## Vet code `go vet ./...` cannot see (build tags, other-OS files)
+	$(GOVET) -tags system ./test/system/...
+	$(GOVET) hack/sync-harness-defaults.go
+	GOOS=windows $(GOVET) ./internal/cellnreview/...
 
 lint: ## Run golangci-lint
 	golangci-lint run ./...
@@ -140,9 +186,28 @@ ENVTEST_K8S_VERSION ?= 1.31.0
 envtest: $(ENVTEST) ## Install setup-envtest locally
 $(ENVTEST):
 	@mkdir -p $(LOCALBIN)
-	GOBIN=$(LOCALBIN) $(GOCMD) install sigs.k8s.io/controller-runtime/tools/setup-envtest@latest
+	@# Retry: proxy.golang.org intermittently resets streams in CI.
+	@for i in 1 2 3 4 5; do \
+		GOBIN=$(LOCALBIN) $(GOCMD) install sigs.k8s.io/controller-runtime/tools/setup-envtest@latest && break; \
+		[ "$$i" = 5 ] && exit 1; \
+		echo "setup-envtest install failed (attempt $$i/5); retrying in $$((i*5))s" >&2; sleep $$((i*5)); \
+	done
 
-test-system: envtest ## Run system tests (envtest — no cluster needed, fast)
+# Downloads etcd + kube-apiserver into $(LOCALBIN)/k8s. A no-op (and offline)
+# once they are there, which is what CI's cache of $(LOCALBIN) relies on.
+.PHONY: envtest-assets
+envtest-assets: envtest ## Download the envtest control-plane binaries
+	@for i in 1 2 3 4 5; do \
+		$(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path >/dev/null && break; \
+		[ "$$i" = 5 ] && exit 1; \
+		echo "envtest asset download failed (attempt $$i/5); retrying in $$((i*5))s" >&2; sleep $$((i*5)); \
+	done
+
+.PHONY: envtest-k8s-version
+envtest-k8s-version: ## Print ENVTEST_K8S_VERSION (CI cache key)
+	@echo $(ENVTEST_K8S_VERSION)
+
+test-system: envtest-assets ## Run system tests (envtest — no cluster needed, fast)
 	KUBEBUILDER_ASSETS="$$($(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" \
 	$(GOCMD) test -tags system ./test/system/ -v -count=1 -timeout 120s
 
@@ -191,14 +256,17 @@ web-dev-serve: web-install ## Vite hot-reload + port-forward to in-cluster apise
 	if [ -z "$$APISERVER_TOKEN" ]; then \
 		SECRET_NAME=$$(kubectl get deploy -n $(SYMPOZIUM_NAMESPACE) sympozium-apiserver -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="SYMPOZIUM_UI_TOKEN")].valueFrom.secretKeyRef.name}' 2>/dev/null); \
 		SECRET_KEY=$$(kubectl get deploy -n $(SYMPOZIUM_NAMESPACE) sympozium-apiserver -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="SYMPOZIUM_UI_TOKEN")].valueFrom.secretKeyRef.key}' 2>/dev/null); \
+		if [ -z "$$SECRET_NAME" ]; then \
+			SECRET_NAME=$$(kubectl get deploy -n $(SYMPOZIUM_NAMESPACE) sympozium-apiserver -o jsonpath='{.spec.template.spec.volumes[?(@.name=="sympozium-ui-token")].secret.secretName}' 2>/dev/null); \
+		fi; \
 		if [ -z "$$SECRET_KEY" ]; then SECRET_KEY=token; fi; \
 		if [ -n "$$SECRET_NAME" ]; then \
 			APISERVER_TOKEN=$$(kubectl get secret -n $(SYMPOZIUM_NAMESPACE) "$$SECRET_NAME" -o jsonpath="{.data.$$SECRET_KEY}" 2>/dev/null | base64 -d 2>/dev/null); \
 		fi; \
 	fi; \
 	if [ -z "$$APISERVER_TOKEN" ]; then \
-		echo "ERROR: Could not resolve API token from apiserver deployment."; \
-		echo "  Check: kubectl get deploy -n $(SYMPOZIUM_NAMESPACE) sympozium-apiserver -o yaml | grep SYMPOZIUM_UI_TOKEN"; \
+		echo "ERROR: Could not resolve API token from the apiserver environment or token volume."; \
+		echo "  Check: kubectl get secret -n $(SYMPOZIUM_NAMESPACE) sympozium-ui-token -o jsonpath='{.data.token}'"; \
 		exit 1; \
 	fi; \
 	STALE_PID=$$(lsof -ti tcp:$(API_LOCAL_PORT) 2>/dev/null || true); \
@@ -214,6 +282,7 @@ web-dev-serve: web-install ## Vite hot-reload + port-forward to in-cluster apise
 	echo "  UI:     http://localhost:$(VITE_PORT)"; \
 	echo "  API:    localhost:$(API_LOCAL_PORT) (port-forward)"; \
 	echo "  Token:  $$APISERVER_TOKEN"; \
+	echo "  Context: $$(kubectl config current-context 2>/dev/null || echo unknown) ($$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}' 2>/dev/null)), node $$(kubectl get nodes -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)"; \
 	echo "============================================"; \
 	echo ""; \
 	PF_LOG=/tmp/sympozium-web-dev-serve-portforward.log; \
@@ -357,10 +426,21 @@ run-controller-inner: build-controller
 
 DOCKER_PLATFORMS ?= linux/amd64,linux/arm64
 
+# The Celln dependency (version + archive checksum + image digest) is pinned in
+# one place. Everything that layers onto the Celln image — the parent controller
+# and the host installer — reads it from here.
+CELLN_RELEASE ?= config/celln/release.json
+CELLN_IMAGE ?= ghcr.io/sympozium-ai/celln@$(shell sed -n 's/.*"imageDigest": *"\(sha256:[a-f0-9]*\)".*/\1/p' $(CELLN_RELEASE))
+
 docker-build: $(addprefix docker-build-,$(IMAGES)) ## Build all Docker images (native arch)
 
 docker-build-%: ## Build a specific Docker image (native arch)
 	docker buildx build --build-arg IMAGE_TAG=$(TAG) --load -t $(REGISTRY)/$*:$(TAG) -f images/$*/Dockerfile .
+
+docker-build-celln-installer: ## Build the Celln host-installer image (amd64; needs the Celln base image)
+	docker buildx build --load -t $(REGISTRY)/celln-installer:$(TAG) \
+		--build-arg CELLN_IMAGE=$(CELLN_IMAGE) \
+		-f images/celln-installer/Dockerfile .
 
 docker-buildx: $(addprefix docker-buildx-,$(IMAGES)) ## Build all Docker images for amd64+arm64
 
@@ -392,7 +472,7 @@ GATEWAY_API_CRDS_URL ?= https://github.com/kubernetes-sigs/gateway-api/releases/
 # runs privileged with hostPID and a read-write host-root mount to perform
 # KVM host setup. `make install ENABLE_HERMETIC_WORKLOADS=true` opts in;
 # the plain CLI equivalent is `sympozium install --enable-hermetic-workloads`.
-ENABLE_HERMETIC_WORKLOADS ?= false
+ENABLE_HERMETIC_WORKLOADS ?= true
 
 install: manifests ## Install Sympozium via Helm chart (CRDs, control plane, built-ins)
 	kubectl apply --server-side --force-conflicts -f charts/sympozium/crds/
@@ -450,7 +530,7 @@ db-migrate: ## Run database migrations
 
 ##@ Helm
 
-helm-sync: ## Sync CRDs and appVersion into the Helm charts
+helm-sync: ## Sync CRDs, appVersion, and generated defaults into the Helm charts
 	@echo "Syncing CRDs to charts/sympozium/crds/..."
 	@mkdir -p charts/sympozium/crds
 	cp config/crd/bases/*.yaml charts/sympozium/crds/
@@ -458,9 +538,11 @@ helm-sync: ## Sync CRDs and appVersion into the Helm charts
 	@mkdir -p charts/sympozium-crds/templates
 	@rm -f charts/sympozium-crds/templates/sympozium.ai_*.yaml
 	cp config/crd/bases/*.yaml charts/sympozium-crds/templates/
+	@echo "Syncing harness-examples.yaml reuse-values fallback from values.yaml..."
+	go run hack/sync-harness-defaults.go
 	@echo "Done."
 
-helm-sync-check: ## Check that Helm chart CRDs are in sync (CI use)
+helm-sync-check: ## Check that Helm charts are in sync (CI use)
 	@diff -qr config/crd/bases/ charts/sympozium/crds/ > /dev/null 2>&1 \
 		|| (echo "ERROR: Helm chart CRDs are out of sync. Run 'make helm-sync'" && exit 1)
 	@tmp=$$(mktemp -d); \
@@ -471,11 +553,27 @@ helm-sync-check: ## Check that Helm chart CRDs are in sync (CI use)
 		&& (echo "ERROR: sympozium-crds chart templates are out of sync. Run 'make helm-sync'" && rm -rf $$tmp && exit 1) \
 		|| true; \
 	rm -rf $$tmp
-	@echo "Helm chart CRDs are in sync."
+	@tmp=$$(mktemp); \
+	cp charts/sympozium/templates/harness-examples.yaml $$tmp; \
+	go run hack/sync-harness-defaults.go > /dev/null; \
+	if ! diff -q $$tmp charts/sympozium/templates/harness-examples.yaml > /dev/null; then \
+		echo "ERROR: harness-examples.yaml reuse-values fallback is out of sync with values.yaml. Run 'make helm-sync'"; \
+		cp $$tmp charts/sympozium/templates/harness-examples.yaml; \
+		rm -f $$tmp; \
+		exit 1; \
+	fi; \
+	rm -f $$tmp
+	@echo "Helm charts are in sync."
 
 helm-lint: ## Lint the Helm charts
 	helm lint charts/sympozium/
 	helm lint charts/sympozium-crds/
+
+.PHONY: test-celln-selection-live
+test-celln-selection-live: ## Verify catalogue grants against the explicit isolated API (no runs/model calls)
+	@test -n "$(CELLN_COMPOSITION_KUBECONFIG)" || (echo 'CELLN_COMPOSITION_KUBECONFIG required' >&2; exit 1)
+	@test -n "$(CELLN_COMPOSITION_FIXTURE)" || (echo 'CELLN_COMPOSITION_FIXTURE required' >&2; exit 1)
+	go test -race ./internal/cellnreview -run TestLiveCatalogueSelectionAndGrantIsolation -count=1 -v
 
 ##@ Clean
 

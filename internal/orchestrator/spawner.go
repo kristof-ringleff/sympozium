@@ -19,6 +19,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	sympoziumv1alpha1 "github.com/sympozium-ai/sympozium/api/v1alpha1"
+	"github.com/sympozium-ai/sympozium/internal/sessionkey"
 	"github.com/sympozium-ai/sympozium/internal/toolpolicy"
 )
 
@@ -130,21 +131,33 @@ func (s *Spawner) Spawn(ctx context.Context, req SpawnRequest) (*SpawnResult, er
 	)
 
 	runName := buildSubagentRunName(req.ParentRunName, req.CurrentDepth+1, req.ChildIndex, req.BatchID)
-	sessionKey := fmt.Sprintf("%s:sub:%s", req.ParentSessionKey, runName)
+	sessionKey := sessionkey.ForSub(req.ParentSessionKey, runName)
+
+	labels := map[string]string{
+		"sympozium.ai/instance":   req.InstanceName,
+		"sympozium.ai/agent-id":   req.AgentID,
+		"sympozium.ai/parent-run": req.ParentRunName,
+		"sympozium.ai/component":  "agent-run",
+	}
+	var annotations map[string]string
+	if req.BatchID != "" {
+		// Label values are bounded (63 chars, restricted charset), so a raw
+		// caller-supplied BatchID can't go in directly; batchNameToken already
+		// sanitizes/bounds it for the run name. The unsanitized ID goes in an
+		// annotation, which has no such restriction.
+		labels["sympozium.ai/subagent-batch-id"] = batchNameToken(req.BatchID)
+		annotations = map[string]string{"sympozium.ai/subagent-batch-id-full": req.BatchID}
+	}
 
 	span.SetAttributes(attribute.String("run.name", runName))
 	log.Info("Spawning sub-agent", "runName", runName)
 
 	agentRun := &sympoziumv1alpha1.AgentRun{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      runName,
-			Namespace: req.Namespace,
-			Labels: map[string]string{
-				"sympozium.ai/instance":   req.InstanceName,
-				"sympozium.ai/agent-id":   req.AgentID,
-				"sympozium.ai/parent-run": req.ParentRunName,
-				"sympozium.ai/component":  "agent-run",
-			},
+			Name:        runName,
+			Namespace:   req.Namespace,
+			Labels:      labels,
+			Annotations: annotations,
 		},
 		Spec: sympoziumv1alpha1.AgentRunSpec{
 			AgentRef:   req.InstanceName,
@@ -166,10 +179,11 @@ func (s *Spawner) Spawn(ctx context.Context, req SpawnRequest) (*SpawnResult, er
 		},
 	}
 
-	// Look up the instance to propagate lifecycle hooks, env, and tool policy to sub-agents.
+	// Look up the instance to propagate lifecycle hooks, tolerations, env, and tool policy to sub-agents.
 	var inst sympoziumv1alpha1.Agent
 	if err := s.Client.Get(ctx, client.ObjectKey{Namespace: req.Namespace, Name: req.InstanceName}, &inst); err == nil {
 		agentRun.Spec.Lifecycle = inst.Spec.Agents.Default.Lifecycle
+		agentRun.Spec.Tolerations = inst.Spec.Agents.Default.Tolerations
 		agentRun.Spec.Env = inst.Spec.Agents.Default.Env
 		if agentRun.Spec.Timeout == nil {
 			agentRun.Spec.Timeout = inst.Spec.Agents.Default.ParseRunTimeout()

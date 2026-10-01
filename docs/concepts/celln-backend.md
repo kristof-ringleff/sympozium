@@ -1,8 +1,27 @@
 # Celln Backend (Hermetic Execution)
 
+!!! note "This page describes the one-shot router path"
+    Native persistent Harness support is a separate, opt-in installation under
+    qualification. It uses an enduring `AgentRun`, a leased parent cell and
+    disposable child cells per turn, not the router described below. See
+    [native installation](../guides/celln-native-installation.md) and
+    [skills, tools and execution](skills-tools-and-execution.md). Router
+    reachability alone does not establish native parent readiness.
+
 Sympozium optionally integrates with [Celln](https://github.com/sympozium-ai/celln) to run a single bounded, high-risk, or sensitive computation in a hardware-isolated microVM instead of a Kubernetes Job. It is selected per run with `spec.backend: "celln"` on an `AgentRun`.
 
-Celln is **opt-in**: `celln.enabled=false` by default in the Helm chart, because the installer DaemonSet it deploys runs privileged, with `hostPID`, and a read-write mount of the host root filesystem — necessary to set up KVM on the host, but a materially different trust boundary than the rest of Sympozium's pods. Enable it explicitly with `sympozium install --enable-hermetic-workloads` (or `helm upgrade --set celln.enabled=true`). This page covers what that turns on, and the one requirement that's easy to miss: Celln needs its own AI provider access on the host, separate from whatever provider your `Agent`/`AgentRun` is configured with.
+Celln is deployed by default by `sympozium install`: an in-cluster (pod-based)
+dispatcher, an unprivileged router, and generated router/backend/capability
+credentials plus the ownership PVC. The dispatcher runs as a privileged pod
+with no node selector (it still mounts the node's `/dev/kvm`). A bare-metal
+alternative — a host systemd
+dispatcher installed by the `celln-installer` DaemonSet — is available via
+`sympozium install --celln-host-installer --celln-backend …`. The router is an
+unprivileged Deployment, not a per-node DaemonSet. Disable Celln with
+`sympozium install --no-celln` (or `helm upgrade --set celln.enabled=false`).
+This page also covers the one requirement that's easy to miss: Celln needs its
+own AI provider access, separate from whatever provider your
+`Agent`/`AgentRun` is configured with.
 
 The web UI's Runs page shows a live banner if any listed run uses `backend: celln` while the router is unreachable, and the New Run dialog checks live reachability when you select the Celln backend — both backed by `GET /api/v1/capabilities`.
 
@@ -24,52 +43,130 @@ spec:
 
 ## How It Works
 
+### Dispatcher authentication
+
+The controller requires `CELLN_TOKEN_FILE`, an operator-provisioned file
+containing the Celln bearer credential (at least 24 bytes). This is distinct
+from model-provider credentials and is never read from AgentRun task text.
+The file is re-read for each POST/GET so mounted Secret rotation takes effect.
+Redirects are refused rather than forwarding credentials or changing methods.
+
+With Helm, create the Secret in the **controller namespace** with key `token`
+and set `celln.tokenSecret` to its name. The token must match the selected
+dispatcher/router's configured credential. Prefer an HTTPS `celln.routerUrl`;
+non-loopback plaintext requires explicit `celln.allowInsecureHttp: true` (or
+`CELLN_ALLOW_INSECURE_HTTP=true` outside Helm). This opt-in does not encrypt
+traffic. Missing or invalid credentials refuse dispatch without backend fallback.
+
+These settings configure the controller client; they do not distribute a
+credential to host dispatchers or make legacy installer images compatible.
+Operators must configure both ends deliberately.
+
 ```
 AgentRun (backend: celln)
   │
-  ├─ Controller POSTs {id, task, timeout} to CELLN_ROUTER_URL
+  ├─ Controller POSTs a celln.dev/v1alpha1 ExecutionRequest to CELLN_ROUTER_URL
   │   (celln-router.celln-system.svc.cluster.local:8787)
   │
-  ├─ Router (one pod per KVM node) forwards to the host-level
-  │   celln dispatcher — a systemd service on that node, installed
-  │   by the celln-installer DaemonSet
+  ├─ Router (an unprivileged Deployment) forwards to the dispatcher — by
+  │   default the in-cluster pod-based dispatcher (celln-dispatcher Service),
+  │   or a bare-metal host dispatcher installed by the celln-installer DaemonSet
   │
-  └─ Dispatcher asks its configured AI provider to write a program,
-     attests and seals it into a real KVM cell, runs it, and returns
-     the bounded output. status.cellnActionId tracks the poll.
+  └─ Dispatcher verifies the pinned program (or forges one for task-only
+     requests), seals a KVM cell from a warm mote, runs it, and returns
+     a receipt plus bounded display output. status.cellnActionId tracks the poll.
 ```
 
-The installer and router only schedule onto nodes labeled `celln.dev/kvm: "true"` — Celln needs `/dev/kvm` and is not a container-level isolation mechanism, so it can't run on arbitrary nodes the way the `job` backend can.
+The host-installer only schedules onto nodes labeled `celln.dev/kvm: "true"` — Celln needs `/dev/kvm` and is not a container-level isolation mechanism, so the host path can't run on arbitrary nodes the way the `job` backend can. The in-cluster dispatcher carries no node selector; it still mounts the node's `/dev/kvm`, so the node it lands on must provide KVM.
 
-## Trust model: your task always runs in the agent lane
+## Trust model: task text never grants tool authority
 
 Celln draws a hard line between two authority levels for code running inside a cell: the **tool lane** (an already-attested host binary, sealed in read-only — full but narrow authority) and the **agent lane** (agent-authored code, generated at run time — gets only what's explicitly loaned to it, permanently, no matter how well it's built). Full model: [tool lane](https://sympozium-ai.github.io/celln/tool-lane.html) / [agent lane](https://sympozium-ai.github.io/celln/agent-lane.html).
 
-A Sympozium `backend: celln` `AgentRun` **always executes in the agent lane.** The controller always sends the task as a `forge` request — a model writes a program from the task string, it gets rebuilt twice and hash-compared — and that program is `author=agent` by construction, which is agent-lane authority regardless of how cleanly it reproduces. There is currently no `AgentRun` field for naming a pre-declared, hash-pinned tool instead of a task string, so tool-lane execution isn't reachable from Sympozium today — only from the `celln` CLI directly (`celln spec` / `celln run`). Practically, that means every `backend: celln` run gets: no ambient host tools or filesystem beyond its own generated program and workspace, no persisted workspace between runs (`workspace: "none"`), a fixed 256MiB/64KiB memory/output envelope (not yet configurable per run), and hardware isolation with no softer fallback. See [Sympozium × Celln actions](https://sympozium-ai.github.io/celln/sympozium-celln-actions.html) for the full breakdown of what the dispatched request actually contains.
+A task-only `backend: celln` run sends a `forge` request in the agent lane.
+Reproducibility does not promote generated code to tool authority. Its default
+bounds remain 256MiB guest memory, 64KiB output and workspace `none`.
+
+For an existing immutable program, set `spec.celln` explicitly. It contains
+`mote: {hash}`, `tools: [{alias, hash}]`, optional bounded `inputs` (name, hash,
+mediaType, bytes), `invocation: {alias, args}`, `lane`, and `capabilities`
+(workspace, optional egress, memoryBytes, outputBytes). `spec.timeout` supplies
+the end-to-end deadline. In this mode task text is not sent to a model and
+does not influence the executable or its arguments. The dispatcher must still
+independently approve and verify the artifacts and refuse unsupported authority.
+Requesting the tool lane does not turn an agent-authored artifact into a tool.
+
+The controller freezes the full versioned request in `status.cellnRequest`
+before the first POST. Retries use that snapshot, not a changed spec. A terminal
+success requires a complete receipt with matching request, phase, pinned mote,
+invoked tool and input identities, valid timestamps and bounded output metadata.
+The validated JSON is retained in `status.cellnReceipt`, including for failed or
+cancelled executions that actually produced a receipt. Pre-execution refusal may
+have none. `status.result` remains lossy UTF-8 display text; use the receipt's
+immutable output reference, not that mutable text, as an artifact identity.
+
+This does not add whole-agent, sidecar, shared-memory or ensemble execution.
+
+Deleting a dispatched AgentRun requests authenticated remote cancellation.
+The controller retains its finalizer while Celln returns `202 Cancelling` or
+cannot be reached; acknowledgement is not proof of teardown. Its deadline
+backstop also cancels remotely and waits for a terminal record before failing
+the run. Terminal status set by another controller does not bypass this cleanup.
+This relies on the configured dispatcher's execution registry; it is not
+distributed failover or recovery of a lost registry after a dispatcher crash.
 
 ## Enabling / Disabling Celln
 
+### M0 rollout warning and network boundary
+
+The chart's `celln-router-ingress` NetworkPolicy selects router pods in
+`celln-system` and permits only TCP 8788 from controller pods **in the configured
+control-plane namespace**. The namespace and pod selectors are intersected;
+copying a controller label in another namespace does not grant access. This
+policy remains enabled with Celln even if the general `networkPolicies.enabled`
+option is false. It requires a NetworkPolicy-enforcing CNI and is not an
+authentication mechanism. Host-network traffic and administrator-added additive
+policies require separate operator review.
+
+The API server is intentionally not granted execution access. Its current
+TCP-only capability probe may report unavailable under this restriction;
+authenticated, least-privilege readiness is tracked in M0 rather than granting
+the API server access to an otherwise unauthenticated execution endpoint.
+
+This policy alone does not resolve [#331](https://github.com/sympozium-ai/sympozium/issues/331).
+The companion Celln router change requires `--client-token-file` for inbound
+authentication, separate from the outbound dispatcher's `--token-file`, and
+adds cancellation forwarding. The chart requires an image implementing that
+change and durable ownership (Celln PRs #70 and #75); v0.4.13 is incompatible.
+TLS, host provisioning and deployed storage qualification remain M0 work.
+Do not treat the chart configuration as a proven
+multi-tenant execution path or work around missing TLS by silently enabling
+insecure HTTP. See [epic #426](https://github.com/sympozium-ai/sympozium/issues/426)
+for remaining deployment, replica ownership and two-node acceptance work.
+
 ```bash
-sympozium install --enable-hermetic-workloads
-# or: make install ENABLE_HERMETIC_WORKLOADS=true
-# or: helm upgrade --install sympozium charts/sympozium/ --set celln.enabled=true ...
+sympozium install                       # Celln (in-cluster dispatcher) on by default
+sympozium install --no-celln            # skip Celln entirely
+sympozium install --celln-host-installer --celln-backend http://…:8787  # bare-metal host dispatcher
+# or via Helm:
+helm upgrade --install sympozium charts/sympozium/ --set celln.enabled=false
 ```
 
 ```yaml
-# values.yaml — the master switch, false by default
+# values.yaml — Celln is on by default (the raw-Helm default is still opt-in)
 celln:
-  enabled: false
+  enabled: true
 ```
 
-When `false` (the default), no `celln-system` namespace, installer, or router is deployed, and the controller/apiserver aren't given a router URL — zero footprint.
+When `false`, no `celln-system` namespace, dispatcher, or router is deployed, and the controller/apiserver aren't given a router URL or credential mount.
 
-**Disabling it does not remove `"celln"` as a valid `backend` value on the CRD.** A run submitted with `backend: celln` while disabled will still be admitted; the controller will attempt to reach the router at the default in-cluster DNS name, fail to resolve it, and the run transitions to `Failed` with a router-unreachable error. If you disable Celln after enabling it, communicate that to whoever authors `AgentRun`s or agent defaults that set `backend: celln` — or watch for the live banner on the Runs page, which flags exactly this case.
+**Disabling it does not remove `"celln"` as a valid `backend` value on the CRD.** A run submitted while disabled is still schema-valid but refuses when the controller lacks the required transport configuration. There is no fallback to a Job. Communicate configuration changes to authors of Celln-backed runs.
 
 ## Enabling Celln: the AI provider requirement
 
-This is the part that's easy to miss: **Celln's AI provider is configured independently of your `Agent`/`AgentRun`'s `model:` field.** A celln-backed run's task string goes to whatever provider is configured on the KVM *host* — the run's own `model.provider`/`model.name` are not passed through and are ignored for this backend.
+This is the part that's easy to miss: **Celln's AI provider is configured independently of your `Agent`/`AgentRun`'s `model:` field.** A celln-backed run's task string goes to whatever provider is configured for the *dispatcher* — the run's own `model.provider`/`model.name` are not passed through and are ignored for this backend.
 
-The host-level dispatcher (not the Sympozium controller) needs one of:
+The dispatcher (the in-cluster pod by default, or the bare-metal host service) needs one of:
 
 - **An API key**, set via Helm — mounted into the `celln-installer` DaemonSet as a Secret, and written to `/etc/celln/agent-key` on the host for the dispatcher to read:
   ```yaml
@@ -87,16 +184,53 @@ The host-level dispatcher (not the Sympozium controller) needs one of:
 
 If none of the above is true on a given KVM node, that node's dispatcher is still installed and healthy from Kubernetes' point of view (the router's health check only verifies `/dev/kvm` and non-empty tool/mote stores, not provider availability) — the failure only surfaces when a task is actually dispatched, as an AgentRun `Failed` status with the provider's own auth error (e.g. *"`claude` has no saved login and ANTHROPIC_API_KEY is not set — authenticate it or set a key"*).
 
+### Host requirement: a musl linker for `forge`
+
+The dispatcher's `forge` step compiles model-generated Rust to the
+`x86_64-unknown-linux-musl` target. The installer ships the Rust toolchain and
+the musl *standard library*, but it does **not** install a linker: building a
+musl binary needs `musl-gcc` (or a C compiler configured for musl) on the host
+itself. Without it, `rustc` compiles but fails at the link step with
+`no default linker (cc) was found`.
+
+Install it on each KVM node before dispatching code-generating runs:
+
+```sh
+# Debian/Ubuntu
+apt-get install -y musl-tools
+```
+
+This is separate from — and in addition to — the AI-provider requirement above.
+The installer does not provision it because linking happens in the host's
+dispatcher, not inside the installer container.
+
 ## Graceful Degradation
 
 | Scenario | Behavior |
 |----------|----------|
 | `celln.enabled=false` | No `celln-system` namespace or resources. Runs with `backend: celln` fail at dispatch with a router-unreachable error, not at admission. |
-| `celln.enabled=true`, no node labeled `celln.dev/kvm=true` | Installer/router DaemonSets deploy with zero pods scheduled. Runs fail the same way as above — nothing is listening at the router URL. |
+| `celln.enabled=true`, missing required router configuration | Helm render fails; no partially configured router is installed. |
+| `celln.enabled=true`, no eligible dispatcher reachable | Router replicas can run without KVM themselves, but cannot execute a request. The optional host-installer only schedules on labelled nodes; the in-cluster dispatcher schedules anywhere but still needs `/dev/kvm` on the node it lands on. |
 | `celln.enabled=true`, KVM node(s) present, no AI provider reachable on the host | Router and dispatcher report healthy. The run reaches `Running`, then fails once the dispatcher's own provider check fails — see above. |
 | Everything configured | Run dispatches, executes in a real sealed cell, and returns a bounded result. |
 
 ## See Also
 
+For a repeatable static-program proof, use Celln's `make conformance-kvm` with
+`CELLN_SYMPOZIUM_PROOF` pointing to this repository's
+`test/integration/test-celln-real-controller.sh` and `CELLN_KIND_BIN` pointing to
+Kind. The script uses a fresh Podman-backed Kind cluster and isolated kubeconfig,
+builds the production controller, and records actual AgentRun status plus Celln
+receipts/audits. It never uses the existing Kubernetes context and needs no model
+credential. The controller and KVM dispatcher run on the host; Kind supplies the
+real Kubernetes API, not nested hardware isolation.
+
 - [Celln repository](https://github.com/sympozium-ai/celln) — the execution runtime itself: the cell/tool-lending model, hardware isolation guarantees, and `scripts/setup-host.sh` (what the installer DaemonSet runs on each node).
 - [Custom Resources](custom-resources.md) — the `AgentRun.spec.backend` field.
+
+## Experimental Harness integration
+
+The [reference Harness binding](../guides/celln-reference-harness.md) adds a
+disabled-by-default, versioned AgentRun path for an in-cell model loop with two
+explicitly lent static tools. It is distinct from container Harness mode and
+does not establish general OCI compatibility or the completed selection UX.

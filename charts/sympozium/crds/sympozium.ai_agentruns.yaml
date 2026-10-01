@@ -104,8 +104,9 @@ spec:
                   "job" (default, implicit): standard Kubernetes Job backend.
                   "celln": hardware-isolated Celln dispatcher (hermetic; no ensembles, no
                     delegation, no shared memory, no IPC, no streaming; the agent receives
-                    the task string and produces a bounded output). Tasks that require
-                    multiple tools, sub-agents, or workflow state must use "job".
+                    the task string and produces a bounded output). Explicit native Harness
+                    bindings support bounded lent tools; sub-agents and retained workflow
+                    state still require "job".
 
                   Celln is selected for individual high-risk or bounded computations;
                   ensembles and workflows always use the Job backend.
@@ -120,6 +121,317 @@ spec:
                   cluster info, k8s resources) and one minimal LLM call to verify
                   provider connectivity, then outputs a structured JSON result.
                 type: boolean
+              celln:
+                description: |-
+                  Celln names an immutable program and bounded data for backend=celln.
+                  A direct program invocation does not send task text to a model. An explicit
+                  Harness binding sends bounded task/persona data through its host model grant.
+                  Task text never supplies executable authority.
+                  The Celln operator must independently approve every referenced artifact.
+                properties:
+                  capabilities:
+                    properties:
+                      egress:
+                        items:
+                          type: string
+                        maxItems: 32
+                        type: array
+                      memoryBytes:
+                        description: Timeout is supplied by AgentRun.spec.timeout,
+                          not this object.
+                        format: int64
+                        maximum: 268435456
+                        minimum: 1
+                        type: integer
+                      outputBytes:
+                        format: int64
+                        maximum: 65536
+                        minimum: 1
+                        type: integer
+                      workspace:
+                        enum:
+                        - none
+                        - read-only
+                        - read-write
+                        type: string
+                    required:
+                    - memoryBytes
+                    - outputBytes
+                    - workspace
+                    type: object
+                  harness:
+                    description: |-
+                      Harness opts into an explicitly versioned sealed native runtime contract.
+                      This is not the container-replacing task.mode=harness adapter.
+                    properties:
+                      borrowedTools:
+                        items:
+                          properties:
+                            description:
+                              maxLength: 512
+                              minLength: 1
+                              type: string
+                            hash:
+                              pattern: ^blake3:[0-9a-f]{64}$
+                              type: string
+                            jsonStdio:
+                              description: CellnJSONToolIO names immutable schema
+                                data and the separate JSON stdio ABI.
+                              properties:
+                                abi:
+                                  enum:
+                                  - celln.json-stdio/v1
+                                  type: string
+                                inputBytes:
+                                  format: int64
+                                  maximum: 65536
+                                  minimum: 1
+                                  type: integer
+                                inputSchema:
+                                  maxLength: 71
+                                  pattern: ^blake3:[0-9a-f]{64}$
+                                  type: string
+                                outputBytes:
+                                  format: int64
+                                  maximum: 65536
+                                  minimum: 1
+                                  type: integer
+                                outputSchema:
+                                  maxLength: 71
+                                  pattern: ^blake3:[0-9a-f]{64}$
+                                  type: string
+                                timeoutMs:
+                                  format: int64
+                                  maximum: 30000
+                                  minimum: 1
+                                  type: integer
+                              required:
+                              - abi
+                              - inputBytes
+                              - inputSchema
+                              - outputBytes
+                              - outputSchema
+                              - timeoutMs
+                              type: object
+                            name:
+                              pattern: ^[a-zA-Z0-9_-]{1,64}$
+                              type: string
+                            path:
+                              maxLength: 256
+                              pattern: ^/
+                              type: string
+                          required:
+                          - description
+                          - hash
+                          - name
+                          - path
+                          type: object
+                        maxItems: 24
+                        minItems: 0
+                        type: array
+                      contractVersion:
+                        enum:
+                        - celln.reference-functions/v1
+                        - celln.json-tools/v1
+                        type: string
+                      json:
+                        description: CellnHarnessJSONLimits are explicit bounded loop
+                          ceilings, not model grants.
+                        properties:
+                          maxCalls:
+                            format: int64
+                            maximum: 16
+                            minimum: 0
+                            type: integer
+                          maxTurns:
+                            format: int64
+                            maximum: 6
+                            minimum: 1
+                            type: integer
+                        required:
+                        - maxCalls
+                        - maxTurns
+                        type: object
+                      modelGrant:
+                        properties:
+                          hash:
+                            maxLength: 71
+                            pattern: ^blake3:[0-9a-f]{64}$
+                            type: string
+                        required:
+                        - hash
+                        type: object
+                    required:
+                    - borrowedTools
+                    - contractVersion
+                    - modelGrant
+                    type: object
+                    x-kubernetes-validations:
+                    - message: JSON and reference Harness fields must match the selected
+                        contract
+                      rule: 'self.contractVersion == ''celln.json-tools/v1'' ? has(self.json)
+                        && self.borrowedTools.all(t, has(t.jsonStdio)) : !has(self.json)
+                        && size(self.borrowedTools) == 2 && self.borrowedTools.all(t,
+                        !has(t.jsonStdio))'
+                  inputs:
+                    items:
+                      properties:
+                        bytes:
+                          format: int64
+                          maximum: 65536
+                          minimum: 1
+                          type: integer
+                        hash:
+                          pattern: ^blake3:[0-9a-f]{64}$
+                          type: string
+                        mediaType:
+                          minLength: 1
+                          type: string
+                        name:
+                          pattern: ^[a-z0-9._-]{1,64}$
+                          type: string
+                      required:
+                      - bytes
+                      - hash
+                      - mediaType
+                      - name
+                      type: object
+                    maxItems: 16
+                    type: array
+                  invocation:
+                    properties:
+                      alias:
+                        type: string
+                      args:
+                        items:
+                          type: string
+                        maxItems: 128
+                        type: array
+                    required:
+                    - alias
+                    type: object
+                  lane:
+                    description: Lane never promotes an agent-authored artifact to
+                      tool authority.
+                    enum:
+                    - agent
+                    - tool
+                    type: string
+                  mote:
+                    properties:
+                      hash:
+                        maxLength: 71
+                        pattern: ^blake3:[0-9a-f]{64}$
+                        type: string
+                    required:
+                    - hash
+                    type: object
+                  tools:
+                    items:
+                      properties:
+                        alias:
+                          pattern: ^/
+                          type: string
+                        closure:
+                          properties:
+                            hash:
+                              maxLength: 71
+                              pattern: ^blake3:[0-9a-f]{64}$
+                              type: string
+                          required:
+                          - hash
+                          type: object
+                        hash:
+                          pattern: ^blake3:[0-9a-f]{64}$
+                          type: string
+                      required:
+                      - alias
+                      - hash
+                      type: object
+                    maxItems: 16
+                    minItems: 1
+                    type: array
+                required:
+                - capabilities
+                - invocation
+                - lane
+                - mote
+                - tools
+                type: object
+              cellnSelection:
+                description: |-
+                  CellnSelection requests same-namespace approved catalogue revisions.
+                  This is intent, not host authority or readiness. Until durable issuance
+                  is committed, the controller waits without entering legacy execution.
+                  Mutually exclusive with the advanced explicit Celln artifact binding.
+                properties:
+                  clusterToolRefs:
+                    description: |-
+                      ClusterToolRefs selects exact shared catalogue revisions. Empty means no
+                      shared tools, not every installed tool.
+                    items:
+                      description: |-
+                        ClusterCellnToolRef is an unambiguous reference to a cluster-scoped tool
+                        catalogue revision. It is intentionally distinct from CellnCatalogueToolRef,
+                        which continues to mean the legacy namespaced CellnTool API.
+                      properties:
+                        name:
+                          maxLength: 253
+                          minLength: 1
+                          pattern: ^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$
+                          type: string
+                        revision:
+                          maxLength: 64
+                          minLength: 1
+                          type: string
+                      required:
+                      - name
+                      - revision
+                      type: object
+                    maxItems: 24
+                    type: array
+                    x-kubernetes-list-type: atomic
+                  runtimeRef:
+                    description: |-
+                      RuntimeRef preserves the legacy namespaced AgentRuntime reference. It is
+                      never reinterpreted as a CellnRuntimeProfile name.
+                    maxLength: 253
+                    minLength: 1
+                    pattern: ^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$
+                    type: string
+                  toolRefs:
+                    items:
+                      properties:
+                        name:
+                          maxLength: 253
+                          minLength: 1
+                          pattern: ^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$
+                          type: string
+                        revision:
+                          maxLength: 64
+                          minLength: 1
+                          type: string
+                      required:
+                      - name
+                      - revision
+                      type: object
+                    maxItems: 24
+                    type: array
+                    x-kubernetes-list-type: atomic
+                required:
+                - toolRefs
+                type: object
+                x-kubernetes-validations:
+                - message: catalogue tool names must be unique
+                  rule: self.toolRefs.all(t, self.toolRefs.filter(x, x.name == t.name).size()
+                    == 1)
+                - message: cluster catalogue tool names must be unique
+                  rule: '!has(self.clusterToolRefs) || self.clusterToolRefs.all(t,
+                    self.clusterToolRefs.filter(x, x.name == t.name).size() == 1)'
+                - message: a tool name cannot resolve through both namespaced and
+                    cluster catalogues
+                  rule: '!has(self.clusterToolRefs) || self.clusterToolRefs.all(t,
+                    self.toolRefs.filter(x, x.name == t.name).size() == 0)'
               cleanup:
                 default: delete
                 description: 'Cleanup policy: "delete" to remove pod after completion,
@@ -128,18 +440,121 @@ spec:
                 - delete
                 - keep
                 type: string
+              conversation:
+                description: |-
+                  Conversation relates an enduring run to the conversation it belongs
+                  to: re-creation after context loss and, for a continued run, the
+                  exchanges it starts with. Immutable once set.
+                properties:
+                  continuation:
+                    description: |-
+                      Continuation decides what happens when this parent's live context is
+                      lost (its node left the fleet, its owner process was replaced):
+                      automatic creates a new run that continues the conversation on any
+                      node with capacity, seeded with the recorded exchanges; none ends it.
+                    enum:
+                    - automatic
+                    - none
+                    type: string
+                  continuesFrom:
+                    description: |-
+                      ContinuesFrom names the run whose conversation this run continues. Set
+                      by the controller (automatic continuation) or the API (a restart); the
+                      transcript travels in Seed so the previous run may already be gone.
+                    maxLength: 253
+                    type: string
+                  depth:
+                    description: |-
+                      Depth counts continuations along the chain so a fleet that keeps
+                      losing nodes cannot re-create a parent forever.
+                    format: int32
+                    maximum: 16
+                    minimum: 0
+                    type: integer
+                  seed:
+                    description: |-
+                      Seed is the memory a continued parent starts with: the committed
+                      exchanges of the conversation so far, oldest first, bounded so a first
+                      message still fits the turn. Text only; never instructions or tools.
+                    items:
+                      description: ConversationExchange is one committed user message
+                        and the answer it got.
+                      properties:
+                        assistant:
+                          maxLength: 8192
+                          type: string
+                        user:
+                          maxLength: 2048
+                          minLength: 1
+                          type: string
+                      required:
+                      - assistant
+                      - user
+                      type: object
+                    maxItems: 16
+                    type: array
+                    x-kubernetes-list-type: atomic
+                type: object
+                x-kubernetes-validations:
+                - message: conversation is immutable
+                  rule: self == oldSelf
               dryRun:
                 description: |-
                   DryRun skips the LLM call and produces a synthetic result, allowing
                   pipeline execution paths to be traced without burning tokens.
                   The flag is automatically propagated to sequential successors.
                 type: boolean
+              enduring:
+                description: |-
+                  Enduring bounds the complete parent lifetime, not a renewable per-turn
+                  allowance. Effective grants may only narrow these requested ceilings.
+                properties:
+                  leaseSeconds:
+                    format: int32
+                    maximum: 86400
+                    minimum: 1
+                    type: integer
+                  maxModelRequests:
+                    format: int32
+                    maximum: 6144
+                    minimum: 0
+                    type: integer
+                  maxOutputTokens:
+                    format: int64
+                    maximum: 25165824
+                    minimum: 0
+                    type: integer
+                  maxTurns:
+                    format: int32
+                    maximum: 1024
+                    minimum: 1
+                    type: integer
+                  requireToolCall:
+                    description: |-
+                      RequireToolCall requires actual execution of at least one lent tool on
+                      every turn before successful completion; it grants no additional tools.
+                    type: boolean
+                required:
+                - leaseSeconds
+                - maxModelRequests
+                - maxOutputTokens
+                - maxTurns
+                type: object
               env:
                 additionalProperties:
                   type: string
                 description: Env defines custom environment variables to pass to the
                   agent container.
                 type: object
+              executionLifecycle:
+                description: |-
+                  ExecutionLifecycle selects one-shot or enduring execution independently of Harness
+                  configuration. Omission preserves legacy task/server behaviour. Enduring
+                  is the native Celln parent/turn-worker path, not an OCI HarnessSession.
+                enum:
+                - one-shot
+                - enduring
+                type: string
               imagePullSecrets:
                 description: ImagePullSecrets are secrets to use when pulling container
                   images.
@@ -270,8 +685,16 @@ spec:
                           type: string
                         timeout:
                           description: |-
-                            Timeout is the maximum duration for this hook container.
-                            Defaults to 5 minutes.
+                            Timeout is the budget for this hook container. Defaults to 5 minutes.
+
+                            PostRun hooks run sequentially in one Job, so their timeouts are summed
+                            into that Job's deadline; the total is never less than 10 minutes. Because
+                            Kubernetes has no per-init-container timeout, this bounds the Job as a
+                            whole rather than each container — use it to give a slow hook (or a
+                            human-in-the-loop gate) the room it needs, not to police a fast one.
+
+                            Not yet honoured on preRun hooks, which are bounded by the agent run's
+                            own spec.timeout.
                           type: string
                       required:
                       - image
@@ -369,8 +792,16 @@ spec:
                           type: string
                         timeout:
                           description: |-
-                            Timeout is the maximum duration for this hook container.
-                            Defaults to 5 minutes.
+                            Timeout is the budget for this hook container. Defaults to 5 minutes.
+
+                            PostRun hooks run sequentially in one Job, so their timeouts are summed
+                            into that Job's deadline; the total is never less than 10 minutes. Because
+                            Kubernetes has no per-init-container timeout, this bounds the Job as a
+                            whole rather than each container — use it to give a slow hook (or a
+                            human-in-the-loop gate) the room it needs, not to police a fast one.
+
+                            Not yet honoured on preRun hooks, which are bounded by the agent run's
+                            own spec.timeout.
                           type: string
                       required:
                       - image
@@ -381,7 +812,7 @@ spec:
                     description: |-
                       RBAC defines namespace-scoped Kubernetes RBAC rules to create for
                       lifecycle hook containers. A Role and RoleBinding are provisioned
-                      in the agent namespace, bound to the "sympozium-agent" ServiceAccount.
+                      in the agent namespace, bound only to this AgentRun's unique ServiceAccount.
                       This allows hooks to interact with Kubernetes resources (e.g., create
                       or delete ConfigMaps, read Secrets).
                     items:
@@ -425,6 +856,11 @@ spec:
               model:
                 description: Model specifies the LLM configuration for this run.
                 properties:
+                  allowInsecure:
+                    description: |-
+                      AllowInsecure is the operator opt-in for an HTTP or self-signed private
+                      model endpoint, carried from the selected connection.
+                    type: boolean
                   authSecretRef:
                     description: AuthSecretRef references the secret containing the
                       API key.
@@ -438,6 +874,18 @@ spec:
                         GitHub Copilot: https://api.githubcopilot.com
                         Azure OpenAI:   https://<resource>.openai.azure.com/openai/deployments/<deployment>
                         Ollama:         http://ollama.default.svc:11434/v1
+                    type: string
+                  connectionRef:
+                    description: ConnectionRef selects a ModelConnection in this run's
+                      namespace (native Celln only).
+                    type: string
+                  connectionRevision:
+                    description: ConnectionRevision pins the connection UID and spec
+                      after resolution.
+                    type: string
+                  credentialProfile:
+                    description: CredentialProfile is the independently approved opaque
+                      host mapping.
                     type: string
                   model:
                     description: Model is the model identifier.
@@ -454,9 +902,14 @@ spec:
                       NodeSelector constrains agent pods to nodes with matching labels.
                       Inherited from AgentConfig at AgentRun creation time.
                     type: object
+                  protocol:
+                    description: Protocol is the host API adapter selected by the
+                      connection.
+                    type: string
                   provider:
-                    description: Provider is the AI provider (openai, anthropic, azure-openai,
-                      github-copilot, ollama, etc.).
+                    description: |-
+                      Provider is the AI provider (openai, anthropic, azure-openai, github-copilot, ollama, etc.).
+                      Omit when resolving a model connection.
                     type: string
                   providerHeaders:
                     additionalProperties:
@@ -474,9 +927,7 @@ spec:
                     description: Thinking mode (off, low, medium, high).
                     type: string
                 required:
-                - authSecretRef
                 - model
-                - provider
                 type: object
               parent:
                 description: Parent contains parent run information for sub-agents.
@@ -619,6 +1070,49 @@ spec:
               timeout:
                 description: Timeout is the maximum duration for this agent run.
                 type: string
+              tolerations:
+                description: |-
+                  Tolerations allow the agent pod to schedule onto tainted nodes.
+                  Typically inherited from Agent.Spec.Agents.Default.Tolerations by
+                  the controller, but may also be set directly on an AgentRun.
+                items:
+                  description: |-
+                    The pod this Toleration is attached to tolerates any taint that matches
+                    the triple <key,value,effect> using the matching operator <operator>.
+                  properties:
+                    effect:
+                      description: |-
+                        Effect indicates the taint effect to match. Empty means match all taint effects.
+                        When specified, allowed values are NoSchedule, PreferNoSchedule and NoExecute.
+                      type: string
+                    key:
+                      description: |-
+                        Key is the taint key that the toleration applies to. Empty means match all taint keys.
+                        If the key is empty, operator must be Exists; this combination means to match all values and all keys.
+                      type: string
+                    operator:
+                      description: |-
+                        Operator represents a key's relationship to the value.
+                        Valid operators are Exists, Equal, Lt, and Gt. Defaults to Equal.
+                        Exists is equivalent to wildcard for value, so that a pod can
+                        tolerate all taints of a particular category.
+                        Lt and Gt perform numeric comparisons (requires feature gate TaintTolerationComparisonOperators).
+                      type: string
+                    tolerationSeconds:
+                      description: |-
+                        TolerationSeconds represents the period of time the toleration (which must be
+                        of effect NoExecute, otherwise this field is ignored) tolerates the taint. By default,
+                        it is not set, which means tolerate the taint forever (do not evict). Zero and
+                        negative values will be treated as 0 (evict immediately) by the system.
+                      format: int64
+                      type: integer
+                    value:
+                      description: |-
+                        Value is the taint value the toleration matches to.
+                        If the operator is Exists, the value should be empty, otherwise just a regular string.
+                      type: string
+                  type: object
+                type: array
               toolPolicy:
                 description: ToolPolicy defines which tools this agent is allowed
                   to use.
@@ -2625,6 +3119,31 @@ spec:
             - model
             - sessionKey
             type: object
+            x-kubernetes-validations:
+            - message: catalogue selection requires backend celln and cannot mix explicit
+                artifacts
+              rule: '!has(self.cellnSelection) || (has(self.backend) && self.backend
+                == ''celln'' && !has(self.celln))'
+            - message: enduring lifecycle requires Celln catalogue selection, limits,
+                and task mode
+              rule: '!has(self.executionLifecycle) || self.executionLifecycle != ''enduring''
+                || (has(self.enduring) && has(self.backend) && self.backend == ''celln''
+                && has(self.cellnSelection) && (!has(self.mode) || self.mode == ''task''))'
+            - message: enduring limits require enduring lifecycle
+              rule: '!has(self.enduring) || (has(self.executionLifecycle) && self.executionLifecycle
+                == ''enduring'')'
+            - message: conversation continuation requires enduring lifecycle
+              rule: '!has(self.conversation) || (has(self.executionLifecycle) && self.executionLifecycle
+                == ''enduring'')'
+            - message: one-shot lifecycle cannot use server mode
+              rule: '!has(self.executionLifecycle) || self.executionLifecycle != ''one-shot''
+                || !has(self.mode) || self.mode != ''server'''
+            - message: an enduring run cannot lose its lifecycle, Celln backend, selection
+                or limits; delete the original run instead
+              rule: '!has(oldSelf.executionLifecycle) || oldSelf.executionLifecycle
+                != ''enduring'' || (has(self.executionLifecycle) && self.executionLifecycle
+                == ''enduring'' && has(self.backend) && self.backend == ''celln''
+                && has(self.cellnSelection) && has(self.enduring))'
           status:
             description: AgentRunStatus defines the observed state of AgentRun.
             properties:
@@ -2635,6 +3154,392 @@ spec:
                   non-Celln backends. The controller polls /v1/executions/<id> on the
                   router to track progress.
                 type: string
+              cellnIssuance:
+                description: |-
+                  CellnIssuance persists the exact approved payload before remote provisioning.
+                  It is history, not dispatch permission or artifact readiness.
+                properties:
+                  payload:
+                    description: Payload contains the frozen observation and expected
+                      execution candidate.
+                    maxLength: 393216
+                    minLength: 1
+                    type: string
+                    x-kubernetes-validations:
+                    - message: issuance payload is immutable
+                      rule: self == oldSelf
+                  payloadSHA256:
+                    maxLength: 71
+                    pattern: ^sha256:[0-9a-f]{64}$
+                    type: string
+                    x-kubernetes-validations:
+                    - message: issuance payload hash is immutable
+                      rule: self == oldSelf
+                  phase:
+                    enum:
+                    - Prepared
+                    - Issued
+                    maxLength: 8
+                    type: string
+                  result:
+                    description: Result contains the validated remote outcome, never
+                      provider credentials.
+                    maxLength: 196608
+                    type: string
+                    x-kubernetes-validations:
+                    - message: issued result is immutable
+                      rule: self == oldSelf
+                  target:
+                    description: Target pins the operator-configured issuer endpoint,
+                      not a tenant URL.
+                    maxLength: 2048
+                    minLength: 1
+                    type: string
+                    x-kubernetes-validations:
+                    - message: issuer target is immutable
+                      rule: self == oldSelf
+                required:
+                - payload
+                - payloadSHA256
+                - phase
+                - target
+                type: object
+                x-kubernetes-validations:
+                - message: Celln issuance phase cannot regress
+                  rule: self.phase == oldSelf.phase || (oldSelf.phase == 'Prepared'
+                    && self.phase == 'Issued')
+                - message: issued outcome requires a durable result
+                  rule: self.phase != 'Issued' || (has(self.result) && size(self.result)
+                    > 0)
+                - message: prepared issuance cannot contain an outcome
+                  rule: self.phase != 'Prepared' || !has(self.result) || size(self.result)
+                    == 0
+              cellnOnly:
+                description: |-
+                  CellnOnly records a new run's execution boundary before any finalizer or
+                  workload side effects. The controller refuses subsequent backend changes.
+                  Absent on legacy runs: absence does not prove that Job-side RBAC is absent.
+                type: boolean
+              cellnParent:
+                description: CellnParent binds enduring intent before any parent creation
+                  side effect.
+                properties:
+                  acceptedTurns:
+                    description: |-
+                      AcceptedTurns counts subsequent turns; the initial turn uses one additional
+                      host turn. Claims consume budget even if dispatch later becomes uncertain.
+                    format: int32
+                    maximum: 1023
+                    minimum: 0
+                    type: integer
+                    x-kubernetes-validations:
+                    - message: accepted turn count cannot decrease
+                      rule: self >= oldSelf
+                  activeTurn:
+                    description: ActiveTurn remains until that exact child record
+                      contains a committed result.
+                    properties:
+                      name:
+                        maxLength: 253
+                        minLength: 1
+                        type: string
+                      uid:
+                        maxLength: 128
+                        minLength: 1
+                        type: string
+                    required:
+                    - name
+                    - uid
+                    type: object
+                  admittedAt:
+                    description: |-
+                      AdmittedAt records when parent creation was first attempted. It anchors
+                      the original execution lease: later tokens, turns or reconciles cannot
+                      extend it, and expiry disables new turns. Immutability is enforced by
+                      the CellnParentStatus-level validation rule.
+                    format: date-time
+                    type: string
+                  binding:
+                    description: |-
+                      CellnParentBinding freezes operator-approved routing and run intent before
+                      creation. It contains no credential and is not itself execution authority.
+                    properties:
+                      incarnation:
+                        maxLength: 71
+                        pattern: ^blake3:[0-9a-f]{64}$
+                        type: string
+                      launchProfile:
+                        maxLength: 71
+                        pattern: ^blake3:[0-9a-f]{64}$
+                        type: string
+                      principal:
+                        maxLength: 512
+                        minLength: 1
+                        type: string
+                      runUID:
+                        maxLength: 128
+                        minLength: 1
+                        type: string
+                      specSHA256:
+                        maxLength: 71
+                        pattern: ^sha256:[0-9a-f]{64}$
+                        type: string
+                      target:
+                        maxLength: 2048
+                        minLength: 1
+                        type: string
+                    required:
+                    - incarnation
+                    - launchProfile
+                    - principal
+                    - runUID
+                    - specSHA256
+                    - target
+                    type: object
+                    x-kubernetes-validations:
+                    - message: parent binding is immutable
+                      rule: self == oldSelf
+                  continuedBy:
+                    description: |-
+                      ContinuedBy names the run that continues this conversation after its
+                      context was lost; set once by the controller or the API.
+                    maxLength: 253
+                    type: string
+                  createAttempted:
+                    description: |-
+                      CreateAttempted must be persisted before POST. A lost response cannot clear
+                      this bit; reconciliation must inspect the same owner instead of replaying.
+                    type: boolean
+                    x-kubernetes-validations:
+                    - message: parent creation attempt cannot be cleared
+                      rule: '!oldSelf || self'
+                  initialTurn:
+                    properties:
+                      attempted:
+                        type: boolean
+                        x-kubernetes-validations:
+                        - message: turn attempt cannot be cleared
+                          rule: '!oldSelf || self'
+                      child:
+                        maxLength: 71
+                        pattern: ^blake3:[0-9a-f]{64}$
+                        type: string
+                        x-kubernetes-validations:
+                        - message: turn child is immutable
+                          rule: self == oldSelf
+                      id:
+                        maxLength: 64
+                        pattern: ^[A-Za-z0-9_-]{1,64}$
+                        type: string
+                        x-kubernetes-validations:
+                        - message: turn ID is immutable
+                          rule: self == oldSelf
+                      message:
+                        maxLength: 2048
+                        minLength: 1
+                        type: string
+                        x-kubernetes-validations:
+                        - message: turn input is immutable
+                          rule: self == oldSelf
+                      result:
+                        properties:
+                          answer:
+                            maxLength: 8192
+                            minLength: 1
+                            type: string
+                          succeeded:
+                            type: boolean
+                        required:
+                        - answer
+                        - succeeded
+                        type: object
+                        x-kubernetes-validations:
+                        - message: committed turn result is immutable
+                          rule: self == oldSelf
+                    required:
+                    - attempted
+                    - child
+                    - id
+                    - message
+                    type: object
+                    x-kubernetes-validations:
+                    - message: committed turn result cannot be removed
+                      rule: '!has(oldSelf.result) || has(self.result)'
+                    - message: turn result requires an attempted submission
+                      rule: '!has(self.result) || self.attempted'
+                  ownerOutcome:
+                    description: |-
+                      OwnerOutcome records the first terminal owner observation
+                      (ContextLost, Stopped, TeardownUncertain, CreateRefused) with the failure signature
+                      the broker itself does not report: whether the parent ever reached
+                      Ready and when the loss was observed. Set once; it grants no replay
+                      authority and never authorizes reconstruction.
+                    properties:
+                      observedAt:
+                        format: date-time
+                        type: string
+                      reachedReady:
+                        description: |-
+                          ReachedReady reports whether a live Ready (or TurnActive) observation
+                          preceded the loss. False means the parent died during warm preparation.
+                        type: boolean
+                      status:
+                        enum:
+                        - ContextLost
+                        - Stopped
+                        - TeardownUncertain
+                        - CreateRefused
+                        maxLength: 32
+                        minLength: 1
+                        type: string
+                    required:
+                    - observedAt
+                    - reachedReady
+                    - status
+                    type: object
+                required:
+                - acceptedTurns
+                - binding
+                - createAttempted
+                type: object
+                x-kubernetes-validations:
+                - message: initial parent turn cannot be removed
+                  rule: '!has(oldSelf.initialTurn) || has(self.initialTurn)'
+                - message: recorded owner outcome is immutable
+                  rule: '!has(oldSelf.ownerOutcome) || self.ownerOutcome == oldSelf.ownerOutcome'
+                - message: parent admission time is immutable
+                  rule: '!has(oldSelf.admittedAt) || (has(self.admittedAt) && self.admittedAt
+                    == oldSelf.admittedAt)'
+              cellnReceipt:
+                description: CellnReceipt retains the validated versioned terminal
+                  receipt as JSON.
+                maxLength: 131072
+                type: string
+              cellnRequest:
+                description: CellnRequest freezes the exact versioned request before
+                  first dispatch.
+                maxLength: 131072
+                type: string
+              cellnScoped:
+                description: |-
+                  CellnScoped binds a shared-catalogue run to immutable protected
+                  preparation, final decision, and receiver ownership. Enduring roots also
+                  retain their namespace-aware parent incarnation here.
+                properties:
+                  cellId:
+                    maxLength: 256
+                    type: string
+                  childId:
+                    maxLength: 256
+                    type: string
+                  cleanupConfirmed:
+                    description: |-
+                      CleanupConfirmed means native teardown and, when applicable, gateway close
+                      both completed. It is the only condition allowing finalizer removal.
+                    type: boolean
+                  decisionName:
+                    maxLength: 76
+                    type: string
+                  decisionUid:
+                    maxLength: 128
+                    type: string
+                  executionProvenance:
+                    maxLength: 65536
+                    type: string
+                  gatewayRegistered:
+                    description: GatewayRegistered is set only after the exact final
+                      decision is accepted.
+                    type: boolean
+                  gatewayRegistrationAttempted:
+                    description: |-
+                      GatewayRegistrationAttempted is persisted before registration so an
+                      ambiguous transport failure remains visible and cleanup still fences the
+                      original budget. It does not by itself prove registration succeeded.
+                    type: boolean
+                  nativePhase:
+                    maxLength: 32
+                    type: string
+                  output:
+                    description: Output is correlated receiver output for the initial
+                      or continuation turn.
+                    maxLength: 4194304
+                    type: string
+                  owner:
+                    maxLength: 256
+                    type: string
+                  parentId:
+                    description: |-
+                      Native IDs and provenance are copied from receiver evidence. They are
+                      observational and cannot select future execution authority.
+                    maxLength: 256
+                    type: string
+                  parentIncarnation:
+                    description: |-
+                      ParentIncarnation is present only for enduring initial/turn operations and
+                      must match the immutable prepared decision and receiver evidence.
+                    maxLength: 71
+                    pattern: ^blake3:[0-9a-f]{64}$
+                    type: string
+                    x-kubernetes-validations:
+                    - message: scoped parent incarnation is immutable
+                      rule: self == oldSelf
+                  preparationName:
+                    maxLength: 75
+                    type: string
+                  preparationUid:
+                    maxLength: 128
+                    type: string
+                  receiptDigest:
+                    maxLength: 256
+                    type: string
+                  receiverId:
+                    description: |-
+                      ReceiverID and Owner are returned by the enrolled native receiver and
+                      jointly identify the only execution this run may observe or clean up.
+                    maxLength: 256
+                    type: string
+                  startAttempted:
+                    description: |-
+                      StartAttempted is persisted before the non-idempotent start request. Once
+                      true, recovery reads the pinned owner before considering the exact start.
+                    type: boolean
+                  substrateProvenance:
+                    maxLength: 65536
+                    type: string
+                  turnId:
+                    description: TurnID is the actual AgentRunTurn UID for continuation
+                      work.
+                    maxLength: 128
+                    type: string
+                    x-kubernetes-validations:
+                    - message: scoped turn identity is immutable
+                      rule: self == oldSelf
+                required:
+                - decisionName
+                - decisionUid
+                - preparationName
+                - preparationUid
+                type: object
+                x-kubernetes-validations:
+                - message: protected scoped preparation identity is immutable
+                  rule: self.preparationName == oldSelf.preparationName && self.preparationUid
+                    == oldSelf.preparationUid && self.decisionName == oldSelf.decisionName
+                    && self.decisionUid == oldSelf.decisionUid
+                - message: scoped receiver owner identity is immutable
+                  rule: '!has(oldSelf.receiverId) || (has(self.receiverId) && self.receiverId
+                    == oldSelf.receiverId && self.owner == oldSelf.owner)'
+                - message: gateway registration attempt cannot be forgotten
+                  rule: '!has(oldSelf.gatewayRegistrationAttempted) || !oldSelf.gatewayRegistrationAttempted
+                    || (has(self.gatewayRegistrationAttempted) && self.gatewayRegistrationAttempted)'
+                - message: gateway registration cannot regress
+                  rule: '!has(oldSelf.gatewayRegistered) || !oldSelf.gatewayRegistered
+                    || (has(self.gatewayRegistered) && self.gatewayRegistered)'
+                - message: scoped start attempt cannot be forgotten
+                  rule: '!has(oldSelf.startAttempted) || !oldSelf.startAttempted ||
+                    (has(self.startAttempted) && self.startAttempted)'
+                - message: scoped cleanup confirmation cannot regress
+                  rule: '!has(oldSelf.cleanupConfirmed) || !oldSelf.cleanupConfirmed
+                    || (has(self.cleanupConfirmed) && self.cleanupConfirmed)'
               completedAt:
                 description: CompletedAt is when the agent run completed.
                 format: date-time
@@ -2803,6 +3708,30 @@ spec:
                   One of: approved, rejected, rewritten, timeout, error, allowed-by-default.
                   Empty when no gate hook is configured.
                 type: string
+              harnessContractVersion:
+                description: |-
+                  HarnessContractVersion records the harness contract supplied to the
+                  adapter that executed this run.
+                type: string
+              harnessImageDigest:
+                description: |-
+                  HarnessImageDigest records the digest of the external harness adapter image
+                  that executed this run. Populated only for `task.mode: harness` runs, and
+                  only once the run has been admitted and dispatched. Empty for all other
+                  modes and backends.
+                type: string
+              harnessRuntimeRef:
+                description: |-
+                  HarnessRuntimeRef records the AgentRuntime that was resolved for this
+                  harness run. It remains populated when an Agent's runtimeRef converted a
+                  normal string task into harness mode, so audit and UI do not have to infer
+                  the selected runtime from the current Agent configuration.
+                type: string
+              harnessRuntimeSource:
+                description: |-
+                  HarnessRuntimeSource records whether the resolved runtime came from the
+                  Agent default ("agent-default") or the AgentRun ("run").
+                type: string
               jobName:
                 description: JobName is the name of the Job created for this run.
                 type: string
@@ -2874,7 +3803,27 @@ spec:
                   Set by the controller when creating the Job.
                 type: string
             type: object
+            x-kubernetes-validations:
+            - message: saved Celln issuance cannot be removed
+              rule: '!has(oldSelf.cellnIssuance) || has(self.cellnIssuance)'
+            - message: saved Celln parent cannot be removed
+              rule: '!has(oldSelf.cellnParent) || has(self.cellnParent)'
+            - message: saved scoped Celln identity cannot be removed
+              rule: '!has(oldSelf.cellnScoped) || has(self.cellnScoped)'
         type: object
+        x-kubernetes-validations:
+        - message: saved Celln issuance status cannot be removed
+          rule: '!has(oldSelf.status) || !has(oldSelf.status.cellnIssuance) || (has(self.status)
+            && has(self.status.cellnIssuance))'
+        - message: saved Celln parent status cannot be removed
+          rule: '!has(oldSelf.status) || !has(oldSelf.status.cellnParent) || (has(self.status)
+            && has(self.status.cellnParent))'
+        - message: a recorded Celln-only execution boundary cannot be removed
+          rule: '!has(oldSelf.status) || !has(oldSelf.status.cellnOnly) || !oldSelf.status.cellnOnly
+            || (has(self.status) && has(self.status.cellnOnly) && self.status.cellnOnly)'
+        - message: a recorded Celln-only run cannot change execution backend
+          rule: '!has(self.status) || !has(self.status.cellnOnly) || !self.status.cellnOnly
+            || (has(self.spec.backend) && self.spec.backend == ''celln'')'
     served: true
     storage: true
     subresources:

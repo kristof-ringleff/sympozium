@@ -10,7 +10,9 @@ covers only what's easy to get wrong.
 - `make test` runs `go test -race ./...` — the **race detector is the bar**; a
   change isn't done until `go test -race ./...`, `go vet ./...`, and `gofmt` are clean.
 - `make test-system` (envtest) runs controller tests against a real apiserver with
-  no cluster — use it for reconcile-logic changes.
+  no cluster — use it for reconcile-logic changes. CI runs it (`system-tests` job).
+- `go vet ./...` skips build-tagged files (`test/system` is `//go:build system`);
+  `make vet` / `make vet-tags` covers them — add a line there for any new build tag.
 - Integration tests (`test/integration/*.sh`) need a Kind cluster + a model. They
   work against any OpenAI-compatible provider — set `spec.model.provider` +
   `spec.model.baseURL` (e.g. a local `llama-server`/`ollama`/`lm-studio`), not just `openai`.
@@ -21,6 +23,14 @@ regenerates `config/crd/bases/` **and** syncs both chart copies
 (`charts/sympozium/crds/`, `charts/sympozium-crds/templates/`). CI fails if they
 drift (`make helm-sync-check`). Never hand-edit generated CRD YAML or
 `zz_generated.deepcopy.go`.
+
+## Updating the Pi/Hermes example adapter versions
+`charts/sympozium/values.yaml`'s `harnessExamples` block is the only file to
+edit for an adapter's name, image digest, or default enablement — the
+`--reuse-values` fallback dict in `charts/sympozium/templates/harness-examples.yaml`
+is generated from it. Run **`make helm-sync`** after editing it; `make
+helm-sync-check` (CI) fails if the two have drifted. Never hand-edit the block
+between the `sync-harness-defaults:begin`/`:end` markers.
 
 ## Naming — these renames recur as bugs
 - The CRD kind is **`Agent`** (formerly `SympoziumInstance` — do not use).

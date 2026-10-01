@@ -3,15 +3,19 @@
 // ── Common K8s types ─────────────────────────────────────────────────────────
 
 export interface ObjectMeta {
+  generation?: number;
+  uid?: string;
   name: string;
   namespace?: string;
   creationTimestamp?: string;
+  deletionTimestamp?: string;
   labels?: Record<string, string>;
   annotations?: Record<string, string>;
   generateName?: string;
 }
 
 export interface Condition {
+  observedGeneration?: number;
   type: string;
   status: string;
   reason: string;
@@ -108,9 +112,15 @@ export interface ChannelStatus {
 }
 
 export interface AgentSpec {
+	/** Administrator-approved AgentRuntime inherited by this Agent's runs. */
+	runtimeRef?: string;
+  /** Default run execution environment, lifecycle and Celln tool selection. */
+  execution?: AgentExecutionDefaults;
   channels?: ChannelSpec[];
   agents: AgentsSpec;
   skills?: SkillRef[];
+  /** Remote MCP servers. Native Celln refuses an Agent that has any. */
+  mcpServers?: Array<{ name: string }>;
   policyRef?: string;
   authRefs?: SecretRef[];
   memory?: MemorySpec;
@@ -130,9 +140,222 @@ export interface Agent {
   status?: AgentStatus;
 }
 
+/** A native profile the current namespace's execution policy admits. */
+/** One cell as `celln ps -a` reports it on a fleet node, joined to its run. */
+export interface CellnCell {
+  id: string;
+  description: string;
+  /** running, dissolved, refused, failed (or died). */
+  status: string;
+  backend: string;
+  started_ms: number;
+  finished_ms: number | null;
+  duration_ms: number | null;
+  error: string | null;
+  tools: string[];
+  run?: CellnRunRef;
+  parent?: string;
+  turn?: string;
+}
+
+export interface CellnRunRef {
+  namespace: string;
+  name: string;
+  agent: string;
+  phase: string;
+  /** The run is unfinished, so its parent should still hold a context. */
+  live: boolean;
+}
+
+export interface CellnNodeParent {
+  incarnation: string;
+  updatedMs: number;
+  /** Stage is one of reserved, child-destroyed, committed — whichever source reported it. */
+  turns: { turnId: string; stage: string; child?: string; succeeded?: boolean; timeoutMs?: number }[];
+  run?: CellnRunRef;
+  /** The owner's observation of the parent (Ready, TurnActive, ContextLost, …); gateway only. */
+  status?: string;
+  /** Whether status was observed live rather than read back from the journal. */
+  statusLive?: boolean;
+}
+
+/** Where a node's cells came from: the Celln gateway's /v1/cells, or the node's own ConfigMap report. */
+export type CellnCellsSource = "gateway" | "node-report";
+
+/** One fleet node's cells and parents, from the gateway or as its configure pod last reported them. */
+export interface CellnNodeCells {
+  node: string;
+  reportedMs: number;
+  stale: boolean;
+  /** An unreadable node report, or the reason the gateway gave for a backend it could not list. */
+  error?: string;
+  source?: CellnCellsSource;
+  cells: CellnCell[];
+  parents: CellnNodeParent[];
+}
+
+/**
+ * One provider route the operator declared for Agents that bring their own
+ * key (GET /api/v1/celln-platform/mediation). A ModelConnection matches it
+ * only with exactly this provider and protocol, one of these models and an
+ * endpoint on one of these origins.
+ */
+export interface CellnMediatedRoute {
+  auth?: "secret" | "none";
+  allowInsecure?: boolean;
+  provider: string;
+  protocol: "openai-chat" | "anthropic-messages";
+  models: string[];
+  endpointOrigins: string[];
+  /** The execution policy carrying the route; absent on a pending one. */
+  policy?: string;
+  /** The fixed key name the provider Secret must hold for this protocol. */
+  secretKey: string;
+}
+
+export interface CellnMediation {
+  enabled: boolean;
+  mediateBackends: boolean;
+  /** Routes the namespace's policies carry now: what a run is matched against. */
+  routes: CellnMediatedRoute[];
+  /** Declared routes no policy carries yet (sympozium celln-mediation apply-routes). */
+  pending: CellnMediatedRoute[];
+}
+
+/** A Secret in the namespace that already holds a model key. Names only, never values. */
+export interface CellnKeySecret {
+  name: string;
+  key: string;
+  /** Created by the console for a model connection. */
+  managed?: boolean;
+}
+
+export interface CellnPlatformProfile {
+  name: string;
+  revision: string;
+  policy: string;
+  model: string;
+  provider: string;
+  endpoint: string;
+  credentialProfile: string;
+  systemPrompt: string;
+  /** Fleet model backend this profile runs on ("native" is the default). */
+  backend: string;
+  /** Name of the AgentRuntime wrapper a run selects (created on first use). */
+  wrapper: string;
+  /** Name of the Agent the wrappers create for this backend. */
+  agent: string;
+  /** Shared catalogue revisions the policy lends to runs on this profile (cellnSelection.clusterToolRefs). */
+  tools: { name: string; revision: string }[];
+  /** The policy's per-parent maxima and the budget a new conversation should ask for. */
+  ceilings: EnduringLimits;
+  sessionDefaults: EnduringLimits;
+}
+
+export interface EnduringLimits {
+  leaseSeconds: number;
+  maxTurns: number;
+  maxModelRequests: number;
+  maxOutputTokens: number;
+}
+
+export interface CellnPlatformWrappers {
+  runtime: string;
+  agent: string;
+  connection: string;
+  created: string[];
+}
+
+export interface AgentRuntime {
+  metadata: ObjectMeta;
+  spec: {
+    image?: string;
+    celln?: { contractVersion: string; revision: string; lifecycle: string; publisherKey: string };
+    /** Shared cluster catalogue profile. Distinct from legacy inline Celln authority. */
+    cellnProfileRef?: { name: string; revision: string };
+    cellnLimits?: { timeoutMillis: number; memoryBytes: number; taskBytes: number; outputBytes: number; workspace: "none" };
+    contractVersion?: string;
+    capabilities?: string[];
+    session?: {
+      protocol?: "openai-chat";
+      port?: number;
+    };
+    supportOwner?: string;
+    conformance?: {
+      status?: string;
+      owner?: string;
+      url?: string;
+    };
+  };
+  status?: {
+    resolvedImageDigest?: string;
+    conditions?: Condition[];
+  };
+}
+
+export interface CellnSelection {
+  runtimeRef?: string;
+  toolRefs: { name: string; revision: string }[];
+  /** Exact shared cluster catalogue revisions; never legacy namespaced tools. */
+  clusterToolRefs?: { name: string; revision: string }[];
+}
+
+export interface CellnPermissionPreview {
+  agent: { name: string; uid: string };
+  runtime: { name: string; uid: string };
+  tools: { tool: { name: string; revision: string }; limits: CellnTool["spec"]["limits"] }[];
+  runtimeLimits: { memoryBytes: number; timeoutMillis: number; workspace: string };
+  executionAuthorized: false;
+  readiness: "not-established";
+}
+
+export interface CellnTool {
+  metadata: ObjectMeta;
+  spec: {
+    revision: string;
+    description: string;
+    supportOwner: string;
+    publisherKey: string;
+    invocationABI: string;
+    /** Digest-pinned image a borrowed command was taken from; provenance only. */
+    sourceImage?: string;
+    lane: string;
+    limits: { timeoutMillis: number; memoryBytes: number; argumentBytes: number; outputBytes: number; workspace: string; effects: string;
+      artifacts?: { operation: "read" | "write"; maxOperations: number; maxFiles: number; maxFileBytes: number; maxTotalBytes: number };
+      https?: { allowHosts: string[]; maxRequests: number; maxResponseBytes: number; timeoutMillis: number };
+    };
+  };
+  status?: { conditions?: Condition[] };
+}
+
+export interface HarnessSession {
+  metadata: ObjectMeta;
+  spec: {
+    agentRef: string;
+    runtimeRef: string;
+    desiredState?: "running" | "stopped";
+    idleTimeout?: string;
+  };
+  status?: {
+    phase?: "Pending" | "Ready" | "Draining" | "Failed";
+    resolvedImageDigest?: string;
+    serviceName?: string;
+    conditions?: Condition[];
+  };
+}
+
+export interface HarnessSessionChatResponse {
+  choices?: Array<{ message?: { role?: string; content?: string } }>;
+  error?: { message?: string };
+}
+
 // ── AgentRun ─────────────────────────────────────────────────────────────────
 
 export interface ModelSpec {
+  connectionRef?: string;
+  connectionRevision?: string;
+  protocol?: string;
+  credentialProfile?: string;
   provider?: string;
   model?: string;
   baseURL?: string;
@@ -173,11 +396,57 @@ export interface ParentRunRef {
   spawnDepth: number;
 }
 
+/** Durable, receiver-correlated status for the protected scoped Celln wire.
+ * Attempt flags describe persisted attempts, not successful delivery. Only
+ * cleanupConfirmed proves native (and, when applicable, gateway) teardown. */
+export interface CellnScopedStatus {
+  preparationName: string;
+  preparationUid: string;
+  decisionName: string;
+  decisionUid: string;
+  receiverId?: string;
+  owner?: string;
+  parentIncarnation?: string;
+  turnId?: string;
+  gatewayRegistrationAttempted?: boolean;
+  gatewayRegistered?: boolean;
+  startAttempted?: boolean;
+  nativePhase?: string;
+  receiptDigest?: string;
+  output?: string;
+  parentId?: string;
+  childId?: string;
+  cellId?: string;
+  executionProvenance?: string;
+  substrateProvenance?: string;
+  cleanupConfirmed?: boolean;
+}
+
+// A run's task is polymorphic, matching api/v1alpha1/taskspec.go: either the
+// prompt string (Path A) or an object naming an orchestration mode. Typing it
+// as `string` is what let an object reach a JSX child and unmount the app with
+// React error #31 — read it through taskText() in @/lib/utils.
+export interface TaskModeSpec {
+  mode?: string;
+  tool?: string;
+  parameters?: Record<string, string>;
+}
+
+export type AgentRunTask = string | TaskModeSpec;
+
+export interface ConversationExchange { user: string; assistant: string }
+
 export interface AgentRunSpec {
+  executionLifecycle?: "one-shot" | "enduring";
+  enduring?: { leaseSeconds: number; maxTurns: number; maxModelRequests: number; maxOutputTokens: number; requireToolCall?: boolean };
+  /** A continued conversation: the run this one carries on from and the memory it started with. */
+  conversation?: { continuation?: "automatic" | "none"; continuesFrom?: string; depth?: number; seed?: ConversationExchange[] };
+  modelConnectionRef?: string;
+  cellnSelection?: CellnSelection;
   agentRef: string;
   agentId: string;
   sessionKey: string;
-  task: string;
+  task: AgentRunTask;
   systemPrompt?: string;
   model?: ModelSpec;
   toolPolicy?: ToolPolicySpec;
@@ -200,6 +469,20 @@ export interface DelegateStatus {
 }
 
 export interface AgentRunStatus {
+  cellnScoped?: CellnScopedStatus;
+  cellnParent?: {
+    binding: { incarnation: string; runUID: string };
+    createAttempted: boolean;
+    /** When the single create was first attempted; the lease runs from here. */
+    admittedAt?: string;
+    initialTurn?: ParentTurnExecution;
+    acceptedTurns: number;
+    activeTurn?: { name: string; uid: string };
+    /** The first terminal owner observation, frozen by the controller. */
+    ownerOutcome?: { status: "ContextLost" | "Stopped" | "TeardownUncertain" | "CreateRefused" | string; reachedReady: boolean; observedAt?: string };
+    /** The run that continues this conversation after its context was lost. */
+    continuedBy?: string;
+  };
   phase?: string;
   podName?: string;
   jobName?: string;
@@ -212,6 +495,10 @@ export interface AgentRunStatus {
   exitCode?: number;
   tokenUsage?: TokenUsage;
   costEstimate?: CostEstimate;
+  harnessImageDigest?: string;
+  harnessRuntimeRef?: string;
+  harnessContractVersion?: string;
+  harnessRuntimeSource?: "agent-default" | "run";
   postRunJobName?: string;
   gateVerdict?: string;
   delegates?: DelegateStatus[];
@@ -224,6 +511,19 @@ export interface AgentRun {
   status?: AgentRunStatus;
   /** Hypothetical estimate from user-defined simulated prices ("source":"simulated"). */
   simulatedCostEstimate?: CostEstimate;
+}
+
+export interface ParentTurnExecution {
+  id: string;
+  message: string;
+  child: string;
+  attempted: boolean;
+  result?: { succeeded: boolean; answer: string };
+}
+export interface AgentRunTurn {
+  metadata: ObjectMeta;
+  spec: { runName: string; runUID: string; message: string; cancelRequested?: boolean };
+  status?: { parentIncarnation?: string; execution?: ParentTurnExecution; cellnScoped?: CellnScopedStatus; conditions?: Condition[]; cancelAttempted?: boolean };
 }
 
 // ── SympoziumPolicy ──────────────────────────────────────────────────────────
@@ -717,6 +1017,13 @@ export interface InstallDefaultMCPServersResponse {
   alreadyPresent: string[];
 }
 
+export interface InstallDefaultRuntimesResponse {
+  sourceNamespace: string;
+  targetNamespace: string;
+  copied: string[];
+  alreadyPresent: string[];
+}
+
 export interface MCPServerAuthStatusResponse {
   status: string;
   secretName: string;
@@ -810,6 +1117,28 @@ export interface ClusterInfoResponse {
   version?: string;
 }
 
+/** One node in the cluster identity response. */
+export interface ClusterIdentityNode {
+  name: string;
+  roles: string[];
+  kubeletVersion?: string;
+}
+
+/** GET /api/v1/cluster/identity — which cluster this console is talking to.
+ *  Every field is best effort and may be empty. */
+export interface ClusterIdentity {
+  /** kube-system namespace UID. */
+  clusterID: string;
+  /** kubeadm clusterName, else the Kind cluster name, else "". */
+  name: string;
+  kubernetesVersion: string;
+  /** Capped server-side; nodeCount is the total. */
+  nodes: ClusterIdentityNode[];
+  nodeCount: number;
+  /** The API server's own build version. */
+  sympoziumVersion: string;
+}
+
 // ── Provider Discovery ───────────────────────────────────────────────────────
 
 export interface NodeProvider {
@@ -837,11 +1166,30 @@ export interface ProviderModelsResponse {
 export interface CapabilityStatus {
   available: boolean;
   reason?: string;
+  /** Stable cause: disabled, not_installed, unreachable, transport_invalid, credential_invalid, not_approved, incompatible, no_capacity, ready, unknown */
+  state?: string;
+  oneShot?: CapabilityStatus;
+  enduring?: CapabilityStatus;
 }
 
 export interface CapabilitiesResponse {
   agentSandbox: CapabilityStatus;
   celln: CapabilityStatus;
+}
+
+export interface ModelConnection {
+  metadata: ObjectMeta;
+  spec: { provider: string; protocol: "openai-chat" | "anthropic-messages"; endpoint: string; credentialProfile?: string; secretRef?: string; models: string[]; disabled?: boolean; allowInsecure?: boolean; parameters?: Record<string, unknown>; maxOutputTokens?: number };
+}
+
+export interface AgentExecutionDefaults {
+  backend?: "job" | "celln";
+  executionLifecycle?: "one-shot" | "enduring";
+  enduring?: AgentRunSpec["enduring"];
+  modelConnectionRef?: string;
+  cellnSelection?: CellnSelection;
+  provider?: string;
+  model?: string;
 }
 
 // ── Model Density (llmfit DaemonSet telemetry) ─────────────────────────────────────
@@ -922,11 +1270,57 @@ export interface DraDevice {
   healthReason?: string;
   linkLayer?: string; // nic: infiniband | ethernet (RoCE)
   rateGbps?: number;  // nic: link rate
+  /** Full-domain PCI address ("0000:c3:00.0"). Join key against DevicePower. */
+  pciAddress?: string;
 }
 
 export interface DraNodeSummary {
   nodeName: string;
   devices: DraDevice[];
+}
+
+// ── Accelerator power (GET /api/v1/power) ────────────────────────────────────
+// Sourced from an out-of-tree energy collector discovered at runtime. Every
+// field is absent-or-honest: there are no fabricated zeros. See
+// internal/collector for the contract.
+
+export interface DevicePower {
+  /** node + address (PCI, "0000:c3:00.0") is the join key against DraDevice. */
+  node: string;
+  address: string;
+  kind: string; // gpu | npu | … (open set)
+  driver?: string;
+  vendorId?: string;
+  deviceId?: string;
+  powerMilliwatts: number;
+  /** Decomposed power where the silicon exposes it. Absent keys are
+   * unmeasured, NOT zero. */
+  components?: Record<string, number>;
+  /** Runtime-PM suspended: power reads 0, but that is "asleep", not a reading. */
+  suspended: boolean;
+  /** Last-known value the collector could not refresh. */
+  stale: boolean;
+  /** False when the 0 W is synthetic (suspended, or no readable sensor).
+   * Render "—", never "0 W", when this is false. */
+  measured: boolean;
+}
+
+export interface PowerSnapshot {
+  scrapedAt: string;
+  agentsTotal: number;
+  agentsUp: number;
+  totalMilliwatts: number;
+  staleDevices: number;
+  devices: DevicePower[];
+}
+
+export interface PowerResponse {
+  /** False when no collector is installed — distinct from "collector present,
+   * zero accelerators". The UI omits the power surface entirely when false. */
+  available: boolean;
+  endpoint?: string;
+  snapshot?: PowerSnapshot;
+  devices: DevicePower[];
 }
 
 export interface DraNodesResponse {
@@ -1062,7 +1456,7 @@ export function setNamespace(ns: string) {
 
 async function apiFetch<T>(
   path: string,
-  init?: RequestInit & { skipNamespace?: boolean },
+  init?: RequestInit & { skipNamespace?: boolean; retryNetwork?: boolean },
 ): Promise<T> {
   const token = getToken();
   const headers = new Headers(init?.headers);
@@ -1086,7 +1480,7 @@ async function apiFetch<T>(
   // Retry network errors (port-forward drops, transient failures) up to 2
   // times with a short delay.  Non-network errors (4xx, 5xx) are NOT retried
   // here — React Query handles those via its own retry config.
-  const maxAttempts = 3;
+  const maxAttempts = init?.retryNetwork === false ? 1 : 3;
   let lastError: unknown;
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     try {
@@ -1151,6 +1545,9 @@ export const api = {
         };
         lifecycle?: LifecycleHooks | null;
         requireApproval?: boolean;
+		runtimeRef?: string;
+        execution?: AgentExecutionDefaults;
+        clearExecution?: boolean;
       },
     ) =>
       apiFetch<Agent>(`/api/v1/agents/${name}`, {
@@ -1169,6 +1566,7 @@ export const api = {
       awsSecretAccessKey?: string;
       awsSessionToken?: string;
       policyRef?: string;
+	  runtimeRef?: string;
       skills?: SkillRef[];
       channels?: ChannelSpec[];
       heartbeatInterval?: string;
@@ -1176,6 +1574,7 @@ export const api = {
       agentSandbox?: { enabled: boolean; runtimeClass?: string };
       runTimeout?: string;
       requireApproval?: boolean;
+      execution?: AgentExecutionDefaults;
     }) =>
       apiFetch<Agent>("/api/v1/agents", {
         method: "POST",
@@ -1184,18 +1583,39 @@ export const api = {
   },
 
   runs: {
+    cancelTurn: (name: string, namespace: string, turn: string, body: { runUID: string; turnUID: string }) =>
+      apiFetch<AgentRunTurn>(`/api/v1/runs/${encodeURIComponent(name)}/turns/${encodeURIComponent(turn)}/cancel?namespace=${encodeURIComponent(namespace)}`, { method: "POST", body: JSON.stringify(body), skipNamespace: true, retryNetwork: false }),
+    deleteEnduring: (name: string, namespace: string, uid: string) =>
+      apiFetch<void>(`/api/v1/runs/${encodeURIComponent(name)}?namespace=${encodeURIComponent(namespace)}&uid=${encodeURIComponent(uid)}`, { method: "DELETE", skipNamespace: true, retryNetwork: false }),
+    /** Restart a conversation in a new parent on any node with capacity, seeded with its transcript; the old run is deleted. */
+    continue: (name: string, namespace: string, uid: string) =>
+      apiFetch<AgentRun>(`/api/v1/runs/${encodeURIComponent(name)}/continue?namespace=${encodeURIComponent(namespace)}&uid=${encodeURIComponent(uid)}`, { method: "POST", skipNamespace: true, retryNetwork: false }),
+    turns: (name: string, namespace: string, cursor = "") =>
+      apiFetch<{ runUID: string; items: AgentRunTurn[]; continue: string }>(`/api/v1/runs/${encodeURIComponent(name)}/turns?namespace=${encodeURIComponent(namespace)}&continue=${encodeURIComponent(cursor)}`, { skipNamespace: true }),
+    submitTurn: (name: string, namespace: string, body: { runUID: string; requestId: string; message: string }) =>
+      apiFetch<AgentRunTurn>(`/api/v1/runs/${encodeURIComponent(name)}/turns?namespace=${encodeURIComponent(namespace)}`, { method: "POST", body: JSON.stringify(body), skipNamespace: true, retryNetwork: false }),
     list: () => apiFetch<AgentRun[]>("/api/v1/runs"),
     get: (name: string) => apiFetch<AgentRun>(`/api/v1/runs/${name}`),
     create: (data: {
       agentRef: string;
       task: string;
+      executionLifecycle?: AgentRunSpec["executionLifecycle"];
+      enduring?: AgentRunSpec["enduring"];
+      systemPrompt?: string;
       model?: string;
       timeout?: string;
       backend?: string;
+      runtimeRef?: string;
+      provider?: string;
+      modelConnectionRef?: string;
+      cellnSelection?: CellnSelection;
     }) =>
       apiFetch<AgentRun>("/api/v1/runs", {
         method: "POST",
         body: JSON.stringify(data),
+        // Creation has no request identity yet; an uncertain enduring creation
+        // must not automatically mint another run/parent.
+        retryNetwork: data.executionLifecycle !== "enduring",
       }),
     delete: (name: string) =>
       apiFetch<void>(`/api/v1/runs/${name}`, { method: "DELETE" }),
@@ -1203,7 +1623,78 @@ export const api = {
       apiFetch<AgentRun>(`/api/v1/runs/${name}/gate-verdict`, {
         method: "POST",
         body: JSON.stringify(data),
+    }),
+  },
+
+  runtimes: {
+    list: () => apiFetch<AgentRuntime[]>("/api/v1/runtimes"),
+    installDefaults: () =>
+      apiFetch<InstallDefaultRuntimesResponse>("/api/v1/runtimes/install-defaults", {
+        method: "POST",
       }),
+  },
+
+  modelConnections: {
+    list: () => apiFetch<ModelConnection[]>("/api/v1/model-connections"),
+    create: (data: { name: string; spec: ModelConnection["spec"]; apiKey?: string }) => apiFetch<ModelConnection>("/api/v1/model-connections", { method: "POST", body: JSON.stringify(data) }),
+  },
+
+  clusterCellnTools: {
+    list: () => apiFetch<CellnTool[]>("/api/v1/cluster-celln-tools"),
+  },
+
+  cellnPlatform: {
+    profiles: () => apiFetch<CellnPlatformProfile[]>("/api/v1/celln-platform/profiles"),
+    /** The AgentRuntime wrapper alone: all an Agent with its own key needs from the fleet. */
+    ensureRuntime: (profile: string) => apiFetch<CellnPlatformWrappers>("/api/v1/celln-platform/wrappers", { method: "POST", body: JSON.stringify({ profile, runtimeOnly: true }) }),
+    mediation: () => apiFetch<CellnMediation>("/api/v1/celln-platform/mediation"),
+    keySecrets: (key: string) => apiFetch<CellnKeySecret[]>(`/api/v1/celln-platform/key-secrets?key=${encodeURIComponent(key)}`),
+    cells: () => apiFetch<CellnNodeCells[]>("/api/v1/celln-platform/cells", { skipNamespace: true }),
+  },
+
+  cellnTools: {
+    list: () => apiFetch<CellnTool[]>("/api/v1/celln-tools"),
+    preview: (agentRef: string, cellnSelection: CellnSelection, executionLifecycle?: "enduring") => apiFetch<CellnPermissionPreview>("/api/v1/celln-selection/preview", { method: "POST", body: JSON.stringify({ agentRef, cellnSelection, executionLifecycle }) }),
+  },
+
+  harnessSessions: {
+    list: () => apiFetch<HarnessSession[]>("/api/v1/harness-sessions"),
+    create: (data: { name: string; agentRef: string; runtimeRef: string; idleTimeout?: string }) =>
+      apiFetch<HarnessSession>("/api/v1/harness-sessions", { method: "POST", body: JSON.stringify(data) }),
+    setDesiredState: (name: string, desiredState: "running" | "stopped") =>
+      apiFetch<HarnessSession>(`/api/v1/harness-sessions/${name}`, { method: "PATCH", body: JSON.stringify({ desiredState }) }),
+    delete: (name: string) => apiFetch<void>(`/api/v1/harness-sessions/${name}`, { method: "DELETE" }),
+    chat: (name: string, message: string) => apiFetch<HarnessSessionChatResponse>(`/api/v1/harness-sessions/${name}/chat`, {
+      method: "POST", body: JSON.stringify({ messages: [{ role: "user", content: message }] }),
+    }),
+    chatStream: async (name: string, message: string, onDelta: (content: string) => void) => {
+      const token = getToken();
+      const headers = new Headers({ "Content-Type": "application/json", Accept: "text/event-stream" });
+      if (token) headers.set("Authorization", `Bearer ${token.replace(/[^\x00-\xFF]/g, "")}`);
+      const response = await fetch(`/api/v1/harness-sessions/${name}/chat?namespace=${encodeURIComponent(getNamespace())}`, {
+        method: "POST", headers, body: JSON.stringify({ stream: true, messages: [{ role: "user", content: message }] }),
+      });
+      if (!response.ok) throw new Error((await response.text()) || `Chat failed (${response.status})`);
+      if (!response.body) throw new Error("The browser did not expose the chat stream");
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let pending = "";
+      for (;;) {
+        const { value, done } = await reader.read();
+        pending += decoder.decode(value, { stream: !done });
+        const events = pending.split("\n\n");
+        pending = events.pop() || "";
+        for (const event of events) {
+          const data = event.split("\n").find((line) => line.startsWith("data: "))?.slice(6);
+          if (!data || data === "[DONE]") continue;
+          const payload = JSON.parse(data) as { choices?: Array<{ delta?: { content?: string } }>; error?: { message?: string } };
+          if (payload.error?.message) throw new Error(payload.error.message);
+          const content = payload.choices?.[0]?.delta?.content;
+          if (content) onDelta(content);
+        }
+        if (done) return;
+      }
+    },
   },
 
   policies: {
@@ -1452,6 +1943,10 @@ export const api = {
 
   cluster: {
     info: () => apiFetch<ClusterInfoResponse>("/api/v1/cluster"),
+    get: () =>
+      apiFetch<ClusterIdentity>("/api/v1/cluster/identity", {
+        skipNamespace: true,
+      }),
   },
 
   capabilities: {
@@ -1563,6 +2058,13 @@ export const api = {
   dra: {
     nodes: () =>
       apiFetch<DraNodesResponse>("/api/v1/dra/nodes", {
+        skipNamespace: true,
+      }),
+  },
+
+  power: {
+    fleet: () =>
+      apiFetch<PowerResponse>("/api/v1/power", {
         skipNamespace: true,
       }),
   },

@@ -11,7 +11,7 @@
   Agents don't need better prompts. They need shared situational awareness.<br>
   Sympozium is a <b>coordination layer</b> for multi-agent AI systems on Kubernetes &mdash;<br>
   selective permeability, structured handoffs, and shared memory.<br>
-  Every agent is a Pod. Every policy is a CRD. Every execution is a Job.</em><br><br>
+  Agents run in isolated workloads. Every policy is a CRD.</em><br><br>
   From the creator of <a href="https://github.com/k8sgpt-ai/k8sgpt">k8sgpt</a> and <a href="https://github.com/AlexsJones/llmfit">llmfit</a>
 </p>
 
@@ -27,12 +27,30 @@
 </p>
 
 <p align="center">
-  <img src="demo.gif" alt="Sympozium dashboard" width="800px;">
+  <a href="https://sympozium.ai/video/sympozium-harness-tasks.mp4">
+    <img src="docs/assets/agentharness/native-harness-tasks.gif" alt="Sympozium coordinates a persistent native harness: each bounded task executes in a fresh Celln child, returns its result, and is cleaned up while the harness retains live context." width="800">
+  </a>
+</p>
+<p align="center">
+  <b>The harness stays. The task cell goes.</b><br>
+  <a href="https://github.com/sympozium-ai/sympozium/discussions/472">Native cells release</a><br>
+  <sub>Native Celln path: one active task at a time; live context does not survive a host crash.</sub>
 </p>
 
 ---
 
 > **Full documentation:** [deploy.sympozium.ai/docs](https://deploy.sympozium.ai/docs/)
+
+---
+
+> [!IMPORTANT]
+> **AgentHarness is available experimentally.** Run an administrator-approved
+> external adapter in an isolated AgentRun, or choose a session-capable runtime
+> for a private, continuing **Agent → Chat** conversation. Kubernetes policy,
+> identity, skills, memory, MCP, observability, and audit remain under platform
+> control. Start with the [AgentHarness guide](https://deploy.sympozium.ai/docs/guides/agentharness/)
+> and the digest-pinned [reference adapter](examples/harness-reference/). This
+> is an adapter boundary—not permission to run arbitrary upstream images.
 
 ---
 
@@ -52,10 +70,30 @@ curl -fsSL https://deploy.sympozium.ai/install.sh | sh
 Then deploy to your cluster and activate your first agents:
 
 ```bash
-sympozium install          # deploys CRDs, controllers, and built-in Ensembles
+sympozium install          # deploys CRDs, controllers, built-in Ensembles, the Celln plane and ergoz
+# With DEEPSEEK_API_KEY, OPENAI_API_KEY and/or ANTHROPIC_API_KEY set (or a prompt in a
+# terminal), the same command installs the Celln fleet: every node with KVM runs
+# hardware-isolated, long-running agents for every namespace, one backend per key,
+# each Agent choosing its own. No further flags.
 sympozium                  # launch the TUI — go to Ensembles tab, press Enter to onboard
 sympozium serve            # open the web dashboard (port-forwards to the in-cluster UI)
 ```
+
+The Celln fleet runs on nodes that have `/dev/kvm` and a kernel image under
+`/boot` (each cell is a microVM; the VMM boots it from that file); the node
+probe labels such nodes `celln.dev/kvm=true`. **Kind is a development
+environment only.** On a Linux host, Kind nodes already see `/dev/kvm` but
+ship without a kernel image, so a plain install waits for a node that never
+qualifies. The mitigation is to copy the host's running kernel into each node;
+the probe labels it within seconds:
+
+```bash
+docker cp /boot/vmlinuz-$(uname -r) kind-control-plane:/boot/   # and each worker
+```
+
+Kind on macOS or Windows runs inside a VM without `/dev/kvm` and cannot run
+the fleet at all. The installer prints this hint if no node has qualified
+within the first minute of its wait.
 
 ### Advanced: Helm Chart
 
@@ -118,6 +156,7 @@ Sympozium is a **Kubernetes-native coordination layer** for multi-agent AI syste
 | **Policy & Governance** | Cluster-wide `SympoziumPolicy` CRD &mdash; tool gating (allow/deny/ask), sandbox requirements, network egress rules, and image-registry allowlists, enforced by an admission webhook |
 | **Serving Mode** | Run an agent as a long-lived, OpenAI-compatible + MCP HTTP endpoint instead of a one-shot Job &mdash; agents as services |
 | **Observability & Cost** | OpenTelemetry traces and metrics, Prometheus endpoints, per-run trace IDs, and token usage with estimated cost on every AgentRun |
+| **Celln Tool Catalogue** | Hardware-isolated agents borrow real programs (grep, sed, awk, jq, &hellip;) taken from container images pinned by digest, never reimplemented. Every borrowed tool names the image layer it came from, and operators extend the toolbox by adding an image to the catalogue, no rebuild. See [the fleet guide](docs/guides/celln-fleet-installation.md#the-toolbox) |
 | **Any AI Provider** | OpenAI, Anthropic, AWS Bedrock, Azure, Ollama, or any OpenAI-compatible endpoint (Groq, Mistral, DeepSeek, OpenRouter, vLLM, LM Studio, &hellip;) &mdash; no vendor lock-in |
 
 ---
@@ -133,6 +172,7 @@ Sympozium is a **Kubernetes-native coordination layer** for multi-agent AI syste
 | Ensembles | [deploy.sympozium.ai/docs/concepts/ensembles](https://deploy.sympozium.ai/docs/concepts/ensembles/) |
 | Skills & Sidecars | [deploy.sympozium.ai/docs/concepts/skills](https://deploy.sympozium.ai/docs/concepts/skills/) |
 | Sidecar-Driven Mode | [deploy.sympozium.ai/docs/modes/sidecar-driven](https://deploy.sympozium.ai/docs/modes/sidecar-driven/) |
+| Harness Mode (external agent harnesses) | [deploy.sympozium.ai/docs/modes/harness](https://deploy.sympozium.ai/docs/modes/harness/) |
 | Persistent Memory | [deploy.sympozium.ai/docs/concepts/persistent-memory](https://deploy.sympozium.ai/docs/concepts/persistent-memory/) |
 | Channels | [deploy.sympozium.ai/docs/concepts/channels](https://deploy.sympozium.ai/docs/concepts/channels/) |
 | Agent Sandboxing | [deploy.sympozium.ai/docs/concepts/agent-sandbox](https://deploy.sympozium.ai/docs/concepts/agent-sandbox/) |

@@ -3,37 +3,33 @@ name: Build and Push Images
 on:
   push:
     branches: [main]
+  # No base-branch filter: stacked PRs (base = another feature branch) get the
+  # same checks. Pushes only trigger on main, so nothing runs twice.
   pull_request:
-    branches: [main]
   workflow_dispatch:
 
 env:
   REGISTRY: ghcr.io/sympozium-ai/sympozium
 
 permissions:
-  contents: read
+  contents: write
   packages: write
 
-# A newer push supersedes an in-flight run of the same ref. The fleet is
-# tagged by sha + latest, so the superseding run rewrites every tag the
-# cancelled one would have written — back-to-back pushes stop paying for
-# the whole 18-image fleet twice.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
-  # Gate the expensive fleet build on whether anything that reaches an
-  # image actually changed. Verification is one cheap job and always runs.
   changes:
     name: Detect changes
     runs-on: ubuntu-latest
     if: github.event_name != 'workflow_dispatch'
     outputs:
       code: ${{ steps.filter.outputs.code }}
+      web: ${{ steps.filter.outputs.web }}
+      system: ${{ steps.filter.outputs.system }}
     steps:
       - uses: actions/checkout@v4
-
       - uses: dorny/paths-filter@v3
         id: filter
         with:
@@ -45,17 +41,34 @@ jobs:
               - 'images/**'
               - 'web/**'
               - '.github/workflows/build.yaml'
+              - '.github/workflows/native-artifacts.yaml'
+              - 'config/host/**'
+              - 'config/celln/**'
+            web:
+              - 'web/**'
+              - '.github/workflows/build.yaml'
+            # Inputs of the envtest suite: Go code (api/, internal/, the tests
+            # themselves), the CRDs it installs, and the chart copies that must
+            # match them. Kept apart from `code`, which also gates image builds.
+            system:
+              - '**.go'
+              - 'go.mod'
+              - 'go.sum'
+              - 'Makefile'
+              - 'api/**'
+              - 'config/crd/**'
+              - 'charts/sympozium/crds/**'
+              - 'charts/sympozium-crds/templates/**'
+              - 'test/system/**'
+              - '.github/workflows/build.yaml'
 
-  # fmt, vet, build, test, and codegen used to be five runners each paying
-  # its own checkout + setup-go + module download. The steps are strictly
-  # cheaper back-to-back on one warm cache; they stay separate steps so a
-  # failure still names itself.
   verify:
     name: Verify
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
@@ -63,24 +76,22 @@ jobs:
 
       - name: Check formatting
         run: |
-          unformatted=$(gofmt -l $(find . -name '*.go' -not -path './vendor/*'))
+          unformatted=$(find . -name '*.go' -not -path './vendor/*' -print0 | xargs -0 gofmt -l)
           if [ -n "$unformatted" ]; then
             echo "::error::The following files are not formatted:"
             echo "$unformatted"
-            echo ""
-            echo "Run 'gofmt -s -w .' to fix."
             exit 1
           fi
-
       - name: Vet
         run: go vet ./...
-
+      - name: Vet build-tagged code
+        # `./...` skips files behind a build constraint (test/system is
+        # `//go:build system`), so they can stop compiling unnoticed.
+        run: make vet-tags
       - name: Build
         run: go build ./...
-
       - name: Test
         run: go test -race -short ./...
-
       - name: Check generated code is up to date
         run: |
           make generate
@@ -89,59 +100,125 @@ jobs:
             git diff --stat
             exit 1
           fi
-
       - name: Check Helm chart CRDs in sync
         run: make helm-sync-check
+
+  system-tests:
+    name: System tests (envtest)
+    # Controllers + API server against a real kube-apiserver/etcd; no cluster.
+    # `make test-system` is what CLAUDE.md prescribes for reconcile changes.
+    needs: [changes]
+    if: >-
+      always() &&
+      (needs.changes.outputs.system == 'true' || github.event_name == 'workflow_dispatch')
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Read envtest Kubernetes version
+        id: envtest
+        run: echo "version=$(make -s envtest-k8s-version)" >> "$GITHUB_OUTPUT"
+      - name: Cache envtest binaries
+        # bin/ is the Makefile's LOCALBIN: setup-envtest plus the etcd and
+        # kube-apiserver it downloads. With a hit, the run needs no download.
+        uses: actions/cache@v4
+        with:
+          path: bin
+          key: envtest-${{ runner.os }}-${{ runner.arch }}-${{ steps.envtest.outputs.version }}
+      - name: Download envtest binaries
+        run: make envtest-assets
+      - name: Run system tests
+        run: make test-system
+
+  web-stubbed-e2e:
+    name: Console stubbed Cypress specs
+    # These specs intercept every API call, so they need no cluster or model.
+    # The spec list lives in web/package.json ("test:stubbed").
+    needs: [changes]
+    if: needs.changes.outputs.web == 'true'
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Install dependencies
+        run: npm ci
+      - name: Start dev server
+        run: |
+          npx vite --port 5173 --strictPort > "$RUNNER_TEMP/vite.log" 2>&1 &
+          for _ in $(seq 1 60); do
+            if curl -sf http://localhost:5173 > /dev/null; then exit 0; fi
+            sleep 1
+          done
+          echo "::error::vite dev server did not start"
+          cat "$RUNNER_TEMP/vite.log"
+          exit 1
+      - name: Run stubbed specs
+        env:
+          CYPRESS_API_TOKEN: test-token
+        run: npm run test:stubbed
+      - name: Upload screenshots
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cypress-screenshots
+          path: web/cypress/screenshots
+          if-no-files-found: ignore
+
+  native-artifacts:
+    needs: [changes, verify]
+    if: >-
+      always() && needs.verify.result == 'success' &&
+      (needs.changes.outputs.code == 'true' || github.event_name == 'workflow_dispatch')
+    uses: ./.github/workflows/native-artifacts.yaml
+    permissions:
+      contents: write
+      packages: write
+    with:
+      publish: ${{ github.event_name != 'pull_request' }}
+    secrets: inherit
 
   build-and-push:
     runs-on: ubuntu-latest
     needs: [changes, verify]
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.changes.outputs.code == 'true'
+    if: >-
+      always() && needs.verify.result == 'success' &&
+      ((github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.changes.outputs.code == 'true') || github.event_name == 'workflow_dispatch')
     strategy:
       matrix:
-        image:
-          - agent-runner
-          - controller
-          - apiserver
-          - ipc-bridge
-          - webhook
-          - web-proxy
-          - channel-telegram
-          - channel-whatsapp
-          - channel-discord
-          - channel-slack
-          - skill-k8s-ops
-          - skill-sre-observability
-          - skill-github-gitops
-          - skill-llmfit
-          - skill-memory
-          - mcp-bridge
-          - node-probe
-          - llmfit-daemon
+        image: [agent-runner, controller, apiserver, ipc-bridge, webhook, web-proxy, model-gateway, channel-telegram, channel-whatsapp, channel-discord, channel-slack, skill-k8s-ops, skill-sre-observability, skill-github-gitops, skill-llmfit, skill-memory, mcp-bridge, node-probe, llmfit-daemon, harness-reference]
     steps:
       - uses: actions/checkout@v4
-
       - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Extract metadata
-        id: meta
+      - uses: docker/setup-buildx-action@v3
+      - id: meta
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ matrix.image }}
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
             type=sha,prefix=
-
-      - name: Build and push
-        uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@v6
         with:
           context: .
           file: images/${{ matrix.image }}/Dockerfile
@@ -149,8 +226,47 @@ jobs:
           platforms: linux/amd64,linux/arm64
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          # Scoped per image: 18 matrix jobs writing mode=max into ONE
-          # shared scope evicted each other constantly — every build ran
-          # effectively cold.
           cache-from: type=gha,scope=${{ matrix.image }}
           cache-to: type=gha,mode=max,scope=${{ matrix.image }}
+
+  build-celln-installer:
+    runs-on: ubuntu-latest
+    needs: [changes, verify]
+    if: >-
+      always() && needs.verify.result == 'success' &&
+      ((github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.changes.outputs.code == 'true') || github.event_name == 'workflow_dispatch')
+    steps:
+      - uses: actions/checkout@v4
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/setup-buildx-action@v3
+      - name: Read pinned Celln release
+        id: celln
+        run: |
+          pin=config/celln/release.json
+          jq -e '.version | test("^v[0-9]+\\.[0-9]+\\.[0-9]+$")' "$pin"
+          jq -e '.imageDigest | test("^sha256:[a-f0-9]{64}$")' "$pin"
+          echo "image=ghcr.io/sympozium-ai/celln@$(jq -r .imageDigest "$pin")" >> "$GITHUB_OUTPUT"
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/celln-installer
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,prefix=
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: images/celln-installer/Dockerfile
+          push: true
+          platforms: linux/amd64
+          build-args: |
+            CELLN_IMAGE=${{ steps.celln.outputs.image }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=celln-installer
+          cache-to: type=gha,mode=max,scope=celln-installer

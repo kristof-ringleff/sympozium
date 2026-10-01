@@ -7,6 +7,12 @@ import (
 
 // AgentRunSpec defines the desired state of an AgentRun.
 // Each agent invocation (including sub-agents) produces an AgentRun CR.
+// +kubebuilder:validation:XValidation:rule="!has(self.cellnSelection) || (has(self.backend) && self.backend == 'celln' && !has(self.celln))",message="catalogue selection requires backend celln and cannot mix explicit artifacts"
+// +kubebuilder:validation:XValidation:rule="!has(self.executionLifecycle) || self.executionLifecycle != 'enduring' || (has(self.enduring) && has(self.backend) && self.backend == 'celln' && has(self.cellnSelection) && (!has(self.mode) || self.mode == 'task'))",message="enduring lifecycle requires Celln catalogue selection, limits, and task mode"
+// +kubebuilder:validation:XValidation:rule="!has(self.enduring) || (has(self.executionLifecycle) && self.executionLifecycle == 'enduring')",message="enduring limits require enduring lifecycle"
+// +kubebuilder:validation:XValidation:rule="!has(self.conversation) || (has(self.executionLifecycle) && self.executionLifecycle == 'enduring')",message="conversation continuation requires enduring lifecycle"
+// +kubebuilder:validation:XValidation:rule="!has(self.executionLifecycle) || self.executionLifecycle != 'one-shot' || !has(self.mode) || self.mode != 'server'",message="one-shot lifecycle cannot use server mode"
+// +kubebuilder:validation:XValidation:rule="!has(oldSelf.executionLifecycle) || oldSelf.executionLifecycle != 'enduring' || (has(self.executionLifecycle) && self.executionLifecycle == 'enduring' && has(self.backend) && self.backend == 'celln' && has(self.cellnSelection) && has(self.enduring))",message="an enduring run cannot lose its lifecycle, Celln backend, selection or limits; delete the original run instead"
 type AgentRunSpec struct {
 	// AgentRef is the name of the Agent this run belongs to.
 	AgentRef string `json:"agentRef"`
@@ -96,6 +102,25 @@ type AgentRunSpec struct {
 	// +optional
 	Mode string `json:"mode,omitempty"`
 
+	// ExecutionLifecycle selects one-shot or enduring execution independently of Harness
+	// configuration. Omission preserves legacy task/server behaviour. Enduring
+	// is the native Celln parent/turn-worker path, not an OCI HarnessSession.
+	// +kubebuilder:validation:Enum=one-shot;enduring
+	// +optional
+	ExecutionLifecycle string `json:"executionLifecycle,omitempty"`
+
+	// Enduring bounds the complete parent lifetime, not a renewable per-turn
+	// allowance. Effective grants may only narrow these requested ceilings.
+	// +optional
+	Enduring *EnduringRunSpec `json:"enduring,omitempty"`
+
+	// Conversation relates an enduring run to the conversation it belongs
+	// to: re-creation after context loss and, for a continued run, the
+	// exchanges it starts with. Immutable once set.
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="conversation is immutable"
+	// +optional
+	Conversation *ConversationSpec `json:"conversation,omitempty"`
+
 	// DryRun skips the LLM call and produces a synthetic result, allowing
 	// pipeline execution paths to be traced without burning tokens.
 	// The flag is automatically propagated to sequential successors.
@@ -106,14 +131,30 @@ type AgentRunSpec struct {
 	// "job" (default, implicit): standard Kubernetes Job backend.
 	// "celln": hardware-isolated Celln dispatcher (hermetic; no ensembles, no
 	//   delegation, no shared memory, no IPC, no streaming; the agent receives
-	//   the task string and produces a bounded output). Tasks that require
-	//   multiple tools, sub-agents, or workflow state must use "job".
+	//   the task string and produces a bounded output). Explicit native Harness
+	//   bindings support bounded lent tools; sub-agents and retained workflow
+	//   state still require "job".
 	//
 	// Celln is selected for individual high-risk or bounded computations;
 	// ensembles and workflows always use the Job backend.
 	// +kubebuilder:validation:Enum=job;celln
 	// +optional
 	Backend string `json:"backend,omitempty"`
+
+	// Celln names an immutable program and bounded data for backend=celln.
+	// A direct program invocation does not send task text to a model. An explicit
+	// Harness binding sends bounded task/persona data through its host model grant.
+	// Task text never supplies executable authority.
+	// The Celln operator must independently approve every referenced artifact.
+	// +optional
+	Celln *CellnExecutionSpec `json:"celln,omitempty"`
+
+	// CellnSelection requests same-namespace approved catalogue revisions.
+	// This is intent, not host authority or readiness. Until durable issuance
+	// is committed, the controller waits without entering legacy execution.
+	// Mutually exclusive with the advanced explicit Celln artifact binding.
+	// +optional
+	CellnSelection *CellnCatalogueSelection `json:"cellnSelection,omitempty"`
 
 	// CanaryMode runs built-in health checks instead of the LLM conversation
 	// loop. The agent executes deterministic platform checks (API server,
@@ -141,6 +182,12 @@ type AgentRunSpec struct {
 	// +optional
 	// +kubebuilder:default=true
 	UseContext *bool `json:"useContext,omitempty"`
+
+	// Tolerations allow the agent pod to schedule onto tainted nodes.
+	// Typically inherited from Agent.Spec.Agents.Default.Tolerations by
+	// the controller, but may also be set directly on an AgentRun.
+	// +optional
+	Tolerations []corev1.Toleration `json:"tolerations,omitempty"`
 
 	// Volumes are additional pod volumes to attach to the agent pod.
 	// Typically populated from Agent.Spec.Volumes by the controller,
@@ -172,7 +219,26 @@ type ParentRunRef struct {
 
 // ModelSpec defines which LLM to use.
 type ModelSpec struct {
+	// ConnectionRef selects a ModelConnection in this run's namespace (native Celln only).
+	// +optional
+	ConnectionRef string `json:"connectionRef,omitempty"`
+	// ConnectionRevision pins the connection UID and spec after resolution.
+	// +optional
+	ConnectionRevision string `json:"connectionRevision,omitempty"`
+	// Protocol is the host API adapter selected by the connection.
+	// +optional
+	Protocol string `json:"protocol,omitempty"`
+	// CredentialProfile is the independently approved opaque host mapping.
+	// +optional
+	CredentialProfile string `json:"credentialProfile,omitempty"`
+	// AllowInsecure is the operator opt-in for an HTTP or self-signed private
+	// model endpoint, carried from the selected connection.
+	// +optional
+	AllowInsecure bool `json:"allowInsecure,omitempty"`
+
 	// Provider is the AI provider (openai, anthropic, azure-openai, github-copilot, ollama, etc.).
+	// Omit when resolving a model connection.
+	// +optional
 	Provider string `json:"provider"`
 
 	// Model is the model identifier.
@@ -193,6 +259,7 @@ type ModelSpec struct {
 	Thinking string `json:"thinking,omitempty"`
 
 	// AuthSecretRef references the secret containing the API key.
+	// +optional
 	AuthSecretRef string `json:"authSecretRef"`
 
 	// ProviderHeaders are additional HTTP headers sent with every LLM provider request.
@@ -325,8 +392,33 @@ const (
 	AgentRunPhaseSkipped AgentRunPhase = "Skipped"
 )
 
+// IsTerminal reports whether the phase is final: the run has stopped and the
+// controller will not move it to another phase.
+//
+// Skipped is terminal alongside Succeeded and Failed. Spelling the check out
+// inline keeps losing Skipped, which leaks finalizers and makes Forbid
+// schedules block on runs that already finished — so always call this helper
+// instead of comparing phases by hand. The empty phase ("", the run not
+// observed yet) is not terminal.
+func (p AgentRunPhase) IsTerminal() bool {
+	switch p {
+	case AgentRunPhaseSucceeded, AgentRunPhaseFailed, AgentRunPhaseSkipped:
+		return true
+	}
+	return false
+}
+
 // AgentRunStatus defines the observed state of AgentRun.
+// +kubebuilder:validation:XValidation:rule="!has(oldSelf.cellnIssuance) || has(self.cellnIssuance)",message="saved Celln issuance cannot be removed"
+// +kubebuilder:validation:XValidation:rule="!has(oldSelf.cellnParent) || has(self.cellnParent)",message="saved Celln parent cannot be removed"
+// +kubebuilder:validation:XValidation:rule="!has(oldSelf.cellnScoped) || has(self.cellnScoped)",message="saved scoped Celln identity cannot be removed"
 type AgentRunStatus struct {
+	// CellnOnly records a new run's execution boundary before any finalizer or
+	// workload side effects. The controller refuses subsequent backend changes.
+	// Absent on legacy runs: absence does not prove that Job-side RBAC is absent.
+	// +optional
+	CellnOnly bool `json:"cellnOnly,omitempty"`
+
 	// Phase is the current phase (Pending, Running, Succeeded, Failed, Skipped).
 	// +optional
 	Phase AgentRunPhase `json:"phase,omitempty"`
@@ -394,6 +486,30 @@ type AgentRunStatus struct {
 	// +optional
 	TraceID string `json:"traceID,omitempty"`
 
+	// HarnessImageDigest records the digest of the external harness adapter image
+	// that executed this run. Populated only for `task.mode: harness` runs, and
+	// only once the run has been admitted and dispatched. Empty for all other
+	// modes and backends.
+	// +optional
+	HarnessImageDigest string `json:"harnessImageDigest,omitempty"`
+
+	// HarnessRuntimeRef records the AgentRuntime that was resolved for this
+	// harness run. It remains populated when an Agent's runtimeRef converted a
+	// normal string task into harness mode, so audit and UI do not have to infer
+	// the selected runtime from the current Agent configuration.
+	// +optional
+	HarnessRuntimeRef string `json:"harnessRuntimeRef,omitempty"`
+
+	// HarnessContractVersion records the harness contract supplied to the
+	// adapter that executed this run.
+	// +optional
+	HarnessContractVersion string `json:"harnessContractVersion,omitempty"`
+
+	// HarnessRuntimeSource records whether the resolved runtime came from the
+	// Agent default ("agent-default") or the AgentRun ("run").
+	// +optional
+	HarnessRuntimeSource string `json:"harnessRuntimeSource,omitempty"`
+
 	// PostRunJobName is the name of the Job created for postRun lifecycle hooks.
 	// +optional
 	PostRunJobName string `json:"postRunJobName,omitempty"`
@@ -419,6 +535,109 @@ type AgentRunStatus struct {
 	// router to track progress.
 	// +optional
 	CellnActionID string `json:"cellnActionId,omitempty"`
+
+	// CellnRequest freezes the exact versioned request before first dispatch.
+	// +kubebuilder:validation:MaxLength=131072
+	// +optional
+	CellnRequest string `json:"cellnRequest,omitempty"`
+	// CellnIssuance persists the exact approved payload before remote provisioning.
+	// It is history, not dispatch permission or artifact readiness.
+	// +optional
+	CellnIssuance *CellnIssuanceStatus `json:"cellnIssuance,omitempty"`
+	// CellnParent binds enduring intent before any parent creation side effect.
+	// +optional
+	CellnParent *CellnParentStatus `json:"cellnParent,omitempty"`
+	// CellnScoped binds a shared-catalogue run to immutable protected
+	// preparation, final decision, and receiver ownership. Enduring roots also
+	// retain their namespace-aware parent incarnation here.
+	// +optional
+	CellnScoped *CellnScopedStatus `json:"cellnScoped,omitempty"`
+	// CellnReceipt retains the validated versioned terminal receipt as JSON.
+	// +kubebuilder:validation:MaxLength=131072
+	// +optional
+	CellnReceipt string `json:"cellnReceipt,omitempty"`
+}
+
+// CellnScopedStatus is the durable controller-side recovery record for the
+// separately authenticated /v1/scoped protocol. Identity fields are write-once.
+// +kubebuilder:validation:XValidation:rule="self.preparationName == oldSelf.preparationName && self.preparationUid == oldSelf.preparationUid && self.decisionName == oldSelf.decisionName && self.decisionUid == oldSelf.decisionUid",message="protected scoped preparation identity is immutable"
+// +kubebuilder:validation:XValidation:rule="!has(oldSelf.receiverId) || (has(self.receiverId) && self.receiverId == oldSelf.receiverId && self.owner == oldSelf.owner)",message="scoped receiver owner identity is immutable"
+// +kubebuilder:validation:XValidation:rule="!has(oldSelf.gatewayRegistrationAttempted) || !oldSelf.gatewayRegistrationAttempted || (has(self.gatewayRegistrationAttempted) && self.gatewayRegistrationAttempted)",message="gateway registration attempt cannot be forgotten"
+// +kubebuilder:validation:XValidation:rule="!has(oldSelf.gatewayRegistered) || !oldSelf.gatewayRegistered || (has(self.gatewayRegistered) && self.gatewayRegistered)",message="gateway registration cannot regress"
+// +kubebuilder:validation:XValidation:rule="!has(oldSelf.startAttempted) || !oldSelf.startAttempted || (has(self.startAttempted) && self.startAttempted)",message="scoped start attempt cannot be forgotten"
+// +kubebuilder:validation:XValidation:rule="!has(oldSelf.cleanupConfirmed) || !oldSelf.cleanupConfirmed || (has(self.cleanupConfirmed) && self.cleanupConfirmed)",message="scoped cleanup confirmation cannot regress"
+type CellnScopedStatus struct {
+	// +kubebuilder:validation:MaxLength=75
+	PreparationName string `json:"preparationName"`
+	// +kubebuilder:validation:MaxLength=128
+	PreparationUID string `json:"preparationUid"`
+	// +kubebuilder:validation:MaxLength=76
+	DecisionName string `json:"decisionName"`
+	// +kubebuilder:validation:MaxLength=128
+	DecisionUID string `json:"decisionUid"`
+	// ReceiverID and Owner are returned by the enrolled native receiver and
+	// jointly identify the only execution this run may observe or clean up.
+	// +optional
+	// +kubebuilder:validation:MaxLength=256
+	ReceiverID string `json:"receiverId,omitempty"`
+	// +optional
+	// +kubebuilder:validation:MaxLength=256
+	Owner string `json:"owner,omitempty"`
+	// ParentIncarnation is present only for enduring initial/turn operations and
+	// must match the immutable prepared decision and receiver evidence.
+	// +optional
+	// +kubebuilder:validation:MaxLength=71
+	// +kubebuilder:validation:Pattern=`^blake3:[0-9a-f]{64}$`
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="scoped parent incarnation is immutable"
+	ParentIncarnation string `json:"parentIncarnation,omitempty"`
+	// TurnID is the actual AgentRunTurn UID for continuation work.
+	// +optional
+	// +kubebuilder:validation:MaxLength=128
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="scoped turn identity is immutable"
+	TurnID string `json:"turnId,omitempty"`
+	// GatewayRegistrationAttempted is persisted before registration so an
+	// ambiguous transport failure remains visible and cleanup still fences the
+	// original budget. It does not by itself prove registration succeeded.
+	// +optional
+	GatewayRegistrationAttempted bool `json:"gatewayRegistrationAttempted,omitempty"`
+	// GatewayRegistered is set only after the exact final decision is accepted.
+	// +optional
+	GatewayRegistered bool `json:"gatewayRegistered,omitempty"`
+	// StartAttempted is persisted before the non-idempotent start request. Once
+	// true, recovery reads the pinned owner before considering the exact start.
+	// +optional
+	StartAttempted bool `json:"startAttempted,omitempty"`
+	// +optional
+	// +kubebuilder:validation:MaxLength=32
+	NativePhase string `json:"nativePhase,omitempty"`
+	// +optional
+	// +kubebuilder:validation:MaxLength=256
+	ReceiptDigest string `json:"receiptDigest,omitempty"`
+	// Output is correlated receiver output for the initial or continuation turn.
+	// +optional
+	// +kubebuilder:validation:MaxLength=4194304
+	Output string `json:"output,omitempty"`
+	// Native IDs and provenance are copied from receiver evidence. They are
+	// observational and cannot select future execution authority.
+	// +optional
+	// +kubebuilder:validation:MaxLength=256
+	ParentID string `json:"parentId,omitempty"`
+	// +optional
+	// +kubebuilder:validation:MaxLength=256
+	ChildID string `json:"childId,omitempty"`
+	// +optional
+	// +kubebuilder:validation:MaxLength=256
+	CellID string `json:"cellId,omitempty"`
+	// +optional
+	// +kubebuilder:validation:MaxLength=65536
+	ExecutionProvenance string `json:"executionProvenance,omitempty"`
+	// +optional
+	// +kubebuilder:validation:MaxLength=65536
+	SubstrateProvenance string `json:"substrateProvenance,omitempty"`
+	// CleanupConfirmed means native teardown and, when applicable, gateway close
+	// both completed. It is the only condition allowing finalizer removal.
+	// +optional
+	CleanupConfirmed bool `json:"cleanupConfirmed,omitempty"`
 }
 
 // DelegateStatus tracks an in-flight delegation to another persona or ad-hoc sub-agent.
@@ -534,8 +753,16 @@ type LifecycleHookContainer struct {
 	// +optional
 	Env []EnvVar `json:"env,omitempty"`
 
-	// Timeout is the maximum duration for this hook container.
-	// Defaults to 5 minutes.
+	// Timeout is the budget for this hook container. Defaults to 5 minutes.
+	//
+	// PostRun hooks run sequentially in one Job, so their timeouts are summed
+	// into that Job's deadline; the total is never less than 10 minutes. Because
+	// Kubernetes has no per-init-container timeout, this bounds the Job as a
+	// whole rather than each container — use it to give a slow hook (or a
+	// human-in-the-loop gate) the room it needs, not to police a fast one.
+	//
+	// Not yet honoured on preRun hooks, which are bounded by the agent run's
+	// own spec.timeout.
 	// +optional
 	Timeout *metav1.Duration `json:"timeout,omitempty"`
 
@@ -564,7 +791,7 @@ type LifecycleHooks struct {
 
 	// RBAC defines namespace-scoped Kubernetes RBAC rules to create for
 	// lifecycle hook containers. A Role and RoleBinding are provisioned
-	// in the agent namespace, bound to the "sympozium-agent" ServiceAccount.
+	// in the agent namespace, bound only to this AgentRun's unique ServiceAccount.
 	// This allows hooks to interact with Kubernetes resources (e.g., create
 	// or delete ConfigMaps, read Secrets).
 	// +optional
@@ -589,6 +816,10 @@ type LifecycleHooks struct {
 // AgentRun is the Schema for the agentruns API.
 // Each agent invocation produces an AgentRun CR that the orchestrator
 // reconciles into a Kubernetes Job.
+// +kubebuilder:validation:XValidation:rule="!has(oldSelf.status) || !has(oldSelf.status.cellnIssuance) || (has(self.status) && has(self.status.cellnIssuance))",message="saved Celln issuance status cannot be removed"
+// +kubebuilder:validation:XValidation:rule="!has(oldSelf.status) || !has(oldSelf.status.cellnParent) || (has(self.status) && has(self.status.cellnParent))",message="saved Celln parent status cannot be removed"
+// +kubebuilder:validation:XValidation:rule="!has(oldSelf.status) || !has(oldSelf.status.cellnOnly) || !oldSelf.status.cellnOnly || (has(self.status) && has(self.status.cellnOnly) && self.status.cellnOnly)",message="a recorded Celln-only execution boundary cannot be removed"
+// +kubebuilder:validation:XValidation:rule="!has(self.status) || !has(self.status.cellnOnly) || !self.status.cellnOnly || (has(self.spec.backend) && self.spec.backend == 'celln')",message="a recorded Celln-only run cannot change execution backend"
 type AgentRun struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`

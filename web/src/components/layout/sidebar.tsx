@@ -25,7 +25,7 @@ import {
   OntologyModal,
   OntologyModalExpanded,
 } from "@/components/ontology-modal";
-import { useRuns } from "@/hooks/use-api";
+import { useCluster, useRuns } from "@/hooks/use-api";
 import { useRunsSeen } from "@/hooks/use-runs-seen";
 import { useThemeAssets } from "@/hooks/use-theme-assets";
 
@@ -55,10 +55,11 @@ const navSections: NavSection[] = [
   {
     label: "Agents",
     items: [
-      { to: "/ensembles", label: "Ensembles", icon: Users },
-      { to: "/agents", label: "Agents", icon: Server, indent: 1 },
-      { to: "/runs", label: "Runs", icon: Play, indent: 2, badgeKey: "runs" },
-      { to: "/schedules", label: "Schedules", icon: Clock, indent: 2 },
+      { to: "/agents", label: "Agents", icon: Server },
+      { to: "/ensembles", label: "Ensembles", icon: Users, indent: 1 },
+      { to: "/harnesses", label: "Harnesses", icon: Shield, indent: 1 },
+      { to: "/runs", label: "Runs", icon: Play, indent: 1, badgeKey: "runs" },
+      { to: "/schedules", label: "Schedules", icon: Clock, indent: 1 },
     ],
   },
   {
@@ -80,6 +81,7 @@ interface AppSidebarProps {
 
 export function AppSidebar({ collapsed, onToggle }: AppSidebarProps) {
   const { data: runs } = useRuns();
+  const { data: cluster } = useCluster();
   const { unseenCount } = useRunsSeen();
   const { icon, logo } = useThemeAssets();
   const allRuns = runs || [];
@@ -233,6 +235,15 @@ export function AppSidebar({ collapsed, onToggle }: AppSidebarProps) {
           <p className="px-2 text-[10px] text-muted-foreground/60">
             Kubernetes-native AI agents
           </p>
+          {cluster?.sympoziumVersion && (
+            <p
+              className="px-2 font-mono text-[10px] text-muted-foreground/60"
+              data-testid="sympozium-version"
+              title="Sympozium API server version"
+            >
+              {cluster.sympoziumVersion}
+            </p>
+          )}
         </div>
       )}
 

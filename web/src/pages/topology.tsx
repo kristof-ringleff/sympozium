@@ -39,10 +39,14 @@ import {
   useGatewayConfig,
   useDensityNodes,
   useDraNodes,
+  useCellnFleetCells,
+  useRuntimes,
 } from "@/hooks/use-api";
 import { StimulusDialogProvider, StimulusDialogCtx } from "@/components/canvas-primitives";
 import type { StimulusNodeData } from "@/components/canvas-primitives";
 import { AcceleratorLeaves } from "@/components/accelerator-leaves";
+import { formatWatts, nodeTotal } from "@/lib/power";
+import { usePowerIndex } from "@/lib/power-context";
 import { useProviderNodes } from "@/hooks/use-provider-nodes";
 import {
   Server,
@@ -62,6 +66,7 @@ import {
   ListOrdered,
   Eye,
   Network,
+  Shield,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import type {
@@ -69,21 +74,29 @@ import type {
   Ensemble,
   Model,
   AgentRun,
+  AgentRuntime,
   ProviderNode,
   NodeProvider,
   GatewayConfigResponse,
   DensityNodeSummary,
   DraNodeSummary,
   DraDevice,
+  CellnNodeCells,
 } from "@/lib/api";
+import { taskText } from "@/lib/utils";
 import { Link } from "react-router-dom";
 import { useArrowKeyPan, KeyboardGuide } from "@/hooks/use-arrow-key-pan";
-import Dagre from "@dagrejs/dagre";
+import { applyDagreLayout } from "@/lib/topology-layout";
+import { shortTurn } from "@/components/celln-node-cells";
+export { NODE_SIZES, applyDagreLayout } from "@/lib/topology-layout";
 
 // ── Custom node components ────────────────────────────────────────────────────
 
 function K8sNodeNode({ data }: NodeProps<Node<K8sNodeData>>) {
   const f = data.fitness;
+  // Live accelerator draw for this node, when an energy collector is present.
+  // Only measured, fresh readings are summed — see lib/power.nodeTotal.
+  const power = nodeTotal(usePowerIndex(), data.name);
   return (
     <div className="border border-foreground/20 bg-card px-4 py-3 min-w-[240px] shadow-md cursor-pointer hover:border-primary/50 hover:bg-primary/5 transition-colors">
       <Handle type="target" position={Position.Top} className="!bg-foreground !w-2 !h-2" />
@@ -93,6 +106,24 @@ function K8sNodeNode({ data }: NodeProps<Node<K8sNodeData>>) {
         <span className="font-semibold text-sm text-foreground">{data.name}</span>
         {f?.stale && (
           <Badge variant="destructive" className="text-[8px] px-1 py-0">stale</Badge>
+        )}
+        {power.measured > 0 && (
+          <span
+            className="ml-auto flex items-center gap-1 font-mono text-[10px] tabular-nums text-amber-600 dark:text-amber-500"
+            title={
+              power.measured === power.total
+                ? `${formatWatts(power.milliwatts)} across ${power.total} accelerator(s)`
+                : `${formatWatts(power.milliwatts)} across ${power.measured} of ${power.total} accelerators — the rest are suspended or unmeasurable`
+            }
+          >
+            <Zap className="h-3 w-3" />
+            {formatWatts(power.milliwatts)}
+            {power.measured < power.total && (
+              <span className="text-muted-foreground">
+                {power.measured}/{power.total}
+              </span>
+            )}
+          </span>
         )}
       </div>
       <p className="text-[10px] text-muted-foreground font-mono mb-1">{data.ip}</p>
@@ -125,7 +156,7 @@ function K8sNodeNode({ data }: NodeProps<Node<K8sNodeData>>) {
       )}
       {(data.accelerators?.length ?? 0) > 0 && (
         <div className="max-w-[280px]">
-          <AcceleratorLeaves devices={data.accelerators!} />
+          <AcceleratorLeaves devices={data.accelerators!} node={data.name} />
         </div>
       )}
     </div>
@@ -296,7 +327,7 @@ function StandaloneAgentNode({ data }: NodeProps<Node<StandaloneAgentNodeData>>)
         : "bg-muted-foreground/40";
 
   return (
-    <div className="border border-primary/30 bg-card px-3 py-2 shadow-sm min-w-[150px]">
+    <div className="border border-primary/30 bg-card px-3 py-2 shadow-sm w-[240px]">
       <Handle type="target" position={Position.Top} className="!bg-primary !w-1.5 !h-1.5" />
       <Handle type="source" position={Position.Bottom} className="!bg-primary !w-1.5 !h-1.5" />
       <div className="flex items-center gap-1.5">
@@ -322,6 +353,58 @@ interface AgentRunNodeData {
   isSubAgent?: boolean;
   label: string;
   [key: string]: unknown;
+}
+
+interface HarnessNodeData {
+  name: string;
+  ready: boolean;
+  owner: string;
+  [key: string]: unknown;
+}
+
+interface CellnCellNodeData {
+  kind: "parent" | "worker";
+  label: string;
+  node: string;
+  status: string;
+  runName?: string;
+  detail: string;
+  [key: string]: unknown;
+}
+
+/** A Celln parent (a conversation's context) or a worker cell (one turn) on a fleet node. */
+function CellnCellNode({ data }: NodeProps<Node<CellnCellNodeData>>) {
+  const parent = data.kind === "parent";
+  return (
+    <div className={`border px-2 py-1.5 shadow-sm w-[200px] ${parent ? "border-violet-500/50 bg-violet-500/5" : "border-blue-500/50 bg-blue-500/5"}`}>
+      <Handle type="target" position={Position.Top} className="!bg-violet-400 !w-1.5 !h-1.5" />
+      <Handle type="source" position={Position.Bottom} className="!bg-violet-400 !w-1.5 !h-1.5" />
+      <div className="flex items-center gap-1.5">
+        <Cpu className={`h-3 w-3 shrink-0 ${parent ? "text-violet-400" : "text-blue-400"}`} />
+        <span className="text-[10px] font-medium">{parent ? "Celln parent" : "Celln cell"}</span>
+        <span className="text-[9px] font-mono text-muted-foreground truncate" title={data.label}>{data.label}</span>
+        <span className={`ml-auto h-1.5 w-1.5 rounded-full shrink-0 ${parent ? "bg-violet-500" : "bg-blue-500 animate-pulse"}`} />
+      </div>
+      <p className="mt-0.5 text-[9px] text-muted-foreground truncate" title={data.detail}>
+        {data.runName ? <Link to={`/runs/${data.runName}`} className="hover:underline">{data.runName}</Link> : data.node}
+        {data.detail ? ` · ${data.detail}` : ""}
+      </p>
+    </div>
+  );
+}
+
+function HarnessNode({ data }: NodeProps<Node<HarnessNodeData>>) {
+  return (
+    <div className="border border-amber-500/40 bg-amber-500/5 px-3 py-2 shadow-sm w-[260px]">
+      <Handle type="target" position={Position.Top} className="!bg-amber-400 !w-1.5 !h-1.5" />
+      <Handle type="source" position={Position.Bottom} className="!bg-amber-400 !w-1.5 !h-1.5" />
+      <div className="flex items-center gap-1.5">
+        <Shield className="h-3.5 w-3.5 text-amber-400 shrink-0" />
+        <Link to={`/harnesses/${data.name}`} className="text-[11px] font-medium hover:underline truncate">{data.name}</Link>
+      </div>
+      <p className="mt-0.5 text-[9px] text-muted-foreground truncate">{data.ready ? "Ready" : "Not ready"}{data.owner ? ` · ${data.owner}` : ""}</p>
+    </div>
+  );
 }
 
 const runPhaseBorder: Record<string, string> = {
@@ -501,61 +584,14 @@ export const nodeTypes = {
   persona: PersonaNode,
   agent: StandaloneAgentNode,
   agentRun: AgentRunNode,
+  harness: HarnessNode,
+  cellnCell: CellnCellNode,
   cloudProvider: CloudProviderNode,
   gateway: GatewayNode,
 };
 
 // ── Layout ────────────────────────────────────────────────────────────────────
 
-/** Estimated node dimensions for dagre layout (width, height). */
-export const NODE_SIZES: Record<string, [number, number]> = {
-  gateway:       [220, 70],
-  k8sNode:       [280, 110],
-  cloudProvider: [180, 50],
-  model:         [200, 70],
-  ensemble:      [200, 50],
-  stimulus:      [140, 40],
-  persona:       [150, 50],
-  agent:         [170, 56],
-  agentRun:      [140, 40],
-};
-
-/** Run dagre layout on nodes and edges, positioning top-to-bottom. */
-export function applyDagreLayout(nodes: Node[], edges: Edge[]): void {
-  const g = new Dagre.graphlib.Graph({ compound: true })
-    .setDefaultEdgeLabel(() => ({}))
-    .setGraph({
-      rankdir: "TB",
-      nodesep: 60,
-      ranksep: 100,
-      edgesep: 30,
-    });
-
-  for (const node of nodes) {
-    const [w, h] = NODE_SIZES[node.type || ""] || [160, 50];
-    if (node.parentId) continue; // skip children of compound nodes
-    g.setNode(node.id, { width: w, height: h });
-  }
-
-  for (const edge of edges) {
-    // Only add edges between nodes that exist in the graph (skip child-only edges).
-    if (g.hasNode(edge.source) && g.hasNode(edge.target)) {
-      g.setEdge(edge.source, edge.target);
-    }
-  }
-
-  Dagre.layout(g);
-
-  for (const node of nodes) {
-    if (node.parentId) continue;
-    const pos = g.node(node.id);
-    if (pos) {
-      const [w, h] = NODE_SIZES[node.type || ""] || [160, 50];
-      // dagre returns center positions; ReactFlow uses top-left.
-      node.position = { x: pos.x - w / 2, y: pos.y - h / 2 };
-    }
-  }
-}
 
 /** Build a stable fingerprint from entity IDs so we know when layout needs recomputing. */
 function entityFingerprint(
@@ -563,6 +599,7 @@ function entityFingerprint(
   models: Model[],
   ensembles: Ensemble[],
   agents: Agent[],
+  runtimes: AgentRuntime[],
   hasGateway: boolean,
   draNodes?: DraNodeSummary[],
 ): string {
@@ -571,14 +608,28 @@ function entityFingerprint(
     (draNodes || []).map((n) => n.nodeName).sort().join(","),
     models.map((m) => m.metadata.name).sort().join(","),
     ensembles.map((e) => e.metadata.name).sort().join(","),
-    agents.map((a) => a.metadata.name).sort().join(","),
+    agents.map((a) => JSON.stringify([a.metadata.name, a.spec.runtimeRef, a.spec.agents])).sort().join(","),
+    runtimes.map((r) => r.metadata.name).sort().join(","),
     hasGateway ? "gw" : "",
   ];
   return parts.join("|");
 }
 
+/** The Celln nodes, live parents and running cells drawn, for relayout. */
+function cellnFingerprint(cellnNodes?: CellnNodeCells[]): string {
+  return (cellnNodes || []).map((n) => [
+    n.node,
+    ...n.parents.filter((p) => p.run?.live).map((p) => p.incarnation),
+    ...n.cells.filter((c) => c.status === "running").map((c) => c.id),
+  ].join(",")).sort().join(";");
+}
+
 interface RunPhaseMap {
   [agentName: string]: string; // latest run phase per stamped agent name
+}
+
+function cellnParentNodeId(incarnation: string) {
+  return `cellnp-${incarnation.slice(7, 23)}`;
 }
 
 function buildTopology(
@@ -586,6 +637,7 @@ function buildTopology(
   models: Model[],
   ensembles: Ensemble[],
   agents: Agent[],
+  runtimes: AgentRuntime[],
   gateway: GatewayConfigResponse | undefined,
   runningByEnsemble: Record<string, number>,
   webEndpointAgents: string[],
@@ -593,6 +645,7 @@ function buildTopology(
   activeRuns: AgentRun[],
   densityNodes?: DensityNodeSummary[],
   draNodes?: DraNodeSummary[],
+  cellnNodes?: CellnNodeCells[],
 ): { nodes: Node[]; edges: Edge[] } {
   const nodes: Node[] = [];
   const edges: Edge[] = [];
@@ -609,6 +662,23 @@ function buildTopology(
   const standaloneAgents = agents.filter(
     (a) => !ensembleAgentRefs.has(a.metadata.name),
   );
+
+  // A harness is execution infrastructure. Render only harnesses actually
+  // selected by an Agent, keeping the topology focused on live relationships.
+  const referencedRuntimeNames = new Set(
+    agents.map((agent) => agent.spec.runtimeRef).filter(Boolean),
+  );
+  for (const runtime of runtimes.filter((runtime) => referencedRuntimeNames.has(runtime.metadata.name))) {
+    const ready = runtime.status?.conditions?.some(
+      (condition) => condition.type === "Ready" && condition.status === "True",
+    ) || false;
+    nodes.push({
+      id: `harness-${runtime.metadata.name}`,
+      type: "harness",
+      position: P,
+      data: { name: runtime.metadata.name, ready, owner: runtime.spec.supportOwner || "" },
+    });
+  }
 
   // ── Provider detection ─────────────────────────────────────────────────
   const PROVIDER_LABELS: Record<string, string> = {
@@ -634,8 +704,17 @@ function buildTopology(
   const LOCAL_PROVIDERS = new Set(["lm-studio", "ollama", "llama-server", "vllm", "unsloth"]);
 
   for (const ens of ensembles) {
+    const inferred = ens.spec.baseURL ? inferProvider(ens.spec.baseURL) : null;
+    if (inferred && LOCAL_PROVIDERS.has(inferred)) {
+      ensProviders.set(inferred, PROVIDER_LABELS[inferred] || inferred);
+      ensProviderMap.set(ens.metadata.name, inferred);
+    }
     for (const ref of ens.spec.authRefs || []) {
-      if (ref.provider) {
+      // A compatibility credential may retain provider=custom even though the
+      // endpoint is a discovered local runtime. The endpoint is authoritative
+      // for topology classification; credentials describe authentication,
+      // not where inference executes.
+      if (ref.provider && !ensProviderMap.has(ens.metadata.name)) {
         ensProviders.set(ref.provider, PROVIDER_LABELS[ref.provider] || ref.provider);
         ensProviderMap.set(ens.metadata.name, ref.provider);
       }
@@ -645,10 +724,10 @@ function buildTopology(
         (m) => m.status?.endpoint && ens.spec.baseURL?.includes(m.status.endpoint.replace("/v1", "")),
       );
       if (!isModelEndpoint) {
-        const inferred = inferProvider(ens.spec.baseURL);
-        if (inferred) {
-          ensProviders.set(inferred, PROVIDER_LABELS[inferred] || inferred);
-          ensProviderMap.set(ens.metadata.name, inferred);
+        const fallbackProvider = inferProvider(ens.spec.baseURL);
+        if (fallbackProvider) {
+          ensProviders.set(fallbackProvider, PROVIDER_LABELS[fallbackProvider] || fallbackProvider);
+          ensProviderMap.set(ens.metadata.name, fallbackProvider);
         }
       }
     }
@@ -669,8 +748,11 @@ function buildTopology(
       agentModelMap.set(agent.metadata.name, matchedModel.metadata.name);
       continue;
     }
-    let prov = (agent.spec.authRefs || []).find((r) => r.provider)?.provider;
-    if (!prov && baseURL) prov = inferProvider(baseURL) || undefined;
+    const inferred = baseURL ? inferProvider(baseURL) : null;
+    let prov = inferred && LOCAL_PROVIDERS.has(inferred)
+      ? inferred
+      : (agent.spec.authRefs || []).find((r) => r.provider)?.provider;
+    if (!prov) prov = inferred || undefined;
     if (prov) {
       ensProviders.set(prov, PROVIDER_LABELS[prov] || prov);
       agentProviderMap.set(agent.metadata.name, prov);
@@ -743,6 +825,47 @@ function buildTopology(
         fitness: undefined,
       },
     });
+  }
+
+  // ── Celln fleet: live parents and running worker cells per node ───────
+  const k8sNodeIds = new Set(nodes.filter((n) => n.type === "k8sNode").map((n) => n.id));
+  for (const report of cellnNodes || []) {
+    const nodeId = `node-${report.node}`;
+    if (!k8sNodeIds.has(nodeId)) {
+      k8sNodeIds.add(nodeId);
+      nodes.push({ id: nodeId, type: "k8sNode", position: P, data: { name: report.node, ip: "", providers: [], accelerators: undefined, fitness: undefined } });
+    }
+    const parentIds = new Map<string, string>();
+    for (const parent of report.parents) {
+      if (!parent.run?.live) continue;
+      const id = cellnParentNodeId(parent.incarnation);
+      parentIds.set(parent.incarnation, id);
+      const last = parent.turns[parent.turns.length - 1];
+      nodes.push({
+        id,
+        type: "cellnCell",
+        position: P,
+        data: {
+          kind: "parent", label: parent.incarnation.slice(7, 15), node: report.node, status: parent.run.phase,
+          runName: parent.run.name,
+          detail: `${parent.turns.length} turn${parent.turns.length === 1 ? "" : "s"}${last ? `, ${last.stage}` : ""}`,
+        },
+      });
+      edges.push({ id: `e-${nodeId}-${id}`, source: nodeId, target: id, style: { stroke: "#8b5cf680", strokeWidth: 1, strokeDasharray: "4 2" } });
+      edges.push({ id: `e-run-${parent.run.name}-${id}`, source: `run-${parent.run.name}`, target: id, style: { stroke: "#8b5cf6", strokeWidth: 1.5 }, markerEnd: { type: MarkerType.ArrowClosed, color: "#8b5cf6" } });
+    }
+    for (const cell of report.cells) {
+      if (cell.status !== "running") continue;
+      const id = `cellnc-${report.node}-${cell.id}`;
+      const parentId = cell.parent ? parentIds.get(cell.parent) : undefined;
+      nodes.push({
+        id,
+        type: "cellnCell",
+        position: P,
+        data: { kind: "worker", label: cell.id, node: report.node, status: cell.status, runName: cell.run?.name, detail: cell.turn ? `turn ${shortTurn(cell.turn)}` : cell.tools.join(", ") },
+      });
+      edges.push({ id: `e-${parentId || nodeId}-${id}`, source: parentId || nodeId, target: id, animated: true, style: { stroke: "#3b82f6", strokeWidth: 1.5 } });
+    }
   }
 
   // ── Providers ──────────────────────────────────────────────────────────
@@ -827,6 +950,19 @@ function buildTopology(
         runPhase: runPhases[agent.metadata.name],
       },
     });
+    if (agent.spec.runtimeRef && runtimes.some((runtime) => runtime.metadata.name === agent.spec.runtimeRef)) {
+      edges.push({
+        id: `e-${agentId}-harness-${agent.spec.runtimeRef}`,
+        source: `harness-${agent.spec.runtimeRef}`,
+        target: agentId,
+        style: { stroke: "#f59e0b", strokeWidth: 1.5, strokeDasharray: "4 3" },
+        markerEnd: { type: MarkerType.ArrowClosed, color: "#f59e0b" },
+        label: "default harness",
+        labelStyle: { fontSize: 9, fill: "#8a8c82" },
+        labelBgStyle: { fill: "#09090b", fillOpacity: 0.8 },
+        labelBgPadding: [4, 2] as [number, number],
+      });
+    }
     const modelName = agentModelMap.get(agent.metadata.name);
     if (modelName) {
       edges.push({
@@ -1053,7 +1189,7 @@ function buildTopology(
           position: P,
           data: {
             runName: run.metadata.name,
-            task: run.spec.task || "",
+            task: taskText(run.spec.task),
             phase: run.status?.phase || "Pending",
             isSubAgent,
             label: run.metadata.name,
@@ -1085,7 +1221,7 @@ function buildTopology(
         position: P,
         data: {
           runName: run.metadata.name,
-          task: run.spec.task || "",
+          task: taskText(run.spec.task),
           phase: run.status?.phase || "Pending",
           isSubAgent,
           label: run.metadata.name,
@@ -1159,12 +1295,16 @@ function buildTopology(
   // ── Apply dagre layout ─────────────────────────────────────────────────
   applyDagreLayout(nodes, edges);
 
-  return { nodes, edges };
+  // A Celln parent links to its run only when the run is drawn.
+  const ids = new Set(nodes.map((n) => n.id));
+  return { nodes, edges: edges.filter((e) => ids.has(e.source) && ids.has(e.target)) };
 }
 
 // ── Inner component (needs ReactFlowProvider above it) ────────────────────────
 
-const TOPO_POSITIONS_KEY = "sympozium_topology_positions";
+// Keep the previous saved layout intact, but do not apply its old graph-depth
+// ordering to the new semantic rows. Manual positions remain supported here.
+const TOPO_POSITIONS_KEY = "sympozium_topology_positions_v2";
 const TOPO_LOCKED_KEY = "sympozium_topology_locked";
 
 function savePositions(nodes: Node[]) {
@@ -1188,11 +1328,13 @@ function TopologyCanvas() {
   const { data: ensembles } = useEnsembles();
   const { data: models } = useModels();
   const { data: agents } = useAgents();
+  const { data: runtimes } = useRuntimes();
   const { data: runs } = useRuns();
   const { data: providerNodes } = useProviderNodes(true);
   const { data: gateway } = useGatewayConfig();
   const { data: densityData } = useDensityNodes();
   const { data: draData } = useDraNodes();
+  const { data: cellnData } = useCellnFleetCells();
   const { fitView } = useReactFlow();
   useArrowKeyPan();
 
@@ -1307,9 +1449,10 @@ function TopologyCanvas() {
       models || [],
       ensembles || [],
       agents || [],
+      runtimes || [],
       !!gateway,
       draData?.nodes,
-    ) + "|runs:" + activeRunFingerprint;
+    ) + "|runs:" + activeRunFingerprint + "|celln:" + cellnFingerprint(cellnData);
 
     const entitiesChanged = fp !== prevFingerprintRef.current;
     prevFingerprintRef.current = fp;
@@ -1320,6 +1463,7 @@ function TopologyCanvas() {
         models || [],
         ensembles || [],
         agents || [],
+        runtimes || [],
         gateway,
         runningByEnsemble,
         webEndpointAgents,
@@ -1327,6 +1471,7 @@ function TopologyCanvas() {
         activeRuns,
         densityData?.nodes,
         draData?.nodes,
+        cellnData,
       );
 
       // Apply saved positions if available.
@@ -1356,6 +1501,7 @@ function TopologyCanvas() {
           models || [],
           ensembles || [],
           agents || [],
+          runtimes || [],
           gateway,
           runningByEnsemble,
           webEndpointAgents,
@@ -1363,6 +1509,7 @@ function TopologyCanvas() {
           activeRuns,
           densityData?.nodes,
           draData?.nodes,
+          cellnData,
         );
         const freshMap = new Map(freshNodes.map((n) => [n.id, n]));
         return prev.map((n) => {
@@ -1379,6 +1526,7 @@ function TopologyCanvas() {
           models || [],
           ensembles || [],
           agents || [],
+          runtimes || [],
           gateway,
           runningByEnsemble,
           webEndpointAgents,
@@ -1386,11 +1534,12 @@ function TopologyCanvas() {
           activeRuns,
           densityData?.nodes,
           draData?.nodes,
+          cellnData,
         );
         return freshEdges;
       });
     }
-  }, [providerNodes, models, ensembles, agents, gateway, runningByEnsemble, webEndpointAgents, runPhases, activeRuns, activeRunFingerprint, densityData, draData]);
+  }, [providerNodes, models, ensembles, agents, runtimes, gateway, runningByEnsemble, webEndpointAgents, runPhases, activeRuns, activeRunFingerprint, densityData, draData, cellnData]);
 
   // Save positions to localStorage after any node drag ends.
   const handleNodesChange = useCallback(

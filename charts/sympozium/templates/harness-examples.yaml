@@ -1,0 +1,164 @@
+{{- /*
+Existing Helm releases upgraded with --reuse-values do not contain this new
+value block. Keep a full fallback default here so those upgrades still gain
+the catalog, and so a partially-stale reused values object (missing only a
+newer adapter key) still falls back per-field instead of erroring.
+
+This block is generated from charts/sympozium/values.yaml's harnessExamples
+section — values.yaml is the only file to edit for an adapter name/image/
+enabled change. Run `make helm-sync` after editing it, and `make
+helm-sync-check` (part of CI) fails if this block has drifted.
+*/}}
+{{/* sync-harness-defaults:begin */}}
+{{- $defaults := dict
+  "enabled" true
+  "policy" (dict "name" "harness-examples")
+  "pi" (dict
+    "enabled" false
+    "name" "pi-v0-84-4"
+    "image" "ghcr.io/sympozium-ai/harness-adapters/pi@sha256:b0d50402dc0a25b2c46f86dbd6b5de963487fa0ffa44058cb324ab2c68934f3b")
+  "piSession" (dict
+    "enabled" true
+    "name" "pi-session-v0-84-4"
+    "image" "ghcr.io/sympozium-ai/harness-adapters/pi@sha256:8c8f0df071dc5307b3b557e0233a70757d8a4be17cb688c1ca725cb41001bbd5")
+  "hermes" (dict
+    "enabled" false
+    "name" "hermes-v0-20-6"
+    "image" "ghcr.io/sympozium-ai/harness-adapters/hermes@sha256:df66d30c56e7a82c74b9df1d8ef4034127f017640f460c0d3aa7c15f28550ab4")
+  "hermesSession" (dict
+    "enabled" true
+    "name" "hermes-session-v0-20-6"
+    "image" "ghcr.io/sympozium-ai/harness-adapters/hermes@sha256:70c643b287b4a74583c7fedafd60e853579a36380a652a3d39ab0ae8c86e2d3b")
+}}
+{{/* sync-harness-defaults:end */}}
+{{- $examples := mergeOverwrite $defaults (default (dict) .Values.harnessExamples) }}
+{{- if $examples.enabled }}
+{{- if not (or $examples.pi.enabled $examples.piSession.enabled $examples.hermes.enabled $examples.hermesSession.enabled) }}
+{{- fail "harnessExamples.enabled requires at least one adapter runtime" }}
+{{- end }}
+{{- if and $examples.pi.enabled (not (regexMatch "@sha256:[a-f0-9]{64}$" $examples.pi.image)) }}
+{{- fail "harnessExamples.pi.image must be a digest-pinned OCI reference" }}
+{{- end }}
+{{- if and $examples.piSession.enabled (not (regexMatch "@sha256:[a-f0-9]{64}$" $examples.piSession.image)) }}
+{{- fail "harnessExamples.piSession.image must be a digest-pinned OCI reference" }}
+{{- end }}
+{{- if and $examples.hermes.enabled (not (regexMatch "@sha256:[a-f0-9]{64}$" $examples.hermes.image)) }}
+{{- fail "harnessExamples.hermes.image must be a digest-pinned OCI reference" }}
+{{- end }}
+{{- if and $examples.hermesSession.enabled (not (regexMatch "@sha256:[a-f0-9]{64}$" $examples.hermesSession.image)) }}
+{{- fail "harnessExamples.hermesSession.image must be a digest-pinned OCI reference" }}
+{{- end }}
+---
+# The chart registers examples but does not bind this policy to any Agent.
+# An operator selects it explicitly along with one of the runtimes below.
+apiVersion: sympozium.ai/v1alpha1
+kind: SympoziumPolicy
+metadata:
+  name: {{ $examples.policy.name }}
+  labels:
+    sympozium.ai/builtin: "true"
+    sympozium.ai/harness-example: "true"
+    {{- include "sympozium.labels" . | nindent 4 }}
+spec:
+  harnessPolicy:
+    enabled: true
+    # Maintained session adapters do not yet provide trusted usage metrics.
+    # The policy scopes this exception to their exact digest-pinned images.
+    allowUnmetered: true
+  imagePolicy:
+    allowedRegistries:
+    {{- if $examples.pi.enabled }}
+      - {{ $examples.pi.image | quote }}
+    {{- end }}
+    {{- if $examples.piSession.enabled }}
+      - {{ $examples.piSession.image | quote }}
+    {{- end }}
+    {{- if $examples.hermes.enabled }}
+      - {{ $examples.hermes.image | quote }}
+    {{- end }}
+    {{- if $examples.hermesSession.enabled }}
+      - {{ $examples.hermesSession.image | quote }}
+    {{- end }}
+{{- if $examples.pi.enabled }}
+---
+apiVersion: sympozium.ai/v1alpha1
+kind: AgentRuntime
+metadata:
+  name: {{ $examples.pi.name }}
+  labels:
+    sympozium.ai/builtin: "true"
+    sympozium.ai/harness-example: "true"
+    {{- include "sympozium.labels" . | nindent 4 }}
+spec:
+  image: {{ $examples.pi.image | quote }}
+  contractVersion: v1alpha1
+  supportOwner: sympozium-maintainers
+  conformance:
+    status: conformant
+    owner: sympozium-maintainers
+    reference: https://github.com/sympozium-ai/harness-adapters/blob/main/docs/conformance.md
+{{- end }}
+{{- if $examples.piSession.enabled }}
+---
+apiVersion: sympozium.ai/v1alpha1
+kind: AgentRuntime
+metadata:
+  name: {{ $examples.piSession.name }}
+  labels:
+    sympozium.ai/builtin: "true"
+    sympozium.ai/harness-example: "true"
+    {{- include "sympozium.labels" . | nindent 4 }}
+spec:
+  image: {{ $examples.piSession.image | quote }}
+  contractVersion: v1alpha2
+  session:
+    protocol: openai-chat
+    port: 8080
+  supportOwner: sympozium-maintainers
+  conformance:
+    status: pending
+    owner: sympozium-maintainers
+    reference: https://github.com/sympozium-ai/harness-adapters/blob/main/docs/adapter-contract.md
+{{- end }}
+{{- if $examples.hermes.enabled }}
+---
+apiVersion: sympozium.ai/v1alpha1
+kind: AgentRuntime
+metadata:
+  name: {{ $examples.hermes.name }}
+  labels:
+    sympozium.ai/builtin: "true"
+    sympozium.ai/harness-example: "true"
+    {{- include "sympozium.labels" . | nindent 4 }}
+spec:
+  image: {{ $examples.hermes.image | quote }}
+  contractVersion: v1alpha1
+  supportOwner: sympozium-maintainers
+  conformance:
+    status: conformant
+    owner: sympozium-maintainers
+    reference: https://github.com/sympozium-ai/harness-adapters/blob/main/docs/conformance.md
+{{- end }}
+{{- if $examples.hermesSession.enabled }}
+---
+apiVersion: sympozium.ai/v1alpha1
+kind: AgentRuntime
+metadata:
+  name: {{ $examples.hermesSession.name }}
+  labels:
+    sympozium.ai/builtin: "true"
+    sympozium.ai/harness-example: "true"
+    {{- include "sympozium.labels" . | nindent 4 }}
+spec:
+  image: {{ $examples.hermesSession.image | quote }}
+  contractVersion: v1alpha2
+  session:
+    protocol: openai-chat
+    port: 8080
+  supportOwner: sympozium-maintainers
+  conformance:
+    status: conformant
+    owner: sympozium-maintainers
+    reference: https://github.com/sympozium-ai/harness-adapters/blob/main/docs/conformance.md
+{{- end }}
+{{- end }}

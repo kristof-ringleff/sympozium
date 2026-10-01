@@ -5,6 +5,35 @@ image:
   # -- Override the image tag (defaults to .Chart.AppVersion)
   tag: ""
 
+# Dedicated gateway component only; does not enable mediated Celln admission
+# (celln.mediation.enabled does, and then deploys this gateway itself, from
+# Secret/ConfigMap volumes, without `enabled` or `configurationClaim` here).
+# Operator-provisioned claim holds gateway.json, public JWKS, TLS and static
+# registration/database credential files. No issuer private keys/provider keys.
+modelGateway:
+  enabled: false
+  image: "" # required immutable repository@sha256:digest
+  configurationClaim: "" # files readable by UID 65532; secret files mode 0600
+  # Explicit reviewed DNS, Kubernetes API and provider egress peers/ports.
+  egress: []
+  # -- Used with celln.mediation.enabled, which deploys this gateway from
+  # Secret/ConfigMap volumes instead of configurationClaim. Operator-provided
+  # Secret in the control-plane namespace holding the PostgreSQL connection URL
+  # (migrations 002 and 003 applied). The chart bundles no database.
+  database:
+    secretName: ""
+    key: database-url
+  # -- Tenant namespaces whose ModelConnections and provider Secrets the
+  # gateway may read. Empty keeps the cluster-wide `get` ClusterRole; a list
+  # replaces it with one Role/RoleBinding per namespace (least privilege).
+  # celln.mediation also sets the gateway's readinessNamespaces from it; with
+  # configurationClaim, put the same list in your gateway.json or readiness
+  # keeps probing cluster-wide access and fails.
+  namespaces: []
+  # -- Exact provider origins on private addresses the gateway may reach
+  # (gateway.json privateOrigins). Only honoured with celln.mediation.
+  privateOrigins: []
+
 imagePullSecrets: []
 nameOverride: ""
 fullnameOverride: ""
@@ -16,6 +45,12 @@ namespace: sympozium-system
 # -- Controller (reconciles CRDs, manages agent pods)
 controller:
   replicas: 1
+  # -- Restrict the general manager to one namespace. Empty retains cluster-wide
+  # watches. Required when deploying the separate native parent controller.
+  watchNamespace: ""
+  # -- Alternative to watchNamespace: retain all other namespace watches while
+  # reserving these namespaces for independent controllers. Not an RBAC boundary.
+  excludeWatchNamespaces: []
   image:
     repository: ""  # defaults to {{ .Values.image.registry }}/controller
     tag: ""
@@ -93,6 +128,15 @@ nats:
       memory: 64Mi
   # -- External NATS URL (used when nats.enabled=false)
   externalUrl: ""
+  auth:
+    # -- Require credentials for the bundled NATS server. The bridge account is
+    # restricted to mediated IPC subjects; all other Sympozium components use
+    # the control-plane account. External NATS operators must provide an
+    # equivalent subject policy themselves.
+    enabled: true
+    # -- Existing Secret containing `control-password` and `bridge-password`.
+    # Leave empty for Helm to create and retain a random secret.
+    existingSecret: ""
   persistence:
     enabled: false
     size: 1Gi
@@ -115,6 +159,33 @@ certManager:
     renewBefore: 720h  # 30 days
 
 # -- Model pricing for AgentRun cost estimation
+# Accelerator power draw, read from an out-of-tree energy collector.
+#
+# Discovery is zero-config: any Service labelled `sympozium.ai/collector=energy`
+# in one of the namespaces below is used. Installing a collector is enough — no
+# further configuration, no restart. When none is present, the power surface is
+# simply absent from the UI.
+#
+# ergoz (a collector for accelerator power draw) is the reference
+# implementation and ships in `ergoz-system`; `sympozium install` deploys
+# the pinned release there by default (--no-ergoz skips it). It is not privileged by
+# sympozium in any way: anything serving the same fleet-snapshot shape works,
+# and no implementation name appears anywhere in the controller or apiserver.
+energyCollector:
+  # -- Master switch for collector discovery. When false, sympozium never
+  # probes for a collector and GET /api/v1/power always reports unavailable.
+  enabled: true
+  discovery:
+    # -- Namespaces sympozium will trust a collector from.
+    #
+    # SECURITY: this is an allowlist, not a convenience filter. Discovery keys
+    # on a label, and labels are cheap — listing collectors cluster-wide would
+    # let anyone able to create a Service forge power readings. Only add
+    # namespaces an administrator already controls.
+    namespaces:
+      - sympozium-system
+      - ergoz-system
+
 pricing:
   # -- Ship the sympozium-model-pricing ConfigMap and enable run cost
   # estimates. Estimates are display-only and never gate runs. Local
@@ -174,6 +245,34 @@ defaultSkills:
 defaultPersonas:
   # -- Install built-in persona pack definitions (disabled by default, must be activated after install)
   enabled: true
+
+# -- Maintained experimental AgentHarness examples. The chart registers the
+# digest-pinned Pi and Hermes adapters and a policy that permits only those
+# images. No Agent is created or changed: an operator must select the policy
+# and runtime explicitly on an Agent before either adapter can execute.
+harnessExamples:
+  # -- Install the maintained persistent AgentRuntime catalog. One-shot
+  # adapters remain available as explicit opt-in examples.
+  enabled: true
+  policy:
+    # -- Policy an Agent must reference before it can execute either example.
+    name: harness-examples
+  pi:
+    enabled: false
+    name: pi-v0-84-4
+    image: ghcr.io/sympozium-ai/harness-adapters/pi@sha256:b0d50402dc0a25b2c46f86dbd6b5de963487fa0ffa44058cb324ab2c68934f3b
+  piSession:
+    enabled: true
+    name: pi-session-v0-84-4
+    image: ghcr.io/sympozium-ai/harness-adapters/pi@sha256:8c8f0df071dc5307b3b557e0233a70757d8a4be17cb688c1ca725cb41001bbd5
+  hermes:
+    enabled: false
+    name: hermes-v0-20-6
+    image: ghcr.io/sympozium-ai/harness-adapters/hermes@sha256:df66d30c56e7a82c74b9df1d8ef4034127f017640f460c0d3aa7c15f28550ab4
+  hermesSession:
+    enabled: true
+    name: hermes-session-v0-20-6
+    image: ghcr.io/sympozium-ai/harness-adapters/hermes@sha256:70c643b287b4a74583c7fedafd60e853579a36380a652a3d39ab0ae8c86e2d3b
 
 # -- Default MCPServer catalog entries to install (github, grafana, kubernetes, argocd, postgres)
 defaultMcpServers:
@@ -275,6 +374,10 @@ webProxy:
 nodeProbe:
   # -- Deploy the node-probe DaemonSet for discovering node-installed inference providers
   enabled: true
+  # -- Label nodes that have /dev/kvm and a kernel under /boot with
+  # celln.dev/kvm=true so the Celln fleet runs there without a manual label.
+  # A label an operator set (either value) is never changed.
+  labelKVMNodes: true
   image:
     repository: ""  # defaults to {{ .Values.image.registry }}/node-probe
     tag: ""
@@ -380,17 +483,354 @@ agentSandbox:
 # Requires: Celln router deployed (see celln repo integrations/kubernetes/)
 # and celln host dispatcher installed on each KVM node (scripts/setup-host.sh).
 celln:
-  # -- Enable the Celln backend. Opt-in and OFF by default: the installer
-  # DaemonSet runs privileged with hostPID and a read-write mount of the
-  # host root filesystem to perform KVM host setup, so turning this on is a
-  # deliberate choice, not a side effect of a routine install. When true,
-  # deploys the installer DaemonSet, router DaemonSet, and configures the
-  # controller for celln dispatch. The router forwards to the host
-  # dispatcher on localhost — no IP needed.
-  # `sympozium install --enable-hermetic-workloads` sets this for you.
+  # -- Native enduring runs use a dedicated co-located provisioner, not the
+  # one-shot router. This opt-in does not install or approve guest artifacts.
+  nativeParent:
+    enabled: false
+    namespace: ""
+    nodeName: ""
+    image:
+      repository: ""
+      digest: ""
+    # Existing operator-owned directory on the selected node, mounted at the
+    # same absolute path. Contains authority/, journal/ and approvals/.
+    statePath: ""
+    # Existing Secret in nativeParent.namespace: registrations.json plus the
+    # owner bearer/CA files referenced by it. Never include model credentials.
+    configSecret: ""
+    grantConfigMaps:
+      operator: grant-operator
+      runtime: grant-runtime
+      agent: grant-agent
+    # Must match the existing host store owner; no recursive chown/fsGroup.
+    uid: 10001
+    gid: 10001
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        cpu: "1"
+        memory: 512Mi
+  # -- Experimental execution plane: explicitly configure before enabling.
   enabled: false
+  installer:
+    # -- Legacy privileged host mutation is a separate, deliberate opt-in.
+    # Disabling/removing this DaemonSet does NOT undo host installation.
+    enabled: false
+  # -- In-cluster dispatcher (pod-based). Runs the celln dispatcher as a
+  # privileged pod with /dev/kvm, reachable by the router over a ClusterIP
+  # Service. This is the reachable-by-default execution path; the host installer
+  # DaemonSet (above) is the bare-metal alternative that stays loopback-only.
+  dispatcher:
+    enabled: false
+    replicas: 1
+    # -- Explicit pod tolerations, e.g. for a tainted KVM-capable control-plane node.
+    # No taints are tolerated by default.
+    tolerations: []
+    # -- Image carrying the celln binary + runtime assets (and Rust for the
+    # forge compile step). Defaults to celln.image when empty.
+    image:
+      repository: ""
+      tag: ""
+    # -- hostPath directory on the node for motes/tools/cells state.
+    statePath: /var/lib/celln
+    # -- Hosts the dispatcher permits for egress (model API and bounded fetch).
+    allowEgressHosts:
+      - api.deepseek.com
+    egressSlots: 1
+    # Shared admission budget for executions, parents and their child cells.
+    maxCells: 1
+    memoryBytes: 268435456
+    # -- Enduring (native parent) lifecycle on the SAME in-cluster dispatcher.
+    # When enabled the dispatcher serves both /v1/executions (one-shot) and
+    # /v1/parents (enduring), and the main controller reconciles parents
+    # directly — no separate celln-parent-controller Deployment. The operator
+    # provisions the parent authority into `authoritySecret`; see
+    # docs/design/celln-single-execution-plane.md.
+    enduring:
+      enabled: false
+      # -- Fixed owner node; both controller and dispatcher mount the same
+      # operator-prepared directory. Parent relocation is unsupported.
+      nodeName: ""
+      # -- Contains authority/, journal/, approvals/ and admitted artifacts.
+      # Preserve this path inside both pods; never reset it on upgrade.
+      statePath: ""
+      # -- Existing Secret in the controller namespace: registrations.json and
+      # owner-token (plus owner-ca.pem for HTTPS). Model keys stay in host state.
+      parentConfigSecret: ""
+      # Match the existing directory owner. Never recursively chown live state.
+      uid: 10001
+      gid: 10001
+      # Host credential files referenced by admitted model profiles. Mounted
+      # read-only into the dispatcher only, at their original absolute paths.
+      modelCredentialFiles: []
+  # -- Per-node native fleet. Label KVM nodes `celln.dev/kvm=true`: each node
+  # prepares its own authority root from the operator-signed starter package
+  # and runs a dispatcher; the router discovers them by DNS and binds every
+  # parent to the owner that issued it. Replaces the single in-cluster
+  # dispatcher and needs no per-node or per-namespace ceremony. See
+  # docs/guides/celln-fleet-installation.md.
+  fleet:
+    enabled: false
+    # -- Stable installation identity; node state lives at
+    # /var/lib/sympozium-celln/<scope>. Never change it to renew consumed authority.
+    scope: ""
+    package:
+      # -- OCI image (repository@sha256:digest) carrying the reviewed
+      # `celln starter-package` output at /package.
+      image: ""
+      # -- blake3 hash of the package's package.json from `celln starter-inspect`.
+      hash: ""
+      # -- Optional Secret in celln-system with `.dockerconfigjson` for a private registry.
+      pullSecret: ""
+      # -- Skip registry TLS verification (development registries only). The
+      # package is still verified against `hash` after download.
+      insecureRegistry: false
+    # -- Explicitly approved publisher key of the package (from `celln starter-inspect`).
+    publisher: ""
+    # -- Parent principal every owner authenticates; must match the
+    # trusted-parent-clients policy and the model profile.
+    principal: ""
+    # -- ConfigMap in celln-system holding trusted-parent-clients.json (the
+    # blake3 hash of router.parentTokenSecret's token, never the token).
+    parentClientsConfigMap: ""
+    # -- ConfigMap in celln-system the nodes publish the starter configuration to.
+    configurationConfigMap: celln-fleet-configuration
+    # -- ConfigMap in celln-system each node reports its Celln cells and parents to
+    # (what `celln ps -a` shows), under data.<node>; the console reads it.
+    cellsConfigMap: celln-fleet-cells
+    # -- The scope's model backends. Every node configures every backend;
+    # each backend becomes a runtime profile and an AgentRuntime wrapper
+    # (`celln-<name>`, the one named `native` keeps `celln-native`) so one
+    # namespace runs parents on several providers side by side.
+    # `sympozium install --celln-fleet --celln-fleet-backend
+    # name=..,provider=..,model=..` fills this list and may be rerun to add a
+    # backend: the node-configure DaemonSet configures it and publishes it,
+    # while the owner DaemonSet is untouched so running conversations keep
+    # going. Names are DNS labels. Keys live in `modelCredentialsSecret`
+    # under the backend's name.
+    # `parameters` (optional) is a JSON object the Celln host merges into
+    # every provider request of that backend; the guest never sees it. Give
+    # the object itself (or the same object as one JSON string, which is what
+    # the installer's `parameters-file=` sends). Celln validates it: at most
+    # 16 keys matching ^[a-z][a-z0-9_]{0,63}$, scalars, objects up to 3 levels
+    # and arrays of at most 8 scalars, 2048 bytes, and none of the request
+    # fields Celln owns (model, messages, max_tokens, tools, ...). It needs a
+    # Celln release newer than v0.5.22 on the nodes, and cannot change once
+    # the backend is published: add a backend under another name instead.
+    # `maxOutputTokens` (optional, 256-4096, default 512) is the most output
+    # tokens one model request of that backend may produce. 512 suits chat
+    # with thinking disabled; a reasoning model left thinking needs 2048-4096.
+    # A turn reserves 6 requests of it (6 x 512 = 3072 by default), so
+    # `limits.maxOutputTokens` must be at least 6 x the largest value here and
+    # is best sized as turns x that. A non-default value needs a Celln release
+    # newer than v0.5.23 on the nodes and a starter package built by it, and,
+    # like `parameters`, cannot change once the backend is published.
+    backends: []
+    # - name: native
+    #   provider: deepseek
+    #   protocol: openai-chat
+    #   endpoint: https://api.deepseek.com/chat/completions
+    #   model: deepseek-chat
+    #   allowInsecure: false
+    # - name: claude
+    #   provider: anthropic
+    #   protocol: anthropic-messages
+    #   endpoint: https://api.anthropic.com/v1/messages
+    #   model: claude-sonnet-5
+    # - name: qwen
+    #   provider: llama-server
+    #   protocol: openai-chat
+    #   endpoint: http://10.0.0.5:8080/v1/chat/completions
+    #   model: qwen.gguf
+    #   allowInsecure: true
+    #   parameters:
+    #     chat_template_kwargs:
+    #       enable_thinking: false
+    # - name: reasoner
+    #   provider: llama-server
+    #   protocol: openai-chat
+    #   endpoint: http://10.0.0.6:8080/v1/chat/completions
+    #   model: qwq.gguf
+    #   allowInsecure: true
+    #   maxOutputTokens: 2048
+    # -- Secret in celln-system holding every backend's provider key under the
+    # backend's name, mounted read-only into every dispatcher at
+    # /etc/celln-native/credentials. Guests and the controller never see it;
+    # the model gateway is the long-term home. The installer publishes it.
+    modelCredentialsSecret: celln-fleet-model-credentials
+    # -- Legacy single-backend form, used only when `backends` is empty: it
+    # becomes the one backend named `native`. An empty endpoint keeps Celln's
+    # reviewed default (DeepSeek).
+    model:
+      provider: ""
+      # -- openai-chat or anthropic-messages
+      protocol: ""
+      # -- Full chat endpoint URL, e.g. https://api.openai.com/v1/chat/completions
+      endpoint: ""
+      name: ""
+      # -- Approve a plain-HTTP or private endpoint (e.g. a LAN llama-server).
+      allowInsecure: false
+      # -- Output tokens per model request, 256-4096; 0 keeps Celln's 512
+      # (see `backends[].maxOutputTokens` above).
+      maxOutputTokens: 0
+    # -- Ceilings for one parent over its whole life; every node configures
+    # them and the scope's policy admits runs within them. Zero keeps Celln's
+    # reviewed defaults (1 h, 12 turns). The installer sets day-long defaults.
+    # Every turn reserves 6 model requests and 6 x the backend's
+    # maxOutputTokens output tokens (3072 by default) from these totals;
+    # maxOutputTokens here may be up to 25165824 (1024 turns x 6 x 4096).
+    limits:
+      leaseSeconds: 0
+      maxTurns: 0
+      maxModelRequests: 0
+      maxOutputTokens: 0
+    # -- Exact hosts the https-fetch and https-post-json starter tools may
+    # reach (lowercase DNS names, at most 16). Empty keeps Celln's reviewed
+    # default, example.com. The installer's --celln-fleet-https-host sets it.
+    httpsHosts: []
+    # -- Rolled by the API server when a backend is added after the install
+    # (the celln-fleet-backends-extra ConfigMap); leave empty.
+    backendsExtraRevision: ""
+    # -- Per-node budget. `auto` sizes each node when its dispatcher starts:
+    # memoryBytes = memoryPercent of the node's memory (its cgroup limit when
+    # set), maxCells = memoryBytes / cellMemoryBytes capped at maxCellsCeiling,
+    # egressSlots = maxCells. A native parent charges two cells, two broker
+    # slots and its declared memory (1.25 GiB for the starter), so a 64 GiB
+    # node holds about 38 parents. `fixed` uses maxCells/memoryBytes/egressSlots
+    # exactly. Celln releases before v0.5.12 hold one parent per node whatever
+    # these say. A create the owner refuses for capacity ends
+    # that run and it deletes cleanly.
+    capacity: auto
+    memoryPercent: 75
+    cellMemoryBytes: 671088640
+    maxCellsCeiling: 1024
+    maxCells: 4
+    memoryBytes: 4294967296
+    allowEgressHosts:
+      - api.deepseek.com
+    # -- fixed mode only; defaults to maxCells (one broker slot per cell).
+    egressSlots: 4
+    # -- Controller-namespace Secret with registrations.json (remoteProvisioner);
+    # produced by `sympozium install --celln-fleet` after the nodes publish.
+    parentConfigSecret: ""
+    journal:
+      # -- ReadWriteOnce claim holding the controller's parent journal/approvals.
+      claim: celln-parent-journal
+      create: true
+      storageClass: ""
+      storage: 1Gi
+  # -- Mediated model access (default off): each native Celln Agent's model
+  # requests go through the model gateway, which injects that Agent's own
+  # provider key from its namespaced Secret; no provider key on Celln nodes.
+  # This one switch wires the controller's scoped dispatch
+  # (CELLN_SCOPED_CONFIG), the fleet dispatchers' scoped receiver and the model
+  # gateway to the same issuer, keys, tokens and CA. Requires celln.fleet, and
+  # modelGateway.image/egress/database. All key material is operator-provided
+  # by `sympozium celln-mediation bootstrap`; nothing is generated or rendered
+  # from values. Runs take the path of their model route: an Agent's own
+  # Secret-backed (or credential-free) connection goes down this path, while
+  # fleet backends (host-profile) keep starting fleet parents as before.
+  # See docs/guides/celln-mediated-model-access.md.
+  mediation:
+    enabled: false
+    # -- Operator-chosen cluster identity bound into every signed decision.
+    clusterId: ""
+    # -- Namespace holding the controller's immutable prepared-operation
+    # records; never a tenant namespace. Empty uses the control-plane namespace.
+    preparationNamespace: ""
+    issuer:
+      # -- Fixed by the credential contract; the controller, dispatchers and
+      # gateway all refuse another issuer.
+      name: sympozium-control-plane
+      # -- Key id of the signing key; must be a `kid` in the trust JWKS.
+      keyId: ""
+    # -- Control-plane Secret, controller only. Keys: issuer.key (one PKCS#8
+    # Ed25519 PRIVATE KEY PEM), receiver-token, gateway-token.
+    controllerSecret: celln-mediation-controller
+    # -- Control-plane Secret, gateway only. Keys: tls.crt, tls.key,
+    # registration-token (equal to the controller's gateway-token).
+    gatewaySecret: celln-mediation-gateway
+    # -- celln-system Secret. Keys: operator-token (equal to the controller's
+    # receiver-token), tls.crt, tls.key (the receiver's TLS edge).
+    nodeSecret: celln-mediation-node
+    # -- Public ConfigMap of the same name in the control-plane namespace AND
+    # celln-system. Keys: jwks.json (public Ed25519 JWKS), ca.crt (the CA that
+    # signed both TLS certificates). Public material only, so a ConfigMap.
+    trustConfigMap: celln-mediation-trust
+    receiver:
+      # -- HTTPS origin of the ONE scoped receiver the controller uses. Empty
+      # uses the chart's celln-scoped-receiver Service, which is correct only
+      # while a single celln-node pod exists: scoped state lives on the node
+      # that prepared it and the router does not forward /v1/scoped/*. With
+      # several nodes, set an origin that reaches exactly one of them (its
+      # host name must be in the receiver certificate).
+      url: ""
+      port: 9443
+    # -- Also offer every HTTPS fleet backend's provider, protocol, origin and
+    # model to an Agent's own key. Plain-HTTP and port-bearing backends are
+    # never offered: a cluster Secret does not cross them.
+    mediateBackends: false
+    # -- The providers an Agent may bring its own key for; none by default.
+    # Matching is EXACT on provider, protocol, model and origin (no wildcard),
+    # and only the operator declares routes: an endpoint a tenant wrote is not
+    # authorisation. Recorded in ConfigMap celln-system/celln-mediated-routes
+    # and appended to the scope's policy by the next `sympozium install
+    # --celln-fleet`, added backend, or `sympozium celln-mediation
+    # apply-routes`; removing an entry here never removes a published route.
+    # Requires `enabled`. Example:
+    #   - provider: anthropic
+    #     protocol: anthropic-messages        # or openai-chat
+    #     models: [claude-sonnet-5]           # 1-32 exact names
+    #     endpointOrigins: [https://api.anthropic.com]   # https://host, no port or path
+    # For keyless local models set auth: none and allowInsecure: true, and
+    # also list the exact HTTP origin (including port) in modelGateway.privateOrigins.
+    routes: []
+    # -- Parent request template for enduring scoped runs, read once when the
+    # dispatcher starts. Empty uses scoped-parent-request.json in the first
+    # backend's starter configuration on the node. When the file is absent the
+    # dispatcher starts with one-shot scoped dispatch only.
+    parentRequestFile: ""
+  # -- One-command bootstrap for a fresh Celln install. Generates the
+  # controller/router/backend/capability bearer Secrets and a router ownership
+  # PVC, then the CLI points celln.tokenSecret, celln.capabilityTokenSecret and
+  # celln.router.*Secret at them. Router backends (KVM node dispatcher
+  # endpoints) and ownership storage class remain operator inputs.
+  bootstrap:
+    enabled: false
+    clientTokenSecret: celln-router-client
+    backendTokenSecret: celln-dispatcher-backend
+    capabilityTokenSecret: celln-discovery
+    ownershipClaim: celln-router-ownership
+    ownershipStorageClass: ""
+    ownershipStorage: 1Gi
   # -- URL of the celln-router Service. The controller POSTs here.
   routerUrl: "http://celln-router.celln-system.svc.cluster.local:8787"
+  # -- Existing Secret in the controller namespace, key `token`, containing
+  # the router CLIENT bearer credential (at least 24 bytes). No token is generated
+  # or inferred from model credentials. Missing configuration refuses dispatch.
+  tokenSecret: ""
+  # -- Optional public ConfigMap with ca-bundle.crt containing the complete
+  # system CA bundle plus the operator router CA. Mounted without subPath.
+  caConfigMap: ""
+  # -- Explicitly allow new native Harness submissions; recovery/cancel remains
+  # available when false. Does not establish catalogue readiness.
+  harnessEnabled: false
+  # -- Existing operator-owned Secret mounted at /etc/sympozium/celln-catalogue.
+  # Include config.json and separately scoped issuer/router token and CA files.
+  # No credential is generated or taken from tenant AgentRun fields.
+  catalogueConfigSecret: ""
+  # -- Existing operator-owned ConfigMap in the API-server namespace, key
+  # config.json. Only permission-preview source bindings; never issuer tokens.
+  # Restart the API server after changing bindings. Does not enable execution.
+  permissionPreviewConfigMap: ""
+  # -- Read-only discovery token Secret in the API-server namespace (key token).
+  # Must differ from execution credentials and match router.capabilityTokenSecret.
+  capabilityTokenSecret: ""
+  # -- Explicitly permit a plaintext non-loopback router URL. Prefer an HTTPS
+  # endpoint; cluster networking alone does not encrypt the bearer credential.
+  allowInsecureHttp: false
   # -- API key for your chosen LLM provider. Set ONE of these.
   # The key file is mounted at /etc/celln/agent-key on the host dispatcher.
   # If none are set, the dispatcher will use auto-discovery (ollama) or
@@ -401,12 +841,39 @@ celln:
   # -- Optional: OpenAI-compatible base URL (for local/proxy servers).
   openaiBaseUrl: ""
   image:
-    repository: "ghcr.io/sympozium-ai/celln-installer"
-    tag: "v0.4.13"
+    # Host installer / dispatcher image: the celln binary + runtime assets +
+    # Rust. Built in this repository (images/celln-installer); the celln repo
+    # does not publish an installer image. Tag defaults to .Chart.AppVersion.
+    repository: "ghcr.io/sympozium-ai/sympozium/celln-installer"
+    tag: ""
   router:
+    # Parent principal used only behind the gateway; controller uses tokenSecret.
+    parentTokenSecret: ""
+    # -- Use an independently managed router/TLS endpoint. The chart configures
+    # clients only and creates no router/installer/ownership resources.
+    external: false
+    replicas: 2
+    # -- Complete, identical backend list on every replica; no Service that
+    # load-balances different dispatcher owners. Current router supports HTTP only.
+    backends: []
+    # -- Explicit acknowledgement for plaintext router-to-dispatcher traffic.
+    # Use only a trusted/encrypted network path; this is NOT a TLS setting.
+    allowInsecureBackends: false
+    # -- Existing Secrets in celln-system, each with key `token`. Client token
+    # must match celln.tokenSecret's contents and differ from the backend token.
+    clientTokenSecret: ""
+    backendTokenSecret: ""
+    # -- Read-only discovery Secret in celln-system; requires Celln PR #80 or later.
+    capabilityTokenSecret: ""
+    # -- Existing shared PVC in celln-system. Must provide coherent cross-node
+    # POSIX flock, atomic publication and directory fsync, not just an RWX label.
+    ownershipClaim: ""
     image:
-      repository: "ghcr.io/sympozium-ai/celln-router"
-      tag: "v0.4.13"
+      repository: "ghcr.io/sympozium-ai/celln"
+      # -- Prefer a digest for a pinned router. `tag` is a fallback for the
+      # bootstrap path and is less tamper-resistant.
+      digest: ""
+      tag: ""
 
 # -- Persona delegation behavior.
 delegation:

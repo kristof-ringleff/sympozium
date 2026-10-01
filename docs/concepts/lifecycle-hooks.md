@@ -50,10 +50,18 @@ spec:
       - name: check-queue
         image: curlimages/curl:latest
         command: ["sh", "-c",
-          "test -s /workspace/queue.json || echo 'queue empty' > /ipc/control/skip"]
+          "test -s /workspace/queue.json || { mkdir -p /ipc/control && echo 'queue empty' > /ipc/control/skip; }"]
 ```
 
 Notes:
+
+- **Create the directory.** Nothing creates `/ipc/control` before preRun hooks
+  run, so the hook must `mkdir -p` it before it writes the marker.
+- **In [harness mode](../modes/harness.md), the adapter does the skip.** The
+  harness replaces `agent-runner`. Sympozium mounts `/ipc/control` read-only
+  into the harness container, and the adapter must check the marker and return
+  a `skipped` result. An adapter that ignores the marker runs the harness
+  anyway. See [Skipped runs](../modes/harness-adapters.md#skipped-runs).
 
 - **Exit `0`, don't fail.** A non-zero exit fails the whole Pod (standard init
   container behavior) and marks the run `Failed` — that is *not* a skip.
@@ -74,6 +82,22 @@ PostRun hooks execute in a **follow-up Job** after the agent completes. They rec
 
 The workspace is shared between the agent and postRun hooks via a PersistentVolumeClaim. PostRun failures are **best-effort** — they're recorded as a `PostRunFailed` Condition but don't change the agent's final phase.
 
+#### PostRun timeouts
+
+PostRun hooks run sequentially in one Job, and that Job's budget is the **sum of the hooks' `timeout` fields** — 5 minutes each when unset, and never less than 10 minutes in total.
+
+```yaml
+postRun:
+  - name: upload-artifacts
+    image: amazon/aws-cli:latest
+    timeout: 30m          # a slow upload gets the room it needs
+```
+
+Two things to know:
+
+- The budget is measured from when the **postRun Job** starts, not from when the agent run started. A long-running agent still gets its full postRun budget.
+- Kubernetes has no per-init-container timeout, so `timeout` bounds the Job as a whole rather than each container. Use it to give a slow hook room, not to police a fast one — a hook that overruns simply eats into what is left for the hooks after it.
+
 **Use cases:** Upload artifacts to S3, post a summary to Slack, clean up temporary resources, trigger downstream pipelines.
 
 ### Environment Variables
@@ -89,7 +113,7 @@ All lifecycle hook containers receive these env vars:
 
 ## RBAC for Hooks
 
-By default, lifecycle hook containers run with the `sympozium-agent` ServiceAccount, which has **no Kubernetes permissions**. If your hooks need to interact with the Kubernetes API (e.g., create or delete ConfigMaps), declare the required RBAC rules:
+Every AgentRun gets a unique ServiceAccount with automatic token mounting disabled. Lifecycle hooks receive **no Kubernetes token or permissions** by default. If your hooks need to interact with the Kubernetes API (for example, to create or delete ConfigMaps), declare the required RBAC rules:
 
 ```yaml
 spec:
@@ -109,7 +133,7 @@ spec:
         command: ["kubectl", "delete", "configmap", "run-context"]
 ```
 
-The controller creates a namespace-scoped Role and RoleBinding for the run, bound to `sympozium-agent`. These are garbage-collected when the AgentRun is deleted — no standing permissions.
+The controller creates a namespace-scoped Role and RoleBinding for the run, bound only to that AgentRun's ServiceAccount. It projects a pod-bound, 10-minute token into the declared hook containers, not into the agent, harness, IPC bridge, or unrelated sidecars. The ServiceAccount and namespace-scoped RBAC are garbage-collected when the AgentRun is deleted; cluster-scoped RBAC is removed when the run completes.
 
 ## Examples
 
@@ -259,9 +283,20 @@ All actions accept an optional `reason` field for audit logging.
 
 If you want a human to approve or reject each response:
 
-1. Set the gate hook to sleep indefinitely (or for a long timeout)
+1. Set the gate hook to sleep indefinitely, and declare a matching `timeout` — otherwise the reviewer only gets the 10-minute default before `gateDefault` decides for them
 2. Set `gateDefault: block` so unapproved responses are blocked
 3. Use the web UI or API to approve or reject
+
+```yaml
+postRun:
+  - name: manual-approval-gate
+    image: busybox:1.36
+    gate: true
+    timeout: 24h        # how long a human has to respond
+    command: ["sh", "-c", "sleep 86400"]
+```
+
+The `requireApproval` toggle in the API and UI configures exactly this, with a 24-hour window.
 
 In the web UI, gated runs show an amber "Approval" badge on the runs list and an approval bar on the run detail page with Approve and Reject buttons. A warning toast fires when a run requires approval.
 

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { useModelList } from "@/hooks/use-model-list";
+import { useModelList, modelApiBaseURL } from "@/hooks/use-model-list";
 import { useProviderNodes } from "@/hooks/use-provider-nodes";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -40,10 +40,20 @@ import {
   Terminal,
   Settings,
   Wifi,
+  Info,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
-import { useCapabilities, useModels } from "@/hooks/use-api";
+import { providersForPlane } from "@/lib/creation";
+import { PlanePicker } from "@/components/plane-picker";
+import { CellnKeyStep, CellnModelStep, CellnRouteStep, OwnKeyProgress } from "@/components/celln-own-key";
+import { useCapabilities, useModels, useCellnMediation, useCellnPlatformProfiles } from "@/hooks/use-api";
+import { persistentHarnesses, persistentHarnessName } from "@/lib/persistent-harness";
+import { modelConnectionName, modelConnectionEndpoint, describeEnduringLimits } from "@/lib/agent-execution";
+import { OwnKeyError, ownKeyConnectionSpec, defaultEndpointPath, enduringForOutputTokens, keyChoiceReady, managedSecretName, prepareOwnKeyBackend, profileForRoute, type KeyChoice, type OwnKeyStep } from "@/lib/celln-own-key";
+import { parseMaxOutputTokens, parseModelParameters } from "@/lib/model-parameters";
 import { api } from "@/lib/api";
+import type { WizardExecution } from "@/lib/agent-execution";
+import type { AgentRuntime, SympoziumPolicy, CellnSelection, CellnMediatedRoute, ModelConnection } from "@/lib/api";
 import {
   YamlModal,
   instanceYamlFromWizard,
@@ -214,6 +224,21 @@ export interface WizardResult {
   requireApproval?: boolean;
   /** References a cluster-local Model CR for inference (no API key needed). */
   modelRef?: string;
+  /** Administrator-approved external harness used by this Agent's normal runs. */
+  runtimeRef?: string;
+  /** Policy required to authorize the selected harness. */
+  policyRef?: string;
+  /** Saved model route; a Celln Agent's own connection, backed by its own Secret. */
+  modelConnectionRef?: string;
+  /** Default execution environment: Kubernetes (job) or Celln. */
+  executionBackend?: "job" | "celln";
+  /** Default Celln lifecycle when executionBackend is celln. */
+  executionLifecycle?: "one-shot" | "enduring";
+  /** Immutable catalogue revisions requested as defaults; never permission grants. */
+  borrowedTools?: CellnSelection["toolRefs"];
+  /** Shared platform catalogue revisions when the runtime is a profile wrapper. */
+  clusterTools?: CellnSelection["clusterToolRefs"];
+  enduringDefaults?: WizardExecution["enduringDefaults"];
 }
 
 interface OnboardingWizardProps {
@@ -221,16 +246,26 @@ interface OnboardingWizardProps {
   onClose: () => void;
   /** "agent" shows a Name step first; "persona" skips it; "canary" shows only provider/apikey/model */
   mode: "agent" | "persona" | "canary";
+  creationKind?: "run" | "agent";
   /** Display name shown in the dialog title */
   targetName?: string;
   /** Number of personas in the pack (persona mode only) */
   agentConfigCount?: number;
   /** Available SkillPacks to choose from */
   availableSkills?: string[];
+  /** Administrator-approved harnesses available in the current namespace. */
+  availableRuntimes?: AgentRuntime[];
+  /** Policies available in the current namespace. */
+  availablePolicies?: SympoziumPolicy[];
+  /** SkillPacks that harness isolation cannot safely combine with. */
+  harnessIncompatibleSkills?: string[];
   /** Pre-fill form values */
   defaults?: Partial<WizardResult>;
-  /** Called when the user clicks Activate / Create */
-  onComplete: (result: WizardResult) => void;
+  /**
+   * Called when the user clicks Activate / Create. A returned promise lets the
+   * wizard report a failed Agent creation beside what it already saved.
+   */
+  onComplete: (result: WizardResult) => void | Promise<unknown>;
   isPending: boolean;
 }
 
@@ -238,6 +273,8 @@ interface OnboardingWizardProps {
 
 type WizardStep =
   | "name"
+  | "runtime"
+  | "plane"
   | "provider"
   | "apikey"
   | "model"
@@ -247,22 +284,32 @@ type WizardStep =
   | "confirm"
   | "channelAction";
 
-function stepsForMode(mode: "agent" | "persona" | "canary"): WizardStep[] {
+function stepsForMode(
+  mode: "agent" | "persona" | "canary",
+  celln = false,
+  persistent = false,
+  runtimeImplicit = false,
+): WizardStep[] {
   if (mode === "canary") {
     return ["provider", "apikey", "model"];
   }
   if (mode === "agent") {
-    return [
-      "name",
-      "provider",
-      "apikey",
-      "model",
-      "skills",
-      "heartbeat",
-      "channels",
-      "confirm",
-      "channelAction",
-    ];
+    if (persistent) {
+      return [
+        "name",
+        "plane",
+        // A Celln Agent owns its model backend: the operator's declared
+        // provider, this Agent's key and one of the route's models. Its runtime
+        // is the fleet's, and the mediated path is chat only, so there is no
+        // runtime, tool or SkillPack to choose.
+        ...(celln
+          ? ["provider", "apikey", "model"]
+          : [...(runtimeImplicit ? [] : ["runtime"]), "skills", "provider", "apikey", "model", "heartbeat", "channels"]),
+        "confirm",
+        "channelAction",
+      ] as WizardStep[];
+    }
+    return ["name", "provider", "apikey", "model", "skills", "heartbeat", "channels", "confirm", "channelAction"];
   }
   return [
     "provider",
@@ -287,6 +334,8 @@ function StepIndicator({
 }) {
   const labels: Record<WizardStep, string> = {
     name: "Name",
+    runtime: "Runtime",
+    plane: "Execution plane",
     provider: "Provider",
     apikey: "Auth",
     model: "Model",
@@ -298,6 +347,8 @@ function StepIndicator({
   };
   const icons: Record<WizardStep, React.ReactNode> = {
     name: <Server className="h-3.5 w-3.5" />,
+    runtime: <Terminal className="h-3.5 w-3.5" />,
+    plane: <Server className="h-3.5 w-3.5" />,
     provider: <Bot className="h-3.5 w-3.5" />,
     apikey: <Key className="h-3.5 w-3.5" />,
     model: <Sparkles className="h-3.5 w-3.5" />,
@@ -310,9 +361,9 @@ function StepIndicator({
   const idx = steps.indexOf(current);
 
   return (
-    <div className="flex flex-wrap items-center justify-center gap-1 mb-6">
+    <div className="flex flex-wrap items-center justify-center gap-1 mb-6" data-testid="wizard-steps">
       {steps.map((step, i) => (
-        <div key={step} className="flex items-center gap-1">
+        <div key={step} className="flex items-center gap-1" data-step={step}>
           <div
             className={cn(
               "flex items-center gap-1 rounded-full px-2 py-1 text-[11px] font-medium transition-colors",
@@ -344,6 +395,7 @@ function ModelSelector({
   value,
   onChange,
   bedrockCredentials,
+  inputId,
 }: {
   provider: string;
   apiKey: string;
@@ -351,6 +403,7 @@ function ModelSelector({
   value: string;
   onChange: (v: string) => void;
   bedrockCredentials?: import("@/hooks/use-model-list").BedrockCredentials;
+  inputId?: string;
 }) {
   const { models, isLoading, isLive } = useModelList(
     provider,
@@ -419,6 +472,7 @@ function ModelSelector({
           Or enter a custom model name
         </Label>
         <Input
+          id={inputId}
           value={value}
           onChange={(e) => onChange(e.target.value)}
           placeholder="gpt-4o"
@@ -450,7 +504,7 @@ function CanaryConnectionTest({ baseURL }: { baseURL: string }) {
     try {
       // Use the same in-cluster proxy endpoint that model listing uses,
       // so the test exercises the real network path (pod → provider).
-      const res = await api.providers.models(baseURL);
+      const res = await api.providers.models(modelApiBaseURL(baseURL));
       setResult({
         reachable: true,
         models: res.models.length,
@@ -505,6 +559,23 @@ function CanaryConnectionTest({ baseURL }: { baseURL: string }) {
   );
 }
 
+// ── Model connection folding ─────────────────────────────────────────────────
+// Persistent Kubernetes harnesses consume a reusable ModelConnection instead
+// of inline credentials. The wizard keeps the ordinary Provider → Auth → Model
+// steps and persists that selection as a connection named after the Agent, so
+// creating a route feels identical to creating a one-shot run. (A Celln Agent's
+// own connection is built in lib/celln-own-key.ts.)
+
+function modelConnectionSpec(result: WizardResult): ModelConnection["spec"] {
+  return {
+    provider: result.provider,
+    protocol: "openai-chat",
+    endpoint: modelConnectionEndpoint(result.baseURL, result.provider),
+    models: [result.model],
+    ...(result.apiKey || !result.secretName ? {} : { secretRef: result.secretName }),
+  };
+}
+
 // ── Main wizard component ────────────────────────────────────────────────────
 
 export function OnboardingWizard({
@@ -512,22 +583,41 @@ export function OnboardingWizard({
   onClose,
   mode,
   targetName,
+  creationKind = "run",
   agentConfigCount,
   availableSkills = [],
+  availableRuntimes = [],
+  availablePolicies = [],
+  harnessIncompatibleSkills = [],
   defaults,
   onComplete,
   isPending,
 }: OnboardingWizardProps) {
-  const steps = stepsForMode(mode);
-  const [step, setStep] = useState<WizardStep>(steps[0]);
+  const persistentRuntimes = persistentHarnesses(availableRuntimes);
+  // The fleet's runtime profiles the namespace's policy admits. A Celln Agent
+  // runs on one of them; its runtime wrapper is created on completion.
+  const platformProfiles = useCellnPlatformProfiles(mode === "agent");
+  const fleetAvailable = (platformProfiles.data || []).length > 0;
+  const defaultRuntimeRef = availableRuntimes.some(
+    (runtime) => runtime.metadata.name === defaults?.runtimeRef,
+  ) ? defaults?.runtimeRef || "" : "";
+  // Kubernetes (job) remains the default execution plane; Celln is an explicit
+  // opt-in in the plane step. Defaulting to Celln here surfaced a "no native
+  // runtime registered" warning in namespaces without a native runtime.
+  const defaultBackend = defaults?.executionBackend || "job";
+  const defaultLifecycle = defaults?.executionLifecycle || "one-shot";
+  const [step, setStep] = useState<WizardStep>(mode === "agent" ? "name" : "provider");
   const [form, setForm] = useState<WizardResult>({
     name: defaults?.name || "",
+    modelConnectionRef: defaults?.modelConnectionRef,
     provider: defaults?.provider || "",
     apiKey: defaults?.apiKey || "",
     secretName: defaults?.secretName || "",
     model: defaults?.model || "",
     baseURL: defaults?.baseURL || "",
-    skills: Array.from(new Set([...(defaults?.skills || []), "memory"])),
+    skills: Array.from(new Set([...(defaults?.skills || []), "memory"])).filter(
+      (skill) => !defaultRuntimeRef || !harnessIncompatibleSkills.includes(skill),
+    ),
     channels: defaults?.channels || Object.keys(defaults?.channelConfigs || {}),
     channelConfigs: defaults?.channelConfigs || {},
     heartbeatInterval: defaults?.heartbeatInterval || "",
@@ -545,12 +635,86 @@ export function OnboardingWizard({
     awsAccessKeyId: defaults?.awsAccessKeyId || "",
     awsSecretAccessKey: defaults?.awsSecretAccessKey || "",
     awsSessionToken: defaults?.awsSessionToken || "",
+    runtimeRef: defaultRuntimeRef,
+    policyRef: defaults?.policyRef || "",
+    executionBackend: defaultBackend,
+    executionLifecycle: defaultLifecycle,
+    borrowedTools: defaults?.borrowedTools || [],
   });
+  // Skill compatibility can arrive after the form defaults or harness selection.
+  const incompatibleSkillsKey = JSON.stringify(harnessIncompatibleSkills);
+  useEffect(() => {
+    setForm((current) => {
+      if (!current.runtimeRef) return current;
+      const skills = current.skills.filter((skill) => !harnessIncompatibleSkills.includes(skill));
+      return skills.length === current.skills.length ? current : { ...current, skills };
+    });
+  }, [form.runtimeRef, incompatibleSkillsKey]);
+  const celln = mode === "agent" && form.executionBackend === "celln";
+  // When the Kubernetes plane has exactly one compatible harness there is
+  // nothing to choose, so select it implicitly and skip the runtime step.
+  const singleRuntimeRef = persistentRuntimes.length === 1 ? persistentRuntimes[0]?.metadata.name || "" : "";
+  const runtimeImplicit = creationKind === "agent" && !celln && !!singleRuntimeRef;
+  useEffect(() => {
+    if (!open || !runtimeImplicit || form.runtimeRef === singleRuntimeRef) return;
+    const isDefaultCatalog = persistentRuntimes.some(
+      (runtime) => runtime.metadata.name === singleRuntimeRef && runtime.metadata.labels?.["sympozium.ai/harness-example"] === "true",
+    );
+    setForm((current) => ({
+      ...current,
+      runtimeRef: singleRuntimeRef,
+      skills: current.skills.filter((skill) => !harnessIncompatibleSkills.includes(skill)),
+      policyRef: isDefaultCatalog ? "harness-examples" : current.policyRef,
+    }));
+  }, [open, runtimeImplicit, singleRuntimeRef, form.runtimeRef, incompatibleSkillsKey]);
+  const selectedRuntime = persistentRuntimes.find((runtime) => runtime.metadata.name === form.runtimeRef);
+  const steps = stepsForMode(mode, celln, creationKind === "agent", runtimeImplicit);
+  // A Celln Agent's own model backend: a provider route the operator declared
+  // for this namespace, this Agent's key, and one of the route's models. The
+  // pasted key lives here, outside the form, so it never reaches the YAML
+  // preview or the Agent request; it goes to the API once, on completion.
+  const mediation = useCellnMediation(celln);
+  const [cellnRoute, setCellnRoute] = useState<CellnMediatedRoute>();
+  const [cellnKey, setCellnKey] = useState<KeyChoice>({ mode: "create", apiKey: "" });
+  const [cellnOrigin, setCellnOrigin] = useState("");
+  const [cellnPath, setCellnPath] = useState("");
+  const [cellnParameters, setCellnParameters] = useState("");
+  const [cellnMaxOutputTokens, setCellnMaxOutputTokens] = useState("");
+  const [cellnFailure, setCellnFailure] = useState<{ error: string; steps: OwnKeyStep[] } | null>(null);
+  const cellnSecretName = !cellnRoute || cellnRoute.auth === "none" ? "" : cellnKey.mode === "existing" ? cellnKey.secretName : managedSecretName(modelConnectionName(form.name), cellnRoute.provider);
+  const cellnProfile = cellnRoute ? profileForRoute(cellnRoute, platformProfiles.data || []) : undefined;
+  const cellnParsedParameters = parseModelParameters(cellnParameters);
+  const cellnParsedTokens = parseMaxOutputTokens(cellnMaxOutputTokens);
+  const cellnEnduring = cellnProfile ? enduringForOutputTokens(cellnProfile, cellnParsedTokens.maxOutputTokens) : undefined;
+  function chooseCellnRoute(route: CellnMediatedRoute) {
+    setCellnRoute(route);
+    setCellnOrigin(route.endpointOrigins[0] || "");
+    setCellnPath(defaultEndpointPath(route.protocol));
+    // A key or Secret chosen for another provider is not carried over.
+    setCellnKey({ mode: "create", apiKey: "" });
+    setCellnFailure(null);
+    setForm((current) => ({ ...current, provider: route.provider, model: route.models.length === 1 ? route.models[0] : "" }));
+  }
+  const compatibleRuntime = celln ? !!cellnProfile : !form.runtimeRef || !!selectedRuntime?.spec.image;
+  // Provider choices come from the shared creation model so the Run dialog and
+  // this wizard can never drift into showing a provider the plane cannot reach.
+  // (The Celln plane offers the operator's declared routes instead.)
+  const providerChoices = useMemo(
+    () =>
+      providersForPlane(PROVIDERS, {
+        plane: "job",
+        persistentHarness:
+          mode === "agent" && creationKind === "agent" && !!form.runtimeRef,
+      }),
+    [mode, creationKind, form.runtimeRef],
+  );
   const [inferenceMode, setInferenceMode] = useState<"workload" | "node">(
     "workload",
   );
   const [channelActionIdx, setChannelActionIdx] = useState(0);
   const [showYaml, setShowYaml] = useState(false);
+  const [savingConnection, setSavingConnection] = useState(false);
+  const [connectionError, setConnectionError] = useState("");
   const { data: capabilities } = useCapabilities();
   const { data: clusterModels } = useModels();
   const [usingLocalModel, setUsingLocalModel] = useState(false);
@@ -623,23 +787,37 @@ export function OnboardingWizard({
     switch (step) {
       case "name":
         return nameValid;
+      case "runtime":
+        return !!form.runtimeRef && compatibleRuntime;
       case "provider":
+        // Only a declared route, on a profile its policy admits, can run.
+        if (celln) return !!cellnRoute && !!cellnProfile;
         return !!form.provider;
+      case "plane":
+        return true;
       case "apikey":
+        if (celln) return cellnRoute?.auth === "none" || keyChoiceReady(cellnKey);
+        if (form.modelConnectionRef) return true;
         if (
           form.provider === "ollama" ||
           form.provider === "lm-studio" ||
           form.provider === "llama-server" ||
-          form.provider === "unsloth"
+          form.provider === "unsloth" ||
+          // Custom endpoints are commonly self-hosted OpenAI-compatible
+          // servers (for example a node-probed llama-server). Credentials
+          // are optional for those servers, but remain available below for
+          // custom endpoints that do require authentication.
+          form.provider === "custom"
         )
           return true;
         if (form.provider === "bedrock")
           return !!form.secretName || !!form.awsRegion;
         return !!form.secretName || !!form.apiKey;
       case "model":
+        if (celln) return !!cellnRoute && cellnRoute.models.includes(form.model) && cellnRoute.endpointOrigins.includes(cellnOrigin) && cellnPath.startsWith("/") && !cellnParsedParameters.error && !cellnParsedTokens.error;
         return !!form.model;
       case "skills":
-        return true;
+        return !form.runtimeRef || !form.skills.some((skill) => harnessIncompatibleSkills.includes(skill));
       case "channelAction":
         return true;
       default:
@@ -653,16 +831,99 @@ export function OnboardingWizard({
   );
   const hasActionChannels = actionChannels.length > 0;
 
-  function completeWithDefaults() {
+  async function completeWithDefaults() {
+    if (mode === "agent" && !compatibleRuntime) return;
     // Apply default baseURL for local providers if the user left it empty.
     const result = { ...form };
-    if (!result.baseURL) {
+    if (celln) return completeCelln(result);
+    if (!result.baseURL && !result.modelConnectionRef) {
       const prov = PROVIDERS.find((p) => p.value === result.provider);
       if (prov?.defaultBaseURL) {
         result.baseURL = prov.defaultBaseURL;
       }
     }
-    onComplete(result);
+    // Persistent Kubernetes harnesses store their Provider → Auth → Model
+    // selection as a reusable ModelConnection.
+    const persistentHarness =
+      mode === "agent" &&
+      creationKind === "agent" &&
+      !!result.runtimeRef &&
+      compatibleRuntime;
+    if (persistentHarness) {
+      setConnectionError("");
+      setSavingConnection(true);
+      try {
+        const connection = await api.modelConnections.create({
+          name: modelConnectionName(result.name),
+          spec: modelConnectionSpec(result),
+          apiKey: result.apiKey || undefined,
+        });
+        result.modelConnectionRef = connection.metadata.name;
+        // The connection now owns the route and credential; inline values would
+        // be rejected by the Agent API and duplicate the Secret.
+        result.apiKey = "";
+        result.secretName = "";
+        result.baseURL = "";
+      } catch (err) {
+        setSavingConnection(false);
+        setConnectionError(
+          err instanceof Error
+            ? err.message
+            : "Could not save the model connection",
+        );
+        return;
+      }
+      setSavingConnection(false);
+    }
+    // The caller reports its own failure; only the Celln path waits for it.
+    void Promise.resolve(onComplete(result)).catch(() => undefined);
+  }
+
+  // A Celln Agent's objects, in the order they depend on each other: its
+  // Secret and ModelConnection (one API call, which validates before it
+  // writes), the namespace's runtime wrapper, then the Agent. Each call is
+  // idempotent, so pressing Create again after a failure is safe; what was and
+  // was not created is always shown.
+  async function completeCelln(result: WizardResult) {
+    if (!cellnRoute || !cellnProfile || !cellnEnduring || savingConnection) return;
+    setConnectionError("");
+    setCellnFailure(null);
+    setSavingConnection(true);
+    let steps: OwnKeyStep[] = [];
+    try {
+      const prepared = await prepareOwnKeyBackend({
+        connectionName: modelConnectionName(result.name),
+        selection: { route: cellnRoute, origin: cellnOrigin, path: cellnPath, model: result.model, parameters: cellnParsedParameters.parameters, maxOutputTokens: cellnParsedTokens.maxOutputTokens },
+        key: cellnKey,
+        profile: cellnProfile,
+        agentName: result.name,
+        onConnectionSaved: (connection) => {
+          setCellnKey({ mode: "existing", secretName: connection.spec.secretRef || "" });
+        },
+      });
+      steps = prepared.steps;
+      await onComplete({
+        ...result,
+        provider: cellnRoute.provider,
+        apiKey: "",
+        secretName: "",
+        baseURL: "",
+        skills: [],
+        modelConnectionRef: prepared.connection.metadata.name,
+        runtimeRef: prepared.runtime,
+        executionLifecycle: "enduring",
+        borrowedTools: [],
+        clusterTools: undefined,
+        enduringDefaults: cellnEnduring,
+      });
+    } catch (err) {
+      if (err instanceof OwnKeyError) steps = err.steps;
+      const agent = steps.find((entry) => entry.step === "agent");
+      if (agent && !(err instanceof OwnKeyError)) agent.state = "failed";
+      setCellnFailure({ error: err instanceof Error ? err.message : "Could not create the Agent", steps });
+    } finally {
+      setSavingConnection(false);
+    }
   }
 
   function next() {
@@ -687,8 +948,7 @@ export function OnboardingWizard({
     let nextIdx = stepIdx + 1;
     while (
       nextIdx < steps.length &&
-      usingLocalModel &&
-      (steps[nextIdx] === "apikey" || steps[nextIdx] === "model")
+      !celln && ((usingLocalModel && (steps[nextIdx] === "apikey" || steps[nextIdx] === "model")) || (!!form.modelConnectionRef && steps[nextIdx] === "apikey"))
     ) {
       nextIdx++;
     }
@@ -703,8 +963,7 @@ export function OnboardingWizard({
     let prevIdx = stepIdx - 1;
     while (
       prevIdx >= 0 &&
-      usingLocalModel &&
-      (steps[prevIdx] === "apikey" || steps[prevIdx] === "model")
+      !celln && ((usingLocalModel && (steps[prevIdx] === "apikey" || steps[prevIdx] === "model")) || (!!form.modelConnectionRef && steps[prevIdx] === "apikey"))
     ) {
       prevIdx--;
     }
@@ -719,14 +978,22 @@ export function OnboardingWizard({
 
   // Reset form when defaults change (new wizard opened)
   function resetWith(d: Partial<WizardResult>) {
+    setCellnRoute(undefined);
+    setCellnKey({ mode: "create", apiKey: "" });
+    setCellnParameters("");
+    setCellnMaxOutputTokens("");
+    setCellnFailure(null);
     setForm({
       name: d.name || "",
+      modelConnectionRef: d.modelConnectionRef,
       provider: d.provider || "",
       apiKey: d.apiKey || "",
       secretName: d.secretName || "",
       model: d.model || "",
       baseURL: d.baseURL || "",
-      skills: d.skills || [],
+      skills: (d.skills || []).filter(
+        (skill) => !d.runtimeRef || !harnessIncompatibleSkills.includes(skill),
+      ),
       channels: d.channels || Object.keys(d.channelConfigs || {}),
       channelConfigs: d.channelConfigs || {},
       heartbeatInterval: d.heartbeatInterval || "",
@@ -736,10 +1003,19 @@ export function OnboardingWizard({
       githubToken: d.githubToken || "",
       githubTeamInstructions: d.githubTeamInstructions || "",
       nodeSelector: d.nodeSelector,
+      agentSandboxEnabled: d.agentSandboxEnabled ?? false,
+      agentSandboxRuntimeClass: d.agentSandboxRuntimeClass || "gvisor",
+      runTimeout: d.runTimeout || "",
+      requireApproval: d.requireApproval ?? false,
       awsRegion: d.awsRegion || "",
       awsAccessKeyId: d.awsAccessKeyId || "",
       awsSecretAccessKey: d.awsSecretAccessKey || "",
       awsSessionToken: d.awsSessionToken || "",
+      runtimeRef: availableRuntimes.some((runtime) => runtime.metadata.name === d.runtimeRef) ? d.runtimeRef : "",
+      policyRef: d.policyRef || "",
+      executionBackend: d.executionBackend || "job",
+      executionLifecycle: d.executionLifecycle || "one-shot",
+      borrowedTools: d.borrowedTools || [],
     });
     setStep(steps[0]);
     setChannelActionIdx(0);
@@ -752,6 +1028,15 @@ export function OnboardingWizard({
       resetWith(defaults || {});
     }
   }, [open, defaultsKey]);
+
+  // Apply a preselected runtime once the runtime list finishes loading, without
+  // discarding input the user has already entered (for example the Agent name).
+  useEffect(() => {
+    if (!open || !defaultRuntimeRef) return;
+    setForm((current) =>
+      current.runtimeRef ? current : { ...current, runtimeRef: defaultRuntimeRef },
+    );
+  }, [open, defaultRuntimeRef]);
 
   const titleIcon =
     mode === "agent" ? (
@@ -797,7 +1082,9 @@ export function OnboardingWizard({
             {mode === "canary"
               ? "Choose a provider and model for the system health canary."
               : mode === "agent"
-                ? "Configure a new Agent with provider, model, and skills."
+                ? creationKind === "agent"
+                  ? "Create an ongoing Agent. Choose an execution plane, then its harness or its own model backend."
+                  : "Configure an Agent for one-shot runs with a provider, model, and SkillPacks."
                 : "Configure provider, model, skills, and channels to activate this ensemble."}
           </DialogDescription>
         </DialogHeader>
@@ -830,8 +1117,123 @@ export function OnboardingWizard({
           </div>
         )}
 
+        {/* ── Execution step (Agent only) ───────────────────────────── */}
+        {step === "runtime" && (
+          <div className="space-y-4">
+            <div>
+              <Label>Choose a persistent harness</Label>
+              <p className="mt-1 text-xs text-muted-foreground">
+                Pi and Hermes keep a persistent conversation and workspace. Choose the harness for this Agent.
+              </p>
+            </div>
+            <Select
+              value={form.runtimeRef || ""}
+              onValueChange={(value) => {
+                const runtimeRef = value;
+                const isDefaultCatalog = persistentRuntimes.some((runtime) => runtime.metadata.name === runtimeRef && runtime.metadata.labels?.["sympozium.ai/harness-example"] === "true");
+                setForm({
+                  ...form,
+                  runtimeRef,
+                  skills: form.skills.filter((skill) => !harnessIncompatibleSkills.includes(skill)),
+                  policyRef: runtimeRef && isDefaultCatalog ? "harness-examples" : runtimeRef ? form.policyRef : "",
+                });
+              }}
+            >
+              <SelectTrigger className="min-w-0"><SelectValue placeholder="Choose Pi or Hermes" /></SelectTrigger>
+              <SelectContent>
+                {persistentRuntimes.map((runtime) => (
+                  <SelectItem key={runtime.metadata.name} value={runtime.metadata.name}>
+                    {`${persistentHarnessName(runtime)} — persistent chat`}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            {form.runtimeRef ? (
+              <div className="rounded-lg border border-amber-500/30 bg-amber-500/5 p-3 text-xs text-muted-foreground">
+                <span className="font-medium text-foreground">Harness selected: {selectedRuntime ? persistentHarnessName(selectedRuntime) || selectedRuntime.metadata.name : form.runtimeRef}.</span>{" "}
+                Your conversation runs in a persistent Kubernetes session.
+              </div>
+            ) : (
+              <div className="rounded-lg border border-border/60 bg-muted/30 p-3 text-xs text-muted-foreground">
+                Choose Pi or Hermes to continue. Install the default persistent runtimes if none are listed.
+              </div>
+            )}
+            {form.runtimeRef && !availablePolicies.some((policy) => policy.metadata.name === form.policyRef) && (
+              <p className="text-xs text-amber-500">The selected harness needs an approving policy. Install the default harnesses for this namespace, or ask an administrator to provide one.</p>
+            )}
+
+          </div>
+        )}
+
+        {step === "plane" && <div className="space-y-3">
+            <div className="space-y-2" data-testid="create-agent-execution-environment">
+              <Label>Execution plane</Label>
+              <p className="text-xs text-muted-foreground">Celln runs a persistent hardware-isolated native parent. Kubernetes runs a persistent Pi or Hermes session.</p>
+              <PlanePicker
+                kind="harness"
+                value={form.executionBackend || "job"}
+                disabledPlanes={fleetAvailable ? [] : ["celln"]}
+                disabledHint={{ celln: "Needs the Celln fleet (sympozium install --celln-fleet …); the one-shot router alone does not run parents" }}
+                onChange={(plane) => {
+                  if (plane === form.executionBackend) return;
+                  setCellnRoute(undefined);
+                  setCellnKey({ mode: "create", apiKey: "" });
+                  setCellnFailure(null);
+                  setForm({
+                    ...form,
+                    // The Celln runtime is the fleet's, bound on completion.
+                    runtimeRef: plane === "celln" ? "" : persistentRuntimes.some((runtime) => runtime.metadata.name === form.runtimeRef) ? form.runtimeRef : "",
+                    skills: plane === "celln" ? [] : form.skills,
+                    borrowedTools: [],
+                    executionBackend: plane,
+                    executionLifecycle: plane === "celln" ? "enduring" : "one-shot",
+                    modelConnectionRef: undefined,
+                    // A Celln provider and model come from a declared route only.
+                    provider: plane === "celln" ? "" : form.provider || "openai",
+                    model: plane === "celln" ? "" : form.model || "gpt-4o",
+                    apiKey: plane === "celln" ? "" : form.apiKey,
+                    secretName: plane === "celln" ? "" : form.secretName,
+                    baseURL: plane === "celln" ? "" : form.baseURL,
+                    modelRef: plane === "celln" ? undefined : form.modelRef,
+                    agentSandboxEnabled: plane === "celln" ? false : form.agentSandboxEnabled,
+                    channels: plane === "celln" ? [] : form.channels,
+                    heartbeatInterval: plane === "celln" ? "" : form.heartbeatInterval,
+                  });
+                }}
+              />
+              {form.executionBackend === "job" && persistentRuntimes.length === 0 && (
+                <p role="status" className="text-xs text-amber-500">No persistent Pi or Hermes harness is installed in this namespace. Install the default harnesses{fleetAvailable ? ", or choose Celln parent" : ""}.</p>
+              )}
+              {!fleetAvailable && !platformProfiles.isLoading && (
+                <p role="status" className="text-xs text-amber-500">The <strong>Celln parent</strong> plane runs the native harness inside a hardware-isolated cell on the Celln fleet. This cluster has no fleet this namespace may use yet: the plain install only deploys the one-shot router that powers <strong>New Run → Celln cell</strong>. An operator installs the fleet with <code className="break-all">sympozium install --celln-fleet …</code>; nodes with KVM join by themselves. See the <a className="underline" href="https://github.com/sympozium-ai/sympozium/blob/main/docs/guides/celln-fleet-installation.md" target="_blank" rel="noreferrer">fleet installation guide</a>. Pi and Hermes run on the Kubernetes plane.</p>
+              )}
+              {form.executionBackend === "celln" && (
+                <div className="space-y-2 rounded-md border p-3">
+                  <Label>Enduring Celln parent</Label>
+                  <p className="text-xs text-muted-foreground">
+                    This Agent owns its model backend: next you choose a provider the operator declared for this namespace, give the Agent its own key, and pick one of the declared models. Nothing is shared with another Agent. The conversation is chat only: SkillPacks, borrowed tools, channels and heartbeats are not part of a Celln Agent. {capabilities?.celln?.available ? capabilities.celln.reason : `Celln readiness: ${capabilities?.celln?.state || "unknown"} — ${capabilities?.celln?.reason || "not confirmed"}.`}
+                  </p>
+                </div>
+              )}
+            </div>
+
+        </div>}
+
         {/* ── Provider step ─────────────────────────────────────────── */}
-        {step === "provider" && (
+        {step === "provider" && celln && (
+          <CellnRouteStep
+            mediation={mediation.data}
+            isLoading={mediation.isLoading}
+            error={mediation.isError ? (mediation.error instanceof Error ? mediation.error.message : "request failed") : undefined}
+            providers={PROVIDERS}
+            selected={cellnRoute}
+            onSelect={chooseCellnRoute}
+          />
+        )}
+        {step === "provider" && celln && cellnRoute && !cellnProfile && !platformProfiles.isLoading && (
+          <p role="alert" className="text-xs text-red-400">No fleet runtime profile of policy <code>{cellnRoute.policy}</code> is offered to this namespace, so an Agent on this provider could not run. Ask the operator to check the policy with <code>sympozium doctor</code>.</p>
+        )}
+        {step === "provider" && !celln && (
           <div className="space-y-4">
             <div className="space-y-2">
               <Label>AI Provider</Label>
@@ -848,6 +1250,7 @@ export function OnboardingWizard({
                       setUsingLocalModel(true);
                       setForm({
                         ...form,
+                        modelConnectionRef: undefined,
                         provider: "openai",
                         model: model.metadata.name,
                         baseURL: model.status?.endpoint || "",
@@ -861,6 +1264,7 @@ export function OnboardingWizard({
                     const prov = PROVIDERS.find((p) => p.value === v);
                     setForm({
                       ...form,
+                      modelConnectionRef: undefined,
                       provider: v,
                       model: form.model || prov?.defaultModel || "",
                       baseURL: prov?.defaultBaseURL || "",
@@ -891,7 +1295,7 @@ export function OnboardingWizard({
                       ))}
                     </>
                   )}
-                  {PROVIDERS.map((p) => (
+                  {providerChoices.map((p) => (
                     <SelectItem key={p.value} value={p.value}>
                       <span className="flex items-center gap-2">
                         <p.icon className="h-4 w-4 shrink-0" />
@@ -946,7 +1350,15 @@ export function OnboardingWizard({
             {(form.provider === "azure-openai" ||
               (isLocalProvider && inferenceMode === "workload")) && (
               <div className="space-y-2">
-                <Label>Base URL</Label>
+                <Label className="flex items-center gap-1.5">
+                  Base URL
+                  <span
+                    className="inline-flex"
+                    title="API base URL. Sympozium assumes the OpenAI-compatible /v1/chat/completions path (Anthropic uses /v1/messages). A full request URL is accepted as-is."
+                  >
+                    <Info className="h-3.5 w-3.5 text-muted-foreground" />
+                  </span>
+                </Label>
                 <Input
                   value={form.baseURL}
                   onChange={(e) =>
@@ -954,14 +1366,23 @@ export function OnboardingWizard({
                   }
                   placeholder={
                     form.provider === "ollama"
-                      ? "http://ollama.default.svc:11434/v1"
+                      ? "http://ollama.default.svc:11434"
                       : form.provider === "lm-studio"
                         ? "http://localhost:1234/v1"
                         : form.provider === "unsloth"
                           ? "http://localhost:8080/v1"
-                          : "https://your-endpoint.openai.azure.com/v1"
+                          : form.provider === "custom"
+                            ? "http://your-host:8080/v1"
+                            : "https://your-endpoint.openai.azure.com/v1"
                   }
                 />
+                {form.provider === "custom" && (
+                  <p className="text-xs text-muted-foreground">
+                    API base URL of your OpenAI-compatible provider. The
+                    <code className="mx-1 rounded bg-muted px-1">/v1/chat/completions</code>
+                    path is assumed.
+                  </p>
+                )}
               </div>
             )}
 
@@ -1070,13 +1491,24 @@ export function OnboardingWizard({
         {step === "apikey" && (
           <ScrollArea className="max-h-[60vh]">
             <div className="space-y-4">
+              {celln ? (
+                cellnRoute && <CellnKeyStep route={cellnRoute} value={cellnKey} onChange={setCellnKey} managedSecretName={managedSecretName(modelConnectionName(form.name), cellnRoute.provider)} />
+              ) : (
+                <>
               {form.provider !== "bedrock" &&
                 form.provider !== "ollama" &&
                 form.provider !== "lm-studio" &&
                 form.provider !== "llama-server" &&
                 form.provider !== "unsloth" && (
                   <div className="space-y-2">
-                    <Label>API Key</Label>
+                    <Label>
+                      API Key
+                      {form.provider === "custom" && (
+                        <span className="text-muted-foreground font-normal">
+                          {" "}(optional)
+                        </span>
+                      )}
+                    </Label>
                     <Input
                       type="password"
                       value={form.apiKey}
@@ -1087,8 +1519,9 @@ export function OnboardingWizard({
                       autoComplete="off"
                     />
                     <p className="text-xs text-muted-foreground">
-                      A Kubernetes Secret will be created automatically from
-                      this key. Also used to fetch available models.
+                      {form.provider === "custom"
+                        ? "Optional for endpoints that require authentication. Leave blank for unauthenticated local servers."
+                        : "A Kubernetes Secret will be created automatically from this key. Also used to fetch available models."}
                     </p>
                   </div>
                 )}
@@ -1170,12 +1603,29 @@ export function OnboardingWizard({
                   auto-create one from the credentials above.
                 </p>
               </div>
+                </>
+              )}
             </div>
           </ScrollArea>
         )}
 
         {/* ── Model step ────────────────────────────────────────────── */}
-        {step === "model" && (
+        {step === "model" && celln && cellnRoute && (
+          <CellnModelStep
+            route={cellnRoute}
+            model={form.model}
+            onModel={(model) => setForm({ ...form, model })}
+            origin={cellnOrigin}
+            onOrigin={setCellnOrigin}
+            path={cellnPath}
+            onPath={setCellnPath}
+            parameters={cellnParameters}
+            onParameters={setCellnParameters}
+            maxOutputTokens={cellnMaxOutputTokens}
+            onMaxOutputTokens={setCellnMaxOutputTokens}
+          />
+        )}
+        {step === "model" && !celln && (
           <div className="space-y-2">
             <ModelSelector
               provider={form.provider}
@@ -1211,8 +1661,14 @@ export function OnboardingWizard({
           <ScrollArea className="max-h-[60vh]">
             <div className="space-y-3">
               <p className="text-sm text-muted-foreground">
-                Select SkillPacks to attach.
+                {creationKind === "agent"
+                  ? "Select SkillPacks to attach. Skills that require host access are excluded from this harness."
+                  : "Select SkillPacks to attach to this one-shot Agent."}
               </p>
+              {form.runtimeRef && <div className="space-y-2 rounded border p-3 text-sm" data-testid="borrowed-tool-availability">
+                <p className="font-medium">Borrowed tools (Celln)</p>
+                <p className="text-xs text-muted-foreground">The installed Pi and Hermes harnesses use Kubernetes sessions and cannot borrow native Celln tools. Use compatible SkillPacks here. For an existing native Celln Agent, select tools under Agent → Harness → Approved borrowed tools.</p>
+              </div>}
               {availableSkills.length === 0 ? (
                 <p className="rounded-md border border-border/50 bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
                   No SkillPacks found in cluster.
@@ -1225,13 +1681,15 @@ export function OnboardingWizard({
                       .map((skill) => {
                         const selected = form.skills.includes(skill);
                         const locked = skill === "memory";
+                        const incompatible = !!form.runtimeRef && harnessIncompatibleSkills.includes(skill);
+                        const disabled = incompatible ? !selected : locked;
                         return (
                           <button
                             key={skill}
                             type="button"
-                            disabled={locked}
+                            disabled={disabled}
                             onClick={() => {
-                              if (locked) return;
+                              if (disabled) return;
                               const next = selected
                                 ? form.skills.filter((s) => s !== skill)
                                 : [...form.skills, skill];
@@ -1239,7 +1697,9 @@ export function OnboardingWizard({
                             }}
                             className={cn(
                               "flex w-full items-center justify-between rounded-md border px-2.5 py-2 text-left text-xs transition-colors",
-                              locked
+                              incompatible && !selected
+                                ? "border-transparent text-muted-foreground opacity-60 cursor-not-allowed"
+                                : locked
                                 ? "border-blue-500/40 bg-blue-500/15 text-blue-300 opacity-70 cursor-not-allowed"
                                 : selected
                                   ? "border-blue-500/40 bg-blue-500/15 text-blue-300"
@@ -1250,6 +1710,8 @@ export function OnboardingWizard({
                             <span className="text-[10px]">
                               {locked
                                 ? "Required"
+                                : incompatible
+                                  ? selected ? "Remove incompatible skill" : "Not compatible with harnesses"
                                 : selected
                                   ? "Selected"
                                   : "Select"}
@@ -1602,6 +2064,27 @@ export function OnboardingWizard({
                   <span className="font-mono text-blue-400">{form.name}</span>
                 </div>
               )}
+              {mode === "agent" && <div className="space-y-2" data-testid="execution-confirmation">
+                <p>Execution plane: {celln ? "Celln" : "Kubernetes"}</p>
+                {!celln && form.runtimeRef && <p>Model connection: {form.provider} / {form.model} (saved for this harness)</p>}
+                {celln && cellnRoute && <div className="space-y-1 text-xs" data-testid="celln-own-key-confirmation">
+                  <p className="text-sm">This Agent's own model backend</p>
+                  <p>Provider: {cellnRoute.provider} ({cellnRoute.protocol}), declared in policy <code>{cellnRoute.policy}</code></p>
+                  <p>Endpoint: <span className="break-all font-mono">{cellnOrigin}{cellnPath}</span></p>
+                  <p>Key: {cellnRoute.auth === "none" ? "Not required — keyless route" : cellnKey.mode === "create"
+                    ? <>a new Secret <code>{cellnSecretName}</code> holding <code>{cellnRoute.secretKey}</code></>
+                    : <>existing Secret <code>{cellnKey.secretName}</code> (<code>{cellnRoute.secretKey}</code>)</>}</p>
+                  <p>Model connection: <code>{modelConnectionName(form.name)}</code>{cellnParsedTokens.maxOutputTokens ? `, up to ${cellnParsedTokens.maxOutputTokens} output tokens per request` : ""}{cellnParsedParameters.parameters ? ", with model parameters" : ""}</p>
+                  <p>Runtime: <code>{cellnProfile?.wrapper}</code> (the fleet's; created in this namespace if missing)</p>
+                  {cellnEnduring && <p className="text-muted-foreground">One conversation: {describeEnduringLimits(cellnEnduring)}. Chat only; context is lost with the parent.</p>}
+                </div>}
+              </div>}
+              {mode === "agent" && (
+                <div className="flex justify-between gap-4">
+                  <span className="text-muted-foreground">Execution</span>
+                  <span className="font-mono text-right">{celln ? cellnProfile?.wrapper || "Celln fleet runtime" : form.runtimeRef || "Built-in Agent runner"}</span>
+                </div>
+              )}
               {mode === "persona" && targetName && (
                 <div className="flex justify-between">
                   <span className="text-muted-foreground">Pack</span>
@@ -1612,10 +2095,10 @@ export function OnboardingWizard({
                 <span className="text-muted-foreground">Provider</span>
                 <span>{form.provider}</span>
               </div>
-              <div className="flex justify-between">
+              {!celln && <div className="flex justify-between">
                 <span className="text-muted-foreground">Secret</span>
                 <span className="font-mono">{form.secretName || "—"}</span>
-              </div>
+              </div>}
               <div className="flex justify-between">
                 <span className="text-muted-foreground">Model</span>
                 <span className="font-mono">{form.model}</span>
@@ -1740,7 +2223,13 @@ export function OnboardingWizard({
               onClose={() => setShowYaml(false)}
               yaml={
                 mode === "agent"
-                  ? instanceYamlFromWizard(form)
+                  ? celln && cellnRoute
+                    // Names only: the Secret is referenced, the key never appears.
+                    ? instanceYamlFromWizard(
+                        { ...form, runtimeRef: cellnProfile?.wrapper, secretName: cellnSecretName, enduringDefaults: cellnEnduring },
+                        ownKeyConnectionSpec({ route: cellnRoute, origin: cellnOrigin, path: cellnPath, model: form.model, parameters: cellnParsedParameters.parameters, maxOutputTokens: cellnParsedTokens.maxOutputTokens }, cellnSecretName),
+                      )
+                    : instanceYamlFromWizard(form)
                   : ensembleYamlFromWizard(
                       targetName || "<pack-name>",
                       form,
@@ -1799,6 +2288,13 @@ export function OnboardingWizard({
           </div>
         )}
 
+        {connectionError && (
+          <p role="alert" className="text-sm text-destructive">
+            {connectionError}
+          </p>
+        )}
+        {cellnFailure && <OwnKeyProgress steps={cellnFailure.steps} error={cellnFailure.error} />}
+
         {/* ── Navigation ────────────────────────────────────────────── */}
         <div className="flex items-center justify-between pt-2">
           <Button
@@ -1816,9 +2312,11 @@ export function OnboardingWizard({
               size="sm"
               className="gap-1 bg-primary hover:bg-primary/90 text-primary-foreground border-0"
               onClick={next}
-              disabled={isPending}
+              disabled={isPending || savingConnection}
             >
-              {isPending ? (
+              {savingConnection ? (
+                "Saving…"
+              ) : isPending ? (
                 "Working…"
               ) : (
                 <>

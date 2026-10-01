@@ -32,9 +32,41 @@ TEST_TIMEOUT=180 ./test/integration/test-write-file.sh
 # Use a pre-existing secret instead of OPENAI_API_KEY env var
 kubectl create secret generic inttest-openai-key --from-literal=OPENAI_API_KEY=sk-...
 ./test/integration/test-write-file.sh
+
+# Persistent AgentHarness: Pi and Hermes real chat, streaming, restart,
+# stop/resume, request audit, cancellation, idle timeout, failures, and cleanup
+OPENAI_API_KEY=... ./test/integration/test-persistent-harness-session.sh
 ```
 
+The scheduled Kind workflow runs that persistent suite against both maintained
+Pi and Hermes runtimes using a pinned Ollama image and a small model served
+inside the test cluster. It needs no external model credentials, and a failure
+in either adapter fails the scheduled workflow.
+
 ## How Integration Tests Work
+
+### Sandbox regression targeting
+
+`test/integration/test-agent-sandbox.sh` requires an explicit absolute
+`TEST_KUBECONFIG`, a `TEST_CONTEXT` beginning with `kind-`, and an existing dedicated
+`TEST_NAMESPACE` named `inttest-sandbox-*`. Review the selected kubeconfig endpoint;
+a context name alone is not cryptographic proof that a cluster is disposable.
+Set `TEST_CONTROLLER_DEPLOYMENT` and `SYMPOZIUM_NAMESPACE` when the qualified test
+controller differs from `sympozium-controller-manager` in `sympozium-system`.
+
+The operator must install the sandbox CRDs and enable the chosen controller in
+advance. This regression checks those prerequisites read-only; it does not install
+cluster-wide schemas or alter/restart a controller. Cleanup deletes this run's
+named AgentRuns/Agent/Secret and instance-labelled ConfigMaps, relying on existing
+finalizers and owner references for dependent Jobs/Sandbox CRs. It does not delete
+all sandbox resources with a shared component label. Cleanup failures fail the
+script rather than silently reporting success. The namespace is operator-owned
+and is not removed by the script.
+
+`go test -race ./test/integration` exercises fail-closed script targeting with a
+recording command stand-in. It is not evidence of deployed sandbox execution,
+gVisor/Kata isolation, webhook enforcement or model functionality. The deployed
+regression remains a separate prerequisite-qualified acceptance run.
 
 Each test follows the same pattern:
 

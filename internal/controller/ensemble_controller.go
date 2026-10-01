@@ -313,10 +313,12 @@ func (r *EnsembleReconciler) reconcileAgentConfig(
 		// existing Agents with no change here — the field-by-field form had to be
 		// extended for each one and drifted behind buildAgent (see #264).
 		//
-		// AgentSpec carries no out-of-band state, so nothing is carried over from
-		// the existing object. Fields buildAgent never sets are cleared; they are
-		// listed in agentFieldsNotExpressibleByEnsemble in ensemble_parity_test.go.
+		// Runtime selection and execution defaults are administrator-owned rather
+		// than persona-owned, so retain those out-of-band fields while converging
+		// every Ensemble-owned field to buildAgent's desired spec.
 		desired := r.buildAgent(pack, persona, instanceName, modelEndpoint)
+		desired.Spec.RuntimeRef = existingInst.Spec.RuntimeRef
+		desired.Spec.Execution = existingInst.Spec.Execution.DeepCopy()
 
 		needsUpdate := false
 		specDrifted := !reflect.DeepEqual(existingInst.Spec, desired.Spec)
@@ -592,6 +594,7 @@ func (r *EnsembleReconciler) buildAgent(
 					ProviderHeadersSecretRef: providerHeadersSecretRef,
 					AgentSandbox:             pack.Spec.AgentSandbox,
 					Lifecycle:                persona.Lifecycle,
+					Tolerations:              persona.Tolerations,
 					Subagents:                persona.Subagents,
 					Env:                      persona.Env,
 					RunTimeout:               persona.RunTimeout,
@@ -607,6 +610,7 @@ func (r *EnsembleReconciler) buildAgent(
 			Observability: defaultObservabilitySpec(),
 			Volumes:       pack.Spec.Volumes,
 			VolumeMounts:  pack.Spec.VolumeMounts,
+			Workspace:     resolveWorkspaceSpec(pack.Spec.Workspace, persona.Workspace),
 		},
 	}
 
@@ -913,6 +917,22 @@ func mergeProviderHeaders(ensembleHeaders, personaHeaders map[string]string) map
 		merged[k] = v
 	}
 	return merged
+}
+
+// resolveWorkspaceSpec picks the WorkspaceSpec to apply to a generated
+// Agent: the persona-level override wins when non-nil; otherwise the
+// ensemble-level default is used (which may itself be nil — meaning the
+// agent gets the legacy emptyDir behaviour).
+func resolveWorkspaceSpec(ensembleWS, personaWS *sympoziumv1alpha1.WorkspaceSpec) *sympoziumv1alpha1.WorkspaceSpec {
+	if personaWS != nil {
+		out := *personaWS
+		return &out
+	}
+	if ensembleWS != nil {
+		out := *ensembleWS
+		return &out
+	}
+	return nil
 }
 
 // buildChannelSpec computes the desired ChannelSpec for a given channel type
@@ -1245,10 +1265,10 @@ func (r *EnsembleReconciler) reconcileSharedMemory(ctx context.Context, log logr
 		}
 	} else {
 		// Already exists. The rest of the spec is deliberately left alone, but the
-		// token env is reconciled so enabling adminDelete (or pointing it at a
-		// different Secret), and the writer token after an upgrade, take effect
-		// without deleting the Deployment.
-		if err := syncMemoryServerEnv(ctx, r.Client, log, &existingDeploy); err != nil {
+		// image and token env are reconciled so a new image tag, enabling
+		// adminDelete (or pointing it at a different Secret), and the writer
+		// token after an upgrade take effect without deleting the Deployment.
+		if err := syncMemoryDeployment(ctx, r.Client, log, &existingDeploy, image); err != nil {
 			return err
 		}
 	}
@@ -1382,7 +1402,10 @@ func (r *EnsembleReconciler) deliverStimulus(ctx context.Context, log logr.Logge
 		return fmt.Errorf("stimulus target agent %q not found: %w", targetAgentName, err)
 	}
 
-	agentRun := BuildStimulusRun(ctx, r.Client, pack, &targetInst, targetPersona, triggerSource, time.Now())
+	agentRun, err := BuildStimulusRun(ctx, r.Client, pack, &targetInst, targetPersona, triggerSource, time.Now())
+	if err != nil {
+		return fmt.Errorf("stimulus execution defaults: %w", err)
+	}
 	runName := agentRun.Name
 
 	if err := r.Create(ctx, agentRun); err != nil {

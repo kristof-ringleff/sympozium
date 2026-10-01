@@ -128,8 +128,9 @@ func (r *AgentRunReconciler) injectSharedMemory(ctx context.Context, agentRun *s
 		)
 		// Only read-write personas get the writer token, so the shared memory
 		// server itself rejects writes from read-only personas. It goes into
-		// the agent container only, never into skill sidecars.
-		if accessMode != "read-only" {
+		// the agent container only, never into skill sidecars, and only when
+		// that container runs agent-runner (not a mode: harness image).
+		if accessMode != "read-only" && !taskModeReplacesAgentContainer(agentRun.Spec.Task) {
 			agent.Env = append(agent.Env,
 				memoryWriterTokenEnv(workflowMemoryWriterTokenEnvName, packName+"-shared-memory"))
 		}

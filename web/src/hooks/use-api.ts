@@ -1,5 +1,5 @@
-import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { api } from "@/lib/api";
+import { useInfiniteQuery, useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { api, type AgentRun } from "@/lib/api";
 import { toast } from "sonner";
 
 /** Show a user-friendly toast for mutation errors.  Network failures get a
@@ -63,6 +63,95 @@ export function useNamespaces() {
 
 export function useAgents() {
   return useQuery({ queryKey: ["agents"], queryFn: api.agents.list });
+}
+
+export function useRuntimes() {
+  return useQuery({ queryKey: ["runtimes"], queryFn: api.runtimes.list });
+}
+
+export function useCellnTools() {
+  return useQuery({ queryKey: ["celln-tools"], queryFn: api.cellnTools.list });
+}
+
+export function useClusterCellnTools() {
+  return useQuery({ queryKey: ["cluster-celln-tools"], queryFn: api.clusterCellnTools.list });
+}
+
+export function useModelConnections() {
+  return useQuery({ queryKey: ["model-connections"], queryFn: api.modelConnections.list });
+}
+
+export function useCellnPlatformProfiles(enabled = true) {
+  return useQuery({ queryKey: ["celln-platform-profiles"], queryFn: api.cellnPlatform.profiles, enabled });
+}
+
+/** Provider routes the operator declared for Agents that bring their own key. */
+export function useCellnMediation(enabled = true) {
+  return useQuery({ queryKey: ["celln-mediation"], queryFn: api.cellnPlatform.mediation, enabled, retry: false });
+}
+
+/** Names of Secrets in the namespace that already hold the given model key. */
+export function useCellnKeySecrets(key: string, enabled = true) {
+  return useQuery({ queryKey: ["celln-key-secrets", key], queryFn: () => api.cellnPlatform.keySecrets(key), enabled: enabled && !!key, retry: false });
+}
+
+export function useInstallDefaultRuntimes() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: api.runtimes.installDefaults,
+    onSuccess: (data) => {
+      qc.invalidateQueries({ queryKey: ["runtimes"] });
+      qc.invalidateQueries({ queryKey: ["policies"] });
+      const installed = data.copied.filter((name) => name.startsWith("runtime/")).length;
+      toast.success(installed ? `Installed ${installed} default harness${installed === 1 ? "" : "es"}` : "Default harnesses are already installed");
+    },
+    onError: toastError,
+  });
+}
+
+export function useHarnessSessions() {
+  return useQuery({ queryKey: ["harness-sessions"], queryFn: api.harnessSessions.list, refetchInterval: 3_000 });
+}
+
+export function useCreateHarnessSession() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: api.harnessSessions.create,
+    onSuccess: () => { qc.invalidateQueries({ queryKey: ["harness-sessions"] }); toast.success("Persistent chat requested — waiting for readiness"); },
+    onError: toastError,
+  });
+}
+
+export function useDeleteHarnessSession() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: api.harnessSessions.delete,
+    onSuccess: () => { qc.invalidateQueries({ queryKey: ["harness-sessions"] }); toast.success("Harness session stopped"); },
+    onError: toastError,
+  });
+}
+
+export function useSetHarnessSessionState() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ name, desiredState }: { name: string; desiredState: "running" | "stopped" }) => api.harnessSessions.setDesiredState(name, desiredState),
+    onSuccess: (_data, variables) => {
+      qc.invalidateQueries({ queryKey: ["harness-sessions"] });
+      toast.success(variables.desiredState === "running" ? "Persistent chat is starting" : "Persistent chat stopped");
+    },
+    onError: toastError,
+  });
+}
+
+export function useHarnessSessionChat() {
+  return useMutation({ mutationFn: ({ name, message }: { name: string; message: string }) => api.harnessSessions.chat(name, message), onError: toastError });
+}
+
+export function useHarnessSessionChatStream() {
+  return useMutation({
+    mutationFn: ({ name, message, onDelta }: { name: string; message: string; onDelta: (content: string) => void }) => api.harnessSessions.chatStream(name, message, onDelta),
+    onError: toastError,
+  });
 }
 
 export function useAgent(name: string) {
@@ -144,6 +233,51 @@ export function useCreateRun() {
       toast.success("Run created");
     },
     onError: toastError,
+  });
+}
+
+/**
+ * An enduring run's turn history, pinned to the run UID it was loaded for. The
+ * conversation view and the failure diagnosis share this one query, so the
+ * page polls the history once however many of them are mounted.
+ */
+export function useParentTurns(run: AgentRun, enabled = true) {
+  const uid = run.metadata.uid || "";
+  const namespace = run.metadata.namespace || "default";
+  return useInfiniteQuery({
+    queryKey: ["parent-turns", namespace, run.metadata.name, uid],
+    initialPageParam: "",
+    queryFn: async ({ pageParam }) => {
+      const page = await api.runs.turns(run.metadata.name, namespace, pageParam);
+      if (page.runUID !== uid) throw new Error("Run identity changed. Reload the run before continuing.");
+      return page;
+    },
+    getNextPageParam: (page) => page.continue || undefined,
+    enabled: enabled && Boolean(uid),
+    refetchInterval: 2000,
+  });
+}
+
+export function useContinueRun() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ name, namespace, uid }: { name: string; namespace: string; uid: string }) => api.runs.continue(name, namespace, uid),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["runs"] });
+      toast.success("Conversation restarted on a new parent");
+    },
+    onError: toastError,
+  });
+}
+
+/** Every fleet node's Celln cells (`celln ps -a`), refreshed while shown. */
+export function useCellnFleetCells(enabled = true) {
+  return useQuery({
+    queryKey: ["celln-fleet-cells"],
+    queryFn: api.cellnPlatform.cells,
+    enabled,
+    retry: false,
+    refetchInterval: 2000,
   });
 }
 
@@ -632,6 +766,19 @@ export function useClusterInfo() {
   });
 }
 
+/** Which cluster the console is talking to. Identity rarely changes, so this
+ *  polls far slower than the 5 s app default; a window refocus still refetches,
+ *  which is when a silently re-pointed port-forward is most likely noticed. */
+export function useCluster(refetchInterval = 60000) {
+  return useQuery({
+    queryKey: ["cluster", "identity"],
+    queryFn: api.cluster.get,
+    refetchInterval,
+    // Always stale, so every return to the tab re-checks the cluster.
+    staleTime: 0,
+  });
+}
+
 // ── Pods ─────────────────────────────────────────────────────────────────────
 
 export function usePods() {
@@ -760,6 +907,25 @@ export function useDraNodes() {
     queryKey: ["dra", "nodes"],
     queryFn: api.dra.nodes,
     refetchInterval: 30000,
+  });
+}
+
+// ── Accelerator power (energy collector) ─────────────────────────────────────
+
+/** Live per-accelerator power draw. Polls fast because watts are the one thing
+ * on these views that genuinely moves; the apiserver caches so this does not
+ * hammer the collector. Returns available:false when no collector is
+ * installed, and callers omit the power surface rather than showing 0 W.
+ *
+ * `enabled` is false when a caller supplies its own readings (the topology
+ * demo's simulation) — there is no cluster to ask, so don't ask it. Prefer
+ * usePowerIndex() in lib/power-context over calling this directly. */
+export function usePower(enabled = true) {
+  return useQuery({
+    queryKey: ["power", "fleet"],
+    queryFn: api.power.fleet,
+    refetchInterval: 2000,
+    enabled,
   });
 }
 

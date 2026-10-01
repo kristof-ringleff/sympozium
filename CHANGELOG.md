@@ -1,5 +1,618 @@
 # Changelog
 
+## [0.10.87](https://github.com/sympozium-ai/sympozium/compare/v0.10.86...v0.10.87) (2026-09-20)
+
+
+### Bug Fixes
+
+* **celln:** pin v0.5.28 for isolated starter runtimes ([4985084](https://github.com/sympozium-ai/sympozium/commit/4985084513216ba1e26ed4a723ad4ea230f749cf))
+* **celln:** pin v0.5.28 for isolated starter runtimes ([0dc600f](https://github.com/sympozium-ai/sympozium/commit/0dc600f0a438edf9d26487e698b3290003be0d63))
+
+## [0.10.86](https://github.com/sympozium-ai/sympozium/compare/v0.10.85...v0.10.86) (2026-09-20)
+
+
+### Features
+
+* **apiserver:** list key Secrets by name and grant a Celln Agent its connection's Secret ([3299376](https://github.com/sympozium-ai/sympozium/commit/3299376642106e9897e79f2ecd5e834dc41a682e))
+* **celln:** mediate explicitly approved keyless local models ([0110107](https://github.com/sympozium-ai/sympozium/commit/01101076bdc560400c13d0bec5dd534a656db69b))
+* **celln:** mediate explicitly approved keyless local models ([4576074](https://github.com/sympozium-ai/sympozium/commit/45760747d2d58c543d78b1bd3056f2f36151be0e))
+* **console:** create Celln agents with their own provider, key and model ([9eeaa15](https://github.com/sympozium-ai/sympozium/commit/9eeaa152f69311b0ab9428d212ed58cd97b46abc))
+* **console:** give Celln agents their own provider, key and model ([af67a57](https://github.com/sympozium-ai/sympozium/commit/af67a579be2f6522675fcc93d7c4a2eddf547b98))
+
+
+### Bug Fixes
+
+* **celln:** pin v0.5.27 for installed mediated runs ([e0e593f](https://github.com/sympozium-ai/sympozium/commit/e0e593f000f827d300af19be6f79e145987ccdd8))
+* **celln:** pin v0.5.27 for installed mediated runs ([5404447](https://github.com/sympozium-ai/sympozium/commit/5404447de6037e5c66108daeddf9088b983cf484))
+
+## [0.10.85](https://github.com/sympozium-ai/sympozium/compare/v0.10.84...v0.10.85) (2026-09-20)
+
+
+### Features
+
+* **apiserver:** carry the mediation record into added backends and expose it ([d9b6416](https://github.com/sympozium-ai/sympozium/commit/d9b6416660d42eee1a0b6225a3aa8025218e1118))
+* **celln:** admit an Agent's own Secret-backed connection on the mediated path ([2e99bba](https://github.com/sympozium-ai/sympozium/commit/2e99bbae7c3fa1fad2a6264ef077222ccf56f189))
+* **celln:** admit an Agent's own Secret-backed connection on the mediated path ([b1a2973](https://github.com/sympozium-ai/sympozium/commit/b1a2973dd5bea92132ee06b02b3f3637ea88a886))
+* **celln:** declare which providers Agents may bring their own key for ([462f838](https://github.com/sympozium-ai/sympozium/commit/462f8387ca4cb71e75defcca80b00675be96539c))
+* **celln:** install mediated model access from the chart behind one switch ([aa471af](https://github.com/sympozium-ai/sympozium/commit/aa471af9c7f3c6e2faff5feeea9d5bfa2743995f))
+* **celln:** install mediated model access from the chart behind one switch ([4830920](https://github.com/sympozium-ai/sympozium/commit/483092018db093b42871a8b1759942212fdd5a59)), closes [#611](https://github.com/sympozium-ai/sympozium/issues/611)
+* **celln:** let the operator declare mediated routes at install ([c4a3b4b](https://github.com/sympozium-ai/sympozium/commit/c4a3b4b03cc233ddb012b64f7b5c97c28db626a9))
+* **doctor:** report mediated model access ([3043e0d](https://github.com/sympozium-ai/sympozium/commit/3043e0dd777885de76665d9cdd41fb54b26e8513))
+* **gateway:** per-connection request policy on ModelConnection ([240eab4](https://github.com/sympozium-ai/sympozium/commit/240eab4f8ad9cde403ca23422b3fdf4d8269f16a))
+* **gateway:** per-connection request policy on ModelConnection ([d841853](https://github.com/sympozium-ai/sympozium/commit/d84185368f4ee9f3acb8bb53f8743f5d2a2e811a))
+
+
+### Bug Fixes
+
+* **celln:** pin Celln v0.5.26 ([09dc2ea](https://github.com/sympozium-ai/sympozium/commit/09dc2eaf601fbd7dd7d8b76fd9e68e7a16161bec))
+* **celln:** pin Celln v0.5.26 (mediated native parents: scoped receiver, per-operation output cap, starter parent request) ([619e980](https://github.com/sympozium-ai/sympozium/commit/619e980e42316b7adeaa604df70b0f937cf7a39e))
+
+## [0.10.84](https://github.com/sympozium-ai/sympozium/compare/v0.10.83...v0.10.84) (2026-09-20)
+
+
+### Bug Fixes
+
+* **celln:** let a fleet backend's turn lifetime follow its output-token cap ([8000d51](https://github.com/sympozium-ai/sympozium/commit/8000d5166723ee9e318847abe2e5bece828c954a))
+* **celln:** let a fleet backend's turn lifetime follow its output-token cap ([f020d3e](https://github.com/sympozium-ai/sympozium/commit/f020d3eb902ef5d9b15090017f379de0251cd2e7))
+* **celln:** pin Celln v0.5.25 ([2f3698e](https://github.com/sympozium-ai/sympozium/commit/2f3698e02c0d8ccab004ab7d9d1bfd4cfece1fbe))
+* **celln:** pin Celln v0.5.25 (worker turn lifetime follows the output-token cap) ([676da52](https://github.com/sympozium-ai/sympozium/commit/676da52bdbf5ded0cb0d2da448f20b2d10bab584))
+
+## [0.10.83](https://github.com/sympozium-ai/sympozium/compare/v0.10.82...v0.10.83) (2026-09-19)
+
+
+### Features
+
+* **celln:** max output tokens per request for fleet backends ([97d8eca](https://github.com/sympozium-ai/sympozium/commit/97d8ecac4c25bdfb504c2d1cff971e8f8191c635))
+* **celln:** output tokens per request for fleet backends ([a6e8880](https://github.com/sympozium-ai/sympozium/commit/a6e8880932150aaa23885a59faaf193a824d6326))
+
+
+### Bug Fixes
+
+* **celln:** a failed first turn no longer ends the conversation ([b1dcbc9](https://github.com/sympozium-ai/sympozium/commit/b1dcbc9614a61569f74c3887560df92f725f9bdc))
+* **celln:** keep a conversation open after a failed initial turn ([096bbfc](https://github.com/sympozium-ai/sympozium/commit/096bbfcc936f323331833d2f8ab064b06dd83b5b))
+
+## [0.10.82](https://github.com/sympozium-ai/sympozium/compare/v0.10.81...v0.10.82) (2026-09-19)
+
+
+### Features
+
+* **celln:** model parameters for fleet backends ([cae4cce](https://github.com/sympozium-ai/sympozium/commit/cae4cce07754aa8aac16601db07a62d1598326ba))
+* **celln:** model parameters for fleet backends ([e5f440b](https://github.com/sympozium-ai/sympozium/commit/e5f440b8e6911ddd2e5b5f1114e9bbefe6bdfcb2))
+
+## [0.10.81](https://github.com/sympozium-ai/sympozium/compare/v0.10.80...v0.10.81) (2026-09-19)
+
+
+### Features
+
+* **celln:** list fleet cells through the gateway, falling back to node reports ([48e35db](https://github.com/sympozium-ai/sympozium/commit/48e35db99dbd53d8aab51515895e079c8a4180c2))
+* **celln:** list fleet cells through the gateway, falling back to node reports ([35ef5eb](https://github.com/sympozium-ai/sympozium/commit/35ef5ebb1dded550cc5f1186eeb594c829d90ee9)), closes [#591](https://github.com/sympozium-ai/sympozium/issues/591)
+* **celln:** match Celln v0.5.22's conversation limits, and pin it ([730f4a6](https://github.com/sympozium-ai/sympozium/commit/730f4a6192254b76148ef196c990150ebe0bb7bb))
+* **celln:** match the widened enduring-conversation bounds ([a90b876](https://github.com/sympozium-ai/sympozium/commit/a90b87693e1decf0c08eb7600cce1b4828075ea7)), closes [#591](https://github.com/sympozium-ai/sympozium/issues/591)
+* **cli:** sympozium doctor and an install preflight for used machines ([d379a06](https://github.com/sympozium-ai/sympozium/commit/d379a06b0480b64b1605ea998202acd4f07bac6a))
+* **cli:** sympozium doctor and an install preflight for used machines ([d27db72](https://github.com/sympozium-ai/sympozium/commit/d27db72bf3940124b05c2da2d1cbfbb952d3cafe))
+* **web:** explain why a run failed, and what to do about it ([db2a023](https://github.com/sympozium-ai/sympozium/commit/db2a023577bff9bb174b46f1d1d9a0e7e4f182d1))
+* **web:** explain why a run failed, and what to do about it ([e2fa476](https://github.com/sympozium-ai/sympozium/commit/e2fa4768aacee5e2efe98582c44e0a4fadd9b3d9))
+* **web:** say which cluster the console is connected to ([9660d27](https://github.com/sympozium-ai/sympozium/commit/9660d27d65e9af3619f3801fc83a7940bd3dae9d))
+* **web:** say which cluster the console is connected to ([4217c10](https://github.com/sympozium-ai/sympozium/commit/4217c108ec6bdf17dde756c9db8e57c073759bcb)), closes [#591](https://github.com/sympozium-ai/sympozium/issues/591)
+
+
+### Bug Fixes
+
+* **release:** republish the Celln starter package when its inputs are unchanged ([9714173](https://github.com/sympozium-ai/sympozium/commit/9714173529693e7346f1e022bdcd3df78c4b621f))
+* **release:** republish the Celln starter package when its inputs are unchanged ([326490d](https://github.com/sympozium-ai/sympozium/commit/326490dd70bf0e55418cddbab1174caec9b5cc2d)), closes [#591](https://github.com/sympozium-ai/sympozium/issues/591)
+* **web:** make the Create Agent wizard fleet-aware ([91f659d](https://github.com/sympozium-ai/sympozium/commit/91f659d4a67a051b6c6de41ce432c4a920985fb2))
+* **web:** make the Create Agent wizard fleet-aware ([470e16d](https://github.com/sympozium-ai/sympozium/commit/470e16d68d75173cae564e40a9d37c8f590f6973)), closes [#591](https://github.com/sympozium-ai/sympozium/issues/591)
+
+## [0.10.80](https://github.com/sympozium-ai/sympozium/compare/v0.10.79...v0.10.80) (2026-09-17)
+
+
+### Bug Fixes
+
+* **web:** choose a fleet backend once, and keep the wizard inside its dialog ([fe215a7](https://github.com/sympozium-ai/sympozium/commit/fe215a72eceadc4a04f6849ce44cb5c31bce34d9))
+* **web:** choose a fleet backend once, and keep the wizard inside its dialog ([aa550a4](https://github.com/sympozium-ai/sympozium/commit/aa550a4532b543ea6598c4aedabee60e5c40e39a))
+
+## [0.10.79](https://github.com/sympozium-ai/sympozium/compare/v0.10.78...v0.10.79) (2026-09-17)
+
+
+### Features
+
+* **web:** celln ps per node, cells on the topology and Celln persistent chats ([a20e748](https://github.com/sympozium-ai/sympozium/commit/a20e748649f520094dc13dec4114482151a8b7fb))
+* **web:** celln ps per node, cells on the topology and Celln persistent chats ([984101c](https://github.com/sympozium-ai/sympozium/commit/984101c875f9916760cd418c04706240fc990beb))
+
+
+### Bug Fixes
+
+* **celln:** move an installed fleet to a new starter package ([07ba1b0](https://github.com/sympozium-ai/sympozium/commit/07ba1b04433840f65d56be2d79d1a65a1542a861))
+* **celln:** move an installed fleet to a new starter package ([1e1520a](https://github.com/sympozium-ai/sympozium/commit/1e1520acdb4d4fd6fdf33f0ac7f560d64e6b6d80))
+* **celln:** stop continuing a continuation that is lost again at once ([1894d78](https://github.com/sympozium-ai/sympozium/commit/1894d78017ef7b1339109ef2dbb6af6531a936f5))
+* **celln:** stop continuing a continuation that is lost again at once ([5565633](https://github.com/sympozium-ai/sympozium/commit/55656335e58be44b98c08de0e72ea180c8372091))
+
+## [0.10.78](https://github.com/sympozium-ai/sympozium/compare/v0.10.77...v0.10.78) (2026-09-16)
+
+
+### Features
+
+* **celln:** accept a bare server address and detect its model ([17c358b](https://github.com/sympozium-ai/sympozium/commit/17c358b0c52b40b9fb6e82297e2d4e2ccc158200))
+* **web:** pick a Celln parent's provider like the Kubernetes plane ([7817747](https://github.com/sympozium-ai/sympozium/commit/78177479abb085064a3a213047911401e7c463d5))
+
+
+### Bug Fixes
+
+* **celln:** drop meaningless dispatcher nodeSelector, self-provision state dir ([6efddfb](https://github.com/sympozium-ai/sympozium/commit/6efddfbb224f6ef643f5e6f472a59777531b01f8))
+* **eventbus:** survive NATS being unavailable at startup and consumer reaping ([7b0406b](https://github.com/sympozium-ai/sympozium/commit/7b0406b04a579379476b65d4ea5b45dbe2033594))
+* **web:** Celln tool grid, provider picker and llama-server auto-detect ([fee3d49](https://github.com/sympozium-ai/sympozium/commit/fee3d49678403bc9dd7de10468fdafb60ae45021))
+* **web:** scrollable tool grid and select all compatible Celln tools by default ([8883051](https://github.com/sympozium-ai/sympozium/commit/888305170b49be586ff455874613cb6c2ae54d1d))
+
+## [0.10.77](https://github.com/sympozium-ai/sympozium/compare/v0.10.76...v0.10.77) (2026-09-16)
+
+
+### Bug Fixes
+
+* **install:** say why a fleet wait is empty, and that Kind needs a kernel ([944668e](https://github.com/sympozium-ai/sympozium/commit/944668ef2fae8166489765566e78aa0be34d225b))
+* **install:** say why a fleet wait is empty, and that Kind needs a kernel ([cb70dee](https://github.com/sympozium-ai/sympozium/commit/cb70dee260b25462a4d2800b53d91f7539d7e3a5))
+* **install:** the Kind kernel copy is a Linux-host mitigation; KVM is already there ([1fb7d6c](https://github.com/sympozium-ai/sympozium/commit/1fb7d6c193a24665f39bf7c62b0c6fb8422bec70))
+
+## [0.10.76](https://github.com/sympozium-ai/sympozium/compare/v0.10.75...v0.10.76) (2026-09-16)
+
+
+### Features
+
+* **celln:** add a model backend from the API and UI ([56b604b](https://github.com/sympozium-ai/sympozium/commit/56b604b7a24c9c5cf8a2455bf1ae6f1f84f67be1))
+* **celln:** add a model backend from the API and UI ([ae83b72](https://github.com/sympozium-ai/sympozium/commit/ae83b722639a0e49cce74808cf396d52434fa45c))
+* **install:** ergoz comes with sympozium install ([25a5d20](https://github.com/sympozium-ai/sympozium/commit/25a5d206a735c7e3b8c5137cd0816c53d3c81675))
+* **install:** ergoz comes with sympozium install ([088538c](https://github.com/sympozium-ai/sympozium/commit/088538c32a2b0579c85cf5a170a3c83014bef3d1))
+
+## [0.10.75](https://github.com/sympozium-ai/sympozium/compare/v0.10.74...v0.10.75) (2026-09-15)
+
+
+### Features
+
+* **celln:** a conversation outlives its node — continue a lost parent elsewhere with its memory ([7a21e97](https://github.com/sympozium-ai/sympozium/commit/7a21e970fe0aa7f1ae6116725e3a8e64cc0cba56))
+* **celln:** a conversation outlives its node — continue a lost parent elsewhere with its memory ([b41f7f0](https://github.com/sympozium-ai/sympozium/commit/b41f7f083268180d01a8b6b305e81c8b33840473))
+
+## [0.10.74](https://github.com/sympozium-ai/sympozium/compare/v0.10.73...v0.10.74) (2026-09-15)
+
+
+### Features
+
+* **install:** every provider key in the environment becomes a backend ([4b4d464](https://github.com/sympozium-ai/sympozium/commit/4b4d4642cfcd5d5ae393be9a1b9ef10899cfc054))
+* **install:** every provider key in the environment becomes a backend ([63666c4](https://github.com/sympozium-ai/sympozium/commit/63666c468fdfb287153e6f76df2c1c82f2fde543))
+
+## [0.10.73](https://github.com/sympozium-ai/sympozium/compare/v0.10.72...v0.10.73) (2026-09-15)
+
+
+### Bug Fixes
+
+* **release:** find mke2fs and debugfs on Debian runners ([63ae579](https://github.com/sympozium-ai/sympozium/commit/63ae5797f54dce927877464d218f90ed45e14def))
+* **release:** find mke2fs and debugfs on Debian runners ([26e64f9](https://github.com/sympozium-ai/sympozium/commit/26e64f96666be5ba5a2977060ef0251d35328ddf))
+
+## [0.10.72](https://github.com/sympozium-ai/sympozium/compare/v0.10.71...v0.10.72) (2026-09-15)
+
+
+### Bug Fixes
+
+* **release:** build the starter package from relative paths ([f88bbb1](https://github.com/sympozium-ai/sympozium/commit/f88bbb17b355ddbbd72628ffc249ced5ce1a11d3))
+* **release:** build the starter package from relative paths ([5cdccd0](https://github.com/sympozium-ai/sympozium/commit/5cdccd02c1e7c531efffb712b8c75964f835bf62))
+
+## [0.10.71](https://github.com/sympozium-ai/sympozium/compare/v0.10.70...v0.10.71) (2026-09-15)
+
+
+### Bug Fixes
+
+* **ui:** say what enables the Celln parent plane ([55c7d03](https://github.com/sympozium-ai/sympozium/commit/55c7d03262f56cce50e61ad1501d9028e31c99fd))
+* **ui:** say what enables the Celln parent plane ([c193c6b](https://github.com/sympozium-ai/sympozium/commit/c193c6b6c41e9941d60ec65f49906bb10f63aa38))
+
+## [0.10.70](https://github.com/sympozium-ai/sympozium/compare/v0.10.69...v0.10.70) (2026-09-15)
+
+
+### Features
+
+* **celln:** eight brokered tools — run files listed, appended, searched, deleted; JSON posted ([6331b72](https://github.com/sympozium-ai/sympozium/commit/6331b72553a525526077ae330b5555f603ad6b8a))
+* **celln:** eight brokered tools — run files listed, appended, searched, deleted; JSON posted ([326158c](https://github.com/sympozium-ai/sympozium/commit/326158c664a24c5d954ee65d58978baaf1a9c665))
+
+## [0.10.69](https://github.com/sympozium-ai/sympozium/compare/v0.10.68...v0.10.69) (2026-09-15)
+
+
+### Features
+
+* **celln:** borrowed commands from pinned images as fleet tools ([6e2642f](https://github.com/sympozium-ai/sympozium/commit/6e2642f612f5853b0dcf940c7ec1c1b28ba99b39))
+* **celln:** borrowed commands from pinned images as fleet tools ([134bdc4](https://github.com/sympozium-ai/sympozium/commit/134bdc4482e7fb4280346fd79f4bc410554f6e05))
+
+## [0.10.68](https://github.com/sympozium-ai/sympozium/compare/v0.10.67...v0.10.68) (2026-09-15)
+
+
+### Features
+
+* **celln:** pick an Agent's fleet backend and answer once from the UI ([9ca6488](https://github.com/sympozium-ai/sympozium/commit/9ca64880d3a0605fa3d846f45206353a66b37468))
+* **celln:** pick an Agent's fleet backend and answer once from the UI ([0676ff5](https://github.com/sympozium-ai/sympozium/commit/0676ff5947462481181c2573b0b5d67f553460da))
+
+## [0.10.67](https://github.com/sympozium-ai/sympozium/compare/v0.10.66...v0.10.67) (2026-09-14)
+
+
+### Features
+
+* **celln:** probe every fleet backend with its key before installing ([d424d67](https://github.com/sympozium-ai/sympozium/commit/d424d67cf6deffc4a94a0a0ce51a735dfab0f9d8))
+* **celln:** probe every fleet backend with its key before installing ([48768b0](https://github.com/sympozium-ai/sympozium/commit/48768b0f17f8747adb7465f65943f7a4fcd4f60a))
+
+## [0.10.66](https://github.com/sympozium-ai/sympozium/compare/v0.10.65...v0.10.66) (2026-09-14)
+
+
+### Features
+
+* **celln:** add a model backend to a running fleet scope ([0291f2b](https://github.com/sympozium-ai/sympozium/commit/0291f2bf22e6626b151e0ac978abd6621cd11685))
+* **celln:** add a model backend to a running fleet scope ([6adf557](https://github.com/sympozium-ai/sympozium/commit/6adf557fc86f6aded0fb90fb809de1544ee9372d))
+* **celln:** one-shot runs on the fleet as single-turn parents ([89611a1](https://github.com/sympozium-ai/sympozium/commit/89611a13eceace226d38dad775f1c840b4713c02))
+* **celln:** one-shot runs on the fleet as single-turn parents ([9601fec](https://github.com/sympozium-ai/sympozium/commit/9601feca59a045cea439aa9eafffa53ea05b805d)), closes [#490](https://github.com/sympozium-ai/sympozium/issues/490)
+
+## [0.10.65](https://github.com/sympozium-ai/sympozium/compare/v0.10.64...v0.10.65) (2026-09-14)
+
+
+### Features
+
+* **celln:** long-running parents — day-long lease ceilings, session defaults, lease deadline in the UI ([d1e900a](https://github.com/sympozium-ai/sympozium/commit/d1e900aaf8101c2433dc001fda3d4bcc909665f2))
+* **celln:** long-running parents — day-long leases, session defaults, lease in the UI, capacity-aware placement ([3a70c96](https://github.com/sympozium-ai/sympozium/commit/3a70c963ecee96e406ed28e5234e33960060f1ab))
+* **celln:** several model backends per fleet scope ([949c432](https://github.com/sympozium-ai/sympozium/commit/949c432b60375e715e2ea5bf88ec46387807890e))
+* **celln:** several model backends per fleet scope ([3c91183](https://github.com/sympozium-ai/sympozium/commit/3c91183ca0fd60d9a978dacd309945bb856842ef)), closes [#535](https://github.com/sympozium-ai/sympozium/issues/535)
+
+
+### Bug Fixes
+
+* **chart:** NATS passwords never start with a digit ([562fe73](https://github.com/sympozium-ai/sympozium/commit/562fe731b191c5fad9e18c2860d4593496df1924))
+
+## [0.10.64](https://github.com/sympozium-ai/sympozium/compare/v0.10.63...v0.10.64) (2026-09-14)
+
+
+### Features
+
+* **celln:** choose the fleet's model backend — llama-server, OpenAI, Anthropic or DeepSeek ([8cce038](https://github.com/sympozium-ai/sympozium/commit/8cce038290feb962cdf07fb67bd1c43040f7b652))
+* **celln:** fleet model backends — llama-server, OpenAI, Anthropic, DeepSeek ([7566d1c](https://github.com/sympozium-ai/sympozium/commit/7566d1c2baf9f348f853fcaad964d734413897aa))
+* **celln:** policy routes approve plain-HTTP endpoints explicitly for node-held credentials ([cc6f537](https://github.com/sympozium-ai/sympozium/commit/cc6f53792011ae5d87f71ae070197e86799443cd))
+* **celln:** start many enduring conversations per Agent from the API and UI ([de2874d](https://github.com/sympozium-ai/sympozium/commit/de2874dd21c167ef7a2ce5e8fe15ac435a8e5052))
+* **celln:** start many enduring conversations per Agent from the API and UI ([2f749a2](https://github.com/sympozium-ai/sympozium/commit/2f749a2f3a6b1601d6b4c40b3f4bb1eb2f58f3fc))
+
+
+### Bug Fixes
+
+* **install:** Helm follows $KUBECONFIG like kubectl; drop symptom workarounds ([aedfb12](https://github.com/sympozium-ai/sympozium/commit/aedfb126ec0ff8110064b75e856cdbd78d84b9a7))
+* **install:** refresh Helm discovery after CRDs and always wait for cert-manager's webhook ([3142b5d](https://github.com/sympozium-ai/sympozium/commit/3142b5d517346691643d5cd3670178ff4aa787e8))
+* **install:** retry the cert-manager manifest download ([cfa6a06](https://github.com/sympozium-ai/sympozium/commit/cfa6a06bae54fef9f173e3749d88621e81350331))
+* **install:** retry the Helm release when an admission webhook is briefly unreachable ([510e49a](https://github.com/sympozium-ai/sympozium/commit/510e49a2ea8d0dab1046826e70af14c22ef14145))
+* **install:** wait for CRDs to be established and retry the Gateway API download ([96678a3](https://github.com/sympozium-ai/sympozium/commit/96678a3741aea728139c037aae821a4696520d58))
+
+## [0.10.63](https://github.com/sympozium-ai/sympozium/compare/v0.10.62...v0.10.63) (2026-09-14)
+
+
+### Features
+
+* **api,web:** tenant path for platform runtimes ([3799827](https://github.com/sympozium-ai/sympozium/commit/3799827f738c18fa532f1f360133c6c121263a49))
+* **celln:** allow an insecure development registry for the fleet package ([2a8f4ef](https://github.com/sympozium-ai/sympozium/commit/2a8f4efb70f5ca5f9b8e516373b4471fbe6e25a7))
+* **cellnauthority:** native provisioning material on runtime profiles and host-profile routes ([d795eaf](https://github.com/sympozium-ai/sympozium/commit/d795eaf7c06149bf9c8cca5c1a211212af4cc282))
+* **celln:** default-open namespace authorisation and on-demand tenant wrappers ([1f6acce](https://github.com/sympozium-ai/sympozium/commit/1f6acce7f69941c1ca3238605492a17b9513c85a))
+* **celln:** enduring parents from any authorised namespace (P0) ([f5abc12](https://github.com/sympozium-ai/sympozium/commit/f5abc1279a0cb17a5dca202be7aac5d99777d9dc))
+* **celln:** fleet installer stamps the platform catalogue and tenant wrappers ([68ea419](https://github.com/sympozium-ai/sympozium/commit/68ea4191c0d17ecc19079e9b05b6d230c6d870e9))
+* **celln:** fleet node defaults hold two parents ([46e2014](https://github.com/sympozium-ai/sympozium/commit/46e201451a7c6e42bb4fc974e0569f7fa9fcd360))
+* **celln:** fleet nodes size their capacity from node memory ([6a20f1c](https://github.com/sympozium-ai/sympozium/commit/6a20f1c0773538f421099f4b449475d99a635a3c))
+* **cellnparent:** platform-backed parent admission for any authorised namespace ([2e3a021](https://github.com/sympozium-ai/sympozium/commit/2e3a021d60f716943a2cef0ebf9889d5daea88a4))
+* **cellnparent:** provision parents through the Celln gateway ([9caf1d2](https://github.com/sympozium-ai/sympozium/commit/9caf1d2c085076ceb555fe5aae32c3bb10eec486))
+* **celln:** per-node native fleet — gateway-issued parents, label-to-join nodes ([9eabc23](https://github.com/sympozium-ai/sympozium/commit/9eabc23e3e455b10412102cc7a0d16cc3d423eda))
+* **celln:** per-node native fleet installed by labeling KVM nodes ([97168f9](https://github.com/sympozium-ai/sympozium/commit/97168f928d97735a370822e960131e7916d23df1))
+* **celln:** zero-ceremony namespaces, node-sized capacity, terminal refusals (P1a + P1b) ([f98fdf3](https://github.com/sympozium-ai/sympozium/commit/f98fdf337c8f0f49bbd3ab8d3fd6bbbf755a62f3))
+
+
+### Bug Fixes
+
+* 415: Gate sequential edges for subagent batch children ([#466](https://github.com/sympozium-ai/sympozium/issues/466)) ([2e8a8b8](https://github.com/sympozium-ai/sympozium/commit/2e8a8b816295b58b4113d761350de03687a2c389))
+* **celln:** a create the owner refuses is terminal and deletable ([a06152e](https://github.com/sympozium-ai/sympozium/commit/a06152e32f5004fab701311edd77ca3c31fd0fcc))
+* **celln:** a fleet parent holds two egress contexts; default egressSlots to maxCells ([4d9d43c](https://github.com/sympozium-ai/sympozium/commit/4d9d43ca3a99eee2cc7bfbded6ee46324f246006))
+* **cellnauthority:** a spec.model that mirrors the connection route is not an override ([027cfb5](https://github.com/sympozium-ai/sympozium/commit/027cfb596604a2eb40918478b31a00e7d715dc3c))
+* **cellnauthority:** compare the pinned connection revision with the value the controller pins ([9b042b8](https://github.com/sympozium-ai/sympozium/commit/9b042b896bbe32e05c29647cf395ddb4e61471f4))
+* **cellnparent:** admit native parents with the profile's per-turn allowance and retry from the pinned choice ([929ce6b](https://github.com/sympozium-ai/sympozium/commit/929ce6b08b7f5d7dd5029ced4b994a715ac1da43))
+* **cellnparent:** treat an owner that left the plane as context loss ([298682c](https://github.com/sympozium-ai/sympozium/commit/298682cdc499e763a8e2269022b0133e16cfcb57))
+* **celln:** publish fleet trust after the chart creates celln-system ([9854fa9](https://github.com/sympozium-ai/sympozium/commit/9854fa9fd4c523b44258e26404b6a1957b6850c4))
+* **celln:** wait for the controller rollout before binding the fleet catalogue ([4504be0](https://github.com/sympozium-ai/sympozium/commit/4504be0d90ea8adf575f4dee79bd0e76ecfd05df))
+* **controller:** route legacy enduring selections to the prepared parent path ([a69f82c](https://github.com/sympozium-ai/sympozium/commit/a69f82ceeadd8d2343e0b92adccb94e05eb6d960))
+* **controller:** serve AgentRunTurn on the unified native parent path ([127dab7](https://github.com/sympozium-ai/sympozium/commit/127dab77b71d7c707526890e83dabb69c505cba8))
+
+## [0.10.62](https://github.com/sympozium-ai/sympozium/compare/v0.10.61...v0.10.62) (2026-09-13)
+
+
+### Features
+
+* **celln:** add durable atomic model-budget ledger ([#503](https://github.com/sympozium-ai/sympozium/issues/503)) ([b6349b5](https://github.com/sympozium-ai/sympozium/commit/b6349b5d5e88d58dbd81230dad1c942567dcc4f9))
+* **celln:** add read-only migration identity inventory and drain boundaries ([c9a4bf2](https://github.com/sympozium-ai/sympozium/commit/c9a4bf2972543a93db237941f622f62dbec50089))
+* **celln:** add shared catalogue and execution-policy API ([#497](https://github.com/sympozium-ai/sympozium/issues/497)) ([d7419d5](https://github.com/sympozium-ai/sympozium/commit/d7419d502b884b1ab1456be2d7b9f25ee1fcce13))
+* **celln:** add TLS gateway process and PostgreSQL isolation tests ([9108629](https://github.com/sympozium-ai/sympozium/commit/910862916f70046bc071179a13531ff14c7acef0))
+* **celln:** cancel fenced model work and verify live gateway readiness ([46388ed](https://github.com/sympozium-ai/sympozium/commit/46388ed9702a71807153531493c269582100a1e9))
+* **celln:** enforce original parent lease with terminal expiry visibility ([#464](https://github.com/sympozium-ai/sympozium/issues/464)) ([37e0e47](https://github.com/sympozium-ai/sympozium/commit/37e0e47c61230748060cd30894ebd12f59882b57))
+* **celln:** freeze controller preparation before native side effects ([f04284c](https://github.com/sympozium-ai/sympozium/commit/f04284c4e994659bd72bd22133333afe3cdb6174))
+* **celln:** implement scoped capability issuer and verifier ([#499](https://github.com/sympozium-ai/sympozium/issues/499)) ([0981bac](https://github.com/sympozium-ai/sympozium/commit/0981bac047f0a5a7b9e289c044dd2aa2af5360cf))
+* **celln:** resolve platform policy into immutable decisions ([#498](https://github.com/sympozium-ai/sympozium/issues/498)) ([a3920e0](https://github.com/sympozium-ai/sympozium/commit/a3920e0abf5cb85ed7c864bf29bc0ffb11b62302))
+* **celln:** ship real-provider framework workspace with concurrent conversation evidence ([eb0501c](https://github.com/sympozium-ai/sympozium/commit/eb0501ce26008373a75f229fa7215c448cb13714))
+* **celln:** validate release evidence matrix and bounded artifact integrity ([6657cd1](https://github.com/sympozium-ai/sympozium/commit/6657cd196a93ba0d642dfec663ce654895b2d312))
+* **controller:** dispatch scoped one-shot runs through native receiver and gateway ([7cc797f](https://github.com/sympozium-ai/sympozium/commit/7cc797f57d82e533bf40abecb1422f5da37863cc))
+* **controller:** reconcile scoped enduring parents and fresh bounded turns ([16b4880](https://github.com/sympozium-ai/sympozium/commit/16b4880f966128fa02a3e1e0cd7135cb80be9ba6))
+* **helm:** package dedicated rootless model gateway with explicit trust dependencies ([cf27393](https://github.com/sympozium-ai/sympozium/commit/cf273937a0ebe18a110d3764998fc54c421e8f1a))
+* **install:** generate isolated scoped native manual-review deployment ([cf86695](https://github.com/sympozium-ai/sympozium/commit/cf86695d1465ed2b518ce3c3646f40452955b201))
+* **review:** add namespace-isolated scoped manager and deterministic TLS provider ([59454ce](https://github.com/sympozium-ai/sympozium/commit/59454cec84bfd18a3185ecc5ec5ff77d4601b133))
+* **review:** configure verified provider CA and scoped TLS frontend ([4851fbd](https://github.com/sympozium-ai/sympozium/commit/4851fbda56f91addbdf44178c28984127c2d2e27))
+* **ui:** expose scoped native runs and enduring turn lifecycle ([4f2d777](https://github.com/sympozium-ai/sympozium/commit/4f2d7779fdd9d7dcb5ba4ee3d91f13ab4b425f0f))
+
+
+### Bug Fixes
+
+* **api:** preserve explicit Celln preview lifecycle and catalogue scope ([5bd5a3b](https://github.com/sympozium-ai/sympozium/commit/5bd5a3b0764e5e7348f5cd688f871787ec4fa41d))
+* **authority:** enforce published decision schema before issuance and verification ([41e0cb3](https://github.com/sympozium-ai/sympozium/commit/41e0cb3cedafd054ed71e191b163f57c6c0c1f3c))
+* **budget:** atomically bind reservation and recovery to verified ownership ([db6dafa](https://github.com/sympozium-ai/sympozium/commit/db6dafac1c4dd9d1545110061f9b413986bae150))
+* **budget:** retain unknown provider usage without fabricating measured zero ([8cf463c](https://github.com/sympozium-ai/sympozium/commit/8cf463c46bb347b015f78a4c0352d309c8f16039))
+* **celln:** align parent refusal with published contract ([edc9c73](https://github.com/sympozium-ai/sympozium/commit/edc9c737a1f71a4dfd5c98c86544724c7e2b65a4))
+* **celln:** claim provider dispatch after bounded gateway admission ([61434e1](https://github.com/sympozium-ai/sympozium/commit/61434e1a72304b8e0952851a1a4b1ad68a72a009))
+* **celln:** correct namespace authorisation contract ([6bd6638](https://github.com/sympozium-ai/sympozium/commit/6bd66383523944cd0065ad8b7d383cc606885e8d))
+* **celln:** fence and atomically claim model provider dispatch ([be60e8e](https://github.com/sympozium-ai/sympozium/commit/be60e8e6c2d1d7fb4f04a2e273e9808e292bd702))
+* **celln:** guard optional cluster tool validation ([6083c23](https://github.com/sympozium-ai/sympozium/commit/6083c23b57465522f85fff7a4b373557c327a731))
+* **celln:** make accepted tool-free fixtures conform to schema ([8b69b03](https://github.com/sympozium-ai/sympozium/commit/8b69b039c682697bbe5d5160d1896969296af376))
+* **celln:** prefer work-deadline expiry for model verification ([dcb5037](https://github.com/sympozium-ai/sympozium/commit/dcb503767e70586df185bb643ff66b58bf5b4e43))
+* **celln:** prevent shared-tool intent entering legacy parent issuance ([97f3243](https://github.com/sympozium-ai/sympozium/commit/97f32431ea03590e0f98c60cca59efeb97b97154))
+* **celln:** refuse shared-tool intent in legacy one-shot issuance ([943e524](https://github.com/sympozium-ai/sympozium/commit/943e5249721659b513d4b230af6c0ed2f8912b5c))
+* **celln:** serialize ledger reconciliation across replicas ([bf28a11](https://github.com/sympozium-ai/sympozium/commit/bf28a11d6ffa3800a572d0a05e842d8219239af1))
+* **celln:** use published protocol refusal reason ([24be045](https://github.com/sympozium-ai/sympozium/commit/24be045f005f472bcdc148d9d1c806c7dbc1b124))
+* **ci:** publish dedicated gateway and repair inherited workflow YAML ([3bd649e](https://github.com/sympozium-ai/sympozium/commit/3bd649e850530a425477664fff935e9fd452dfa3))
+* **ci:** verify the reviewed contract without rewriting or pushing PR source ([3777b31](https://github.com/sympozium-ai/sympozium/commit/3777b31f2ec82a1e31c28ddcc0978c51579d94a7))
+* **controller:** fence cancelled turns and stop completed cleanup loops ([3c78f6c](https://github.com/sympozium-ai/sympozium/commit/3c78f6c899a65446c4cafb2ff07e4cabe9b795d0))
+* **controller:** revalidate frozen policy before first scoped dispatch ([29447e7](https://github.com/sympozium-ai/sympozium/commit/29447e785b929f89f9ab0deb3753fe3b26b95f86))
+* **deps:** mark go-jose as direct dependency ([12f4cbd](https://github.com/sympozium-ai/sympozium/commit/12f4cbdf85c5bb7cbc02ee599b78d6eed81d579c))
+* **enduring:** reserve retained substrate capacity and preserve uncertain owner state ([ce67ad1](https://github.com/sympozium-ai/sympozium/commit/ce67ad153f503aec045004f10d112163a0fe61f8))
+* **gateway:** align request canonicalization and decision fixtures with Rust receiver ([8d01032](https://github.com/sympozium-ai/sympozium/commit/8d010323f0596b8d84c303308145f93317eb7a91))
+* **gateway:** bind durable admission, preserve unknown usage and scope turn cleanup ([04ef174](https://github.com/sympozium-ai/sympozium/commit/04ef1748f9f8f367c077821c67ed53880e84ac81))
+* **install:** qualify framework KVM packaging, persistent ledger and bounded manual workflows ([5e61e22](https://github.com/sympozium-ai/sympozium/commit/5e61e224174bd7c5a7d00608ed330035750846e3))
+* **integration:** preserve recovery authority and enforce the contract issuer ([44cc86d](https://github.com/sympozium-ai/sympozium/commit/44cc86de8a39e4104118679ad175c882965ddb03))
+* **integration:** retain protected record identities before run deletion ([5d3eeb9](https://github.com/sympozium-ai/sympozium/commit/5d3eeb92b243329c946cf3bf54d07e612183d4f0))
+* **scoped:** fence exhausted turn registration and complete retained-root cleanup ([98e8107](https://github.com/sympozium-ai/sympozium/commit/98e8107e39a1cdbe8fd2ee279c7e432e3dbf7034))
+
+## [0.10.61](https://github.com/sympozium-ai/sympozium/compare/v0.10.60...v0.10.61) (2026-09-11)
+
+
+### Features
+
+* **celln:** single execution plane (unified client, chart, contract) ([#491](https://github.com/sympozium-ai/sympozium/issues/491)) ([7a4d993](https://github.com/sympozium-ai/sympozium/commit/7a4d993aca39769c11e79a1cc4376f63f2da4c62))
+* **web:** unify the Run/Harness × Kubernetes/Celln creation matrix ([#492](https://github.com/sympozium-ai/sympozium/issues/492)) ([1ff3e47](https://github.com/sympozium-ai/sympozium/commit/1ff3e471f801c815b33b43b04ec50ca66d3fad03))
+
+
+### Bug Fixes
+
+* **celln:** use Recreate strategy for the in-cluster dispatcher ([#488](https://github.com/sympozium-ai/sympozium/issues/488)) ([2bcc10e](https://github.com/sympozium-ai/sympozium/commit/2bcc10ecd85dc120cec7c833ced28bc4d6385bb0))
+* **controller:** gate the amd64-only Celln CLI in the multi-arch image ([#493](https://github.com/sympozium-ai/sympozium/issues/493)) ([94dd83a](https://github.com/sympozium-ai/sympozium/commit/94dd83ab3b13434871183ef873885cf78305bdb6))
+
+## [0.10.60](https://github.com/sympozium-ai/sympozium/compare/v0.10.59...v0.10.60) (2026-09-11)
+
+
+### Features
+
+* **celln:** build the host-installer image and centralize the Celln release pin ([f92c8b0](https://github.com/sympozium-ai/sympozium/commit/f92c8b0214aa2be40e64268cc8a6022b0bbf01ae))
+* **celln:** build the host-installer image and pin the Celln release ([28e3273](https://github.com/sympozium-ai/sympozium/commit/28e3273503ba6c708aa3afb35757472a0e97f230))
+
+
+### Bug Fixes
+
+* **celln:** host installer and in-cluster dispatcher are mutually exclusive ([#487](https://github.com/sympozium-ai/sympozium/issues/487)) ([43ad9a2](https://github.com/sympozium-ai/sympozium/commit/43ad9a2228555348a5f05c224f1d82fc064f1580))
+
+## [0.10.59](https://github.com/sympozium-ai/sympozium/compare/v0.10.58...v0.10.59) (2026-09-11)
+
+
+### Features
+
+* add tolerations for agent pods ([#440](https://github.com/sympozium-ai/sympozium/issues/440)) ([df23b2f](https://github.com/sympozium-ai/sympozium/commit/df23b2fd9cc021c244ee22d17e48c29d3e9c7e68))
+* **celln:** reusable ModelConnection routes for persistent harnesses ([dc8bb97](https://github.com/sympozium-ai/sympozium/commit/dc8bb97477ad7214933cce38c0abd4705e3e8e3c))
+* **install:** deploy the Celln backend by default ([#483](https://github.com/sympozium-ai/sympozium/issues/483)) ([dbf6f15](https://github.com/sympozium-ai/sympozium/commit/dbf6f15aa83b40141efeb8a47a4882140c30cd51))
+* **web:** Celln insecure model routes and native conversation UX ([#482](https://github.com/sympozium-ai/sympozium/issues/482)) ([b79a7ca](https://github.com/sympozium-ai/sympozium/commit/b79a7ca4d44b544a985990f89979cfe67cdac312))
+
+
+### Bug Fixes
+
+* 468: Propagate traceparent on LLM provider calls ([#469](https://github.com/sympozium-ai/sympozium/issues/469)) ([5c906bd](https://github.com/sympozium-ai/sympozium/commit/5c906bddfeb8f42bf2c158689a57b221ec017822))
+* **web:** clarify execution plane vs runtime ([c7f3048](https://github.com/sympozium-ai/sympozium/commit/c7f30483ec41ccb0646fa7aaa151eafac2c9e4d2))
+* **web:** fold model connections into Provider -&gt; Auth -&gt; Model ([718b9d8](https://github.com/sympozium-ai/sympozium/commit/718b9d80d2adbfe5bdfe162304671cd8d48297cf))
+* **web:** give Celln the same provider list as the run/agent flow ([e6b80ab](https://github.com/sympozium-ai/sympozium/commit/e6b80ab3e088f0766d8a2240f2ec8d184492a740))
+* **web:** offer persistent Pi and Hermes harnesses ([#480](https://github.com/sympozium-ai/sympozium/issues/480)) ([d0d03d4](https://github.com/sympozium-ai/sympozium/commit/d0d03d4bcf0ca46a969a859bfc2d40255a6f8e9b))
+* **web:** restore Provider -&gt; Auth -&gt; Model for the Celln wizard flow ([1907b12](https://github.com/sympozium-ai/sympozium/commit/1907b125a30ca1fa43bb73a4dbee46968f6a8c7a))
+* **web:** split Create into Harness and Run flows ([0ab8bc1](https://github.com/sympozium-ai/sympozium/commit/0ab8bc1e23eafa3c6a6de9b6e658b38c346e3936))
+
+## [0.10.58](https://github.com/sympozium-ai/sympozium/compare/v0.10.57...v0.10.58) (2026-09-10)
+
+
+### Bug Fixes
+
+* **celln:** Agent execution defaults and accurate availability messaging ([#478](https://github.com/sympozium-ai/sympozium/issues/478)) ([eeee90a](https://github.com/sympozium-ai/sympozium/commit/eeee90acf7ae0478ed3fcfdd5461ad26a1353f54))
+* **web:** clarify Celln selection and topology ordering ([#473](https://github.com/sympozium-ai/sympozium/issues/473)) ([3c19e60](https://github.com/sympozium-ai/sympozium/commit/3c19e6032ac583b898fa01187299cce990a0e92c))
+* **web:** complete Agent execution-plane and borrowed-tool creation flow ([#479](https://github.com/sympozium-ai/sympozium/issues/479)) ([842ccec](https://github.com/sympozium-ai/sympozium/commit/842ccec79f84614d37b0184c50eaa6ff54662137))
+
+## [0.10.57](https://github.com/sympozium-ai/sympozium/compare/v0.10.56...v0.10.57) (2026-09-09)
+
+
+### Features
+
+* add explicit catalogue Harness selection to run APIs ([af20bac](https://github.com/sympozium-ai/sympozium/commit/af20bac59080299ba51e7741153d7e3283ba0b6b))
+* add named catalogue selection to Harness run APIs ([9a378ed](https://github.com/sympozium-ai/sympozium/commit/9a378edb485dae6db514112a2cc17113f9ff3891))
+* automatically issue registered catalogue compositions ([#459](https://github.com/sympozium-ai/sympozium/issues/459)) ([d8b1c61](https://github.com/sympozium-ai/sympozium/commit/d8b1c611f1ff8dbdbd288300122f9d886da01153))
+* catalogue-derived requests and local host grant provisioning ([#443](https://github.com/sympozium-ai/sympozium/issues/443)) ([7f60cb8](https://github.com/sympozium-ai/sympozium/commit/7f60cb808f2534c5dd8ff5b34baa7971755fc87b))
+* **celln:** add immutable tool catalogue and submission metadata ([2362880](https://github.com/sympozium-ai/sympozium/commit/23628806a1c3aada7668daa69e59df1b86fdf213))
+* **celln:** authenticate API capability discovery with read-only credentials ([34f7fe1](https://github.com/sympozium-ai/sympozium/commit/34f7fe1f7a4d41754888aee6625943fa0e1772d9))
+* **celln:** authenticated capability status and scoped discovery credentials ([0b1c927](https://github.com/sympozium-ai/sympozium/commit/0b1c927420915d71950fada605365649cf71013e))
+* **celln:** bind experimental in-cell Harness runs with frozen authority ([5515928](https://github.com/sympozium-ai/sympozium/commit/55159281ea142dca8de2c5c12fcacc4683aeb87b))
+* **celln:** declare runtime profiles with independent fail-closed readiness ([a8a01e6](https://github.com/sympozium-ai/sympozium/commit/a8a01e63aed19a7fbf79f0a52b22829c8d7df7f1))
+* **celln:** freeze experimental in-cell Harness bindings on AgentRun ([b331a29](https://github.com/sympozium-ai/sympozium/commit/b331a2922235bf88491809e19a242a0035da3c4b))
+* **celln:** immutable tool catalogue and unprivileged submissions ([865c4cd](https://github.com/sympozium-ai/sympozium/commit/865c4cdbdd1f1b0f4e5a6814a8569e62e9f2c705))
+* **celln:** native JSON Harness contracts and actual-controller proof ([027682d](https://github.com/sympozium-ai/sympozium/commit/027682d552992c6538bd91c36f4dc4a27241439a))
+* **celln:** native parent installation packaging and teardown safety ([#470](https://github.com/sympozium-ai/sympozium/issues/470)) ([30fddf0](https://github.com/sympozium-ai/sympozium/commit/30fddf0757710b2ca6c30befb1a28d8e88c66d71))
+* **celln:** native persistent harness starter release candidate ([#463](https://github.com/sympozium-ai/sympozium/issues/463)) ([0136e9a](https://github.com/sympozium-ai/sympozium/commit/0136e9a3e159cc60facced820ccadd854581910f))
+* **celln:** operator-reviewed catalogue publication ([f78761a](https://github.com/sympozium-ai/sympozium/commit/f78761ad1e047008c088f47cce3b910dc98a32a4))
+* **celln:** preview effective tool permissions without issuing authority ([#462](https://github.com/sympozium-ai/sympozium/issues/462)) ([963c92d](https://github.com/sympozium-ai/sympozium/commit/963c92dece1990fedc6e7d14d870ffeae1abc68c))
+* **celln:** publish exact operator-reviewed catalogue revisions ([fdc2792](https://github.com/sympozium-ai/sympozium/commit/fdc2792f549a96ef9e6801b097353e3d23ccb769))
+* **celln:** resolve revision-bound tool authority intersections ([cea875f](https://github.com/sympozium-ai/sympozium/commit/cea875fbf67f4fbd4df5ad4d2f818dea3a1734b1))
+* **celln:** revision-bound tool authority resolver ([25a2674](https://github.com/sympozium-ai/sympozium/commit/25a2674855a541ae7696ce286eb752ad5b1d52a9))
+* **celln:** runtime profile metadata and independent readiness ([0721533](https://github.com/sympozium-ai/sympozium/commit/0721533c456b6224823d78686469738ab0f0b0d8))
+* **celln:** support native JSON Harness contracts and prove controller execution ([2dd256c](https://github.com/sympozium-ai/sympozium/commit/2dd256cd20bf7cd822d5f108b493fc56febb4758))
+* connect frozen catalogue issuance to controller execution lifecycle ([5fe2bab](https://github.com/sympozium-ai/sympozium/commit/5fe2bab81001a00f88dcc9e3bda8127fbb8549f5))
+* connect issued catalogue runs to controller recovery and dispatch ([811ba59](https://github.com/sympozium-ai/sympozium/commit/811ba59bfc08c2d801c6e237c039c11ef289bcf1))
+* expose durable catalogue issuance through operator CLI ([c9c340e](https://github.com/sympozium-ai/sympozium/commit/c9c340e728afcb3a3a64d8b6efd6b5b43a4b22fe))
+* expose Harness in Celln catalogue selection in run UI ([fb4a694](https://github.com/sympozium-ai/sympozium/commit/fb4a694cf74c3e06e99f33cf3206d4e5b7d1bbd2))
+* freeze exact verified Celln issuance for dispatch hand-off ([#451](https://github.com/sympozium-ai/sympozium/issues/451)) ([dd9abe1](https://github.com/sympozium-ai/sympozium/commit/dd9abe137f44194bc698c1ea7919d333307ed34f))
+* freeze serving route before Celln issuance ([#452](https://github.com/sympozium-ai/sympozium/issues/452)) ([51b9454](https://github.com/sympozium-ai/sympozium/commit/51b945432f27a1ed1d3f3d32094d684d81ba06c3))
+* independently resolve Celln model-policy approval ([#442](https://github.com/sympozium-ai/sympozium/issues/442)) ([74d6673](https://github.com/sympozium-ai/sympozium/commit/74d66736e7984ec20572e7cd451a034c1495f364))
+* journal local issuer authority and recover interrupted profiles ([#444](https://github.com/sympozium-ai/sympozium/issues/444)) ([49a3e23](https://github.com/sympozium-ai/sympozium/commit/49a3e2315df5291f07a2a5b55e84b56b9bb30e96))
+* manage local issuer startup recovery and periodic withdrawal ([#447](https://github.com/sympozium-ai/sympozium/issues/447)) ([e2d9d6a](https://github.com/sympozium-ai/sympozium/commit/e2d9d6a20f381d34160b1d551d250285ce070e10))
+* offer Harness in Celln catalogue selection in the run UI ([fb9f443](https://github.com/sympozium-ai/sympozium/commit/fb9f4439d5bf55fafce31318f01618a8ac920541))
+* persist bounded Celln issuance windows without retry renewal ([#446](https://github.com/sympozium-ai/sympozium/issues/446)) ([44787c8](https://github.com/sympozium-ai/sympozium/commit/44787c851c12efb2ee40da4bc96482e666c275e2))
+* persist catalogue issuance through the operator CLI ([2588768](https://github.com/sympozium-ai/sympozium/commit/2588768271a560dce131bafb332aa5f7cec3bdcd))
+* persist frozen Celln issuance and resume verified outcomes ([#450](https://github.com/sympozium-ai/sympozium/issues/450)) ([e690186](https://github.com/sympozium-ai/sympozium/commit/e6901864c6789d948df6e0c4bf985bee0a0f6030))
+* preserve frozen router execution identity through submission and recovery ([fb1aefd](https://github.com/sympozium-ai/sympozium/commit/fb1aefd015bf6a1685f9558585e7e28a6041ec7c))
+* reconcile issued Celln profiles against current approvals ([#445](https://github.com/sympozium-ai/sympozium/issues/445)) ([3f660c3](https://github.com/sympozium-ai/sympozium/commit/3f660c3e262da5681337b994152d05135e8d2cb3))
+* register catalogue controller dispatch with explicit operator config ([da70fff](https://github.com/sympozium-ai/sympozium/commit/da70fffa3dff5fb2b3e4e0886075b239ea52824e))
+* serve managed Celln issuance over authenticated TLS ([#448](https://github.com/sympozium-ai/sympozium/issues/448)) ([455cb4c](https://github.com/sympozium-ai/sympozium/commit/455cb4c92a9dc3a788416fbafce4cc1b811a84b1))
+* **sessionkey:** stable per-conversation session keys ([#408](https://github.com/sympozium-ai/sympozium/issues/408)) ([13ce3a3](https://github.com/sympozium-ai/sympozium/commit/13ce3a3bab2f3ace6f9ade6151f46cf29b4353d7))
+* trusted Celln catalogue planning and operator composition ([#441](https://github.com/sympozium-ai/sympozium/issues/441)) ([1edd036](https://github.com/sympozium-ai/sympozium/commit/1edd03680308202eb5e676f715498cc9d7b1f332))
+* verify pinned router prewarm with real KVM proof ([#453](https://github.com/sympozium-ai/sympozium/issues/453)) ([6bc9246](https://github.com/sympozium-ai/sympozium/commit/6bc9246e39c3c7b61483cdaa0497abd52272a404))
+* verify remote Celln issuance with a bounded TLS client ([#449](https://github.com/sympozium-ai/sympozium/issues/449)) ([cc3de76](https://github.com/sympozium-ai/sympozium/commit/cc3de7688a9b37724d863456d2fed7c8a82c405a))
+* **workspace:** per-session persistent workspaces via WorkspaceSession CRD ([#409](https://github.com/sympozium-ai/sympozium/issues/409)) ([30c8ead](https://github.com/sympozium-ai/sympozium/commit/30c8ead556bfd86792be198b03d0167dd9faa425))
+
+
+### Bug Fixes
+
+* **apiserver:** bound optional NATS initialization and honor UI disable ([b525711](https://github.com/sympozium-ai/sympozium/commit/b5257115cf4affb728df43399e37d54f4a9a3789))
+* **apiserver:** bound optional NATS startup and honor disabled UI ([3d16c84](https://github.com/sympozium-ai/sympozium/commit/3d16c8475ae09d924f62b9b7dda597f1bac9ca8d))
+* **celln:** restrict router ingress to control-plane controller ([9c3fd52](https://github.com/sympozium-ai/sympozium/commit/9c3fd5273a0464850a621c26a23a44a5e47e82fc))
+* **celln:** restrict router ingress to controller namespace and pods (M0) ([0953b01](https://github.com/sympozium-ai/sympozium/commit/0953b017c6538a0fae2dc15b9c2d66f45c8fbd16))
+* **celln:** wire durable router deployment with explicit trust configuration ([d845fa1](https://github.com/sympozium-ai/sympozium/commit/d845fa1f94ac32318b0de6c863e72814701d5fa4))
+* **celln:** wire replicated routers with durable ownership and explicit credentials ([fe09549](https://github.com/sympozium-ai/sympozium/commit/fe09549cc3a8e9d6a3caf85d180749dbf417287a))
+* **helm:** suspend postgres MCP server by default ([#420](https://github.com/sympozium-ai/sympozium/issues/420)) ([6ec7da6](https://github.com/sympozium-ai/sympozium/commit/6ec7da6742b52e639635b5371e94cf57d1f9e970))
+
+## [0.10.56](https://github.com/sympozium-ai/sympozium/compare/v0.10.55...v0.10.56) (2026-09-03)
+
+
+### Bug Fixes
+
+* **harness:** harden persistent session lifecycle ([#417](https://github.com/sympozium-ai/sympozium/issues/417)) ([73d24f2](https://github.com/sympozium-ai/sympozium/commit/73d24f2cfa9d7c11e1fdfc6e1d69d1d7d469566e))
+
+## [0.10.55](https://github.com/sympozium-ai/sympozium/compare/v0.10.54...v0.10.55) (2026-09-02)
+
+
+### Features
+
+* **web:** split feed into one-shot runs and persistent sessions ([#411](https://github.com/sympozium-ai/sympozium/issues/411)) ([8a09d1b](https://github.com/sympozium-ai/sympozium/commit/8a09d1b64c25882dc84994a7a6660f002ed08421))
+* **web:** surface interactive sessions at top of Harnesses page ([#413](https://github.com/sympozium-ai/sympozium/issues/413)) ([5a53be6](https://github.com/sympozium-ai/sympozium/commit/5a53be6f046e7fca2780f3bc2230ee2d19588c67))
+
+## [0.10.54](https://github.com/sympozium-ai/sympozium/compare/v0.10.53...v0.10.54) (2026-09-02)
+
+
+### Features
+
+* **harness:** add persistent Hermes default ([6f0a45b](https://github.com/sympozium-ai/sympozium/commit/6f0a45ba02b8b300d06e60c3b044f20b30cc9940))
+* **harness:** track activity and enforce idle timeout ([f1de44c](https://github.com/sympozium-ai/sympozium/commit/f1de44cc45a44ef309e8d8e600ffb0c03ca3b5c2))
+
+
+### Bug Fixes
+
+* **ci:** allow explicit image fleet rebuilds ([567564a](https://github.com/sympozium-ai/sympozium/commit/567564ac044054836d682e12dabaadf741f2b404))
+* **ci:** evaluate manual build after skipped detection ([39efce6](https://github.com/sympozium-ai/sympozium/commit/39efce655138a1e1d16f047de20a5eac25977cf6))
+* **ci:** preserve required image builds ([9da627d](https://github.com/sympozium-ai/sympozium/commit/9da627d280a7bf06fe485f8368dfae0692ecfb4f))
+* **harness:** auto-start persistent agent sessions ([4f8c538](https://github.com/sympozium-ai/sympozium/commit/4f8c5382756d110b13ef2ad8850bc6825d63853a))
+* **harness:** pin corrected Hermes session image ([1d281a4](https://github.com/sympozium-ai/sympozium/commit/1d281a468ad6561206a23b0390e385ffa856868a))
+* **harness:** retain idle timeout condition ([8cd7eb8](https://github.com/sympozium-ai/sympozium/commit/8cd7eb83aebe5fd54dbcb30c478e410b11b19c0c))
+
+## [0.10.53](https://github.com/sympozium-ai/sympozium/compare/v0.10.52...v0.10.53) (2026-09-01)
+
+
+### Bug Fixes
+
+* **harness:** persist session state across restarts ([#407](https://github.com/sympozium-ai/sympozium/issues/407)) ([c3bab88](https://github.com/sympozium-ai/sympozium/commit/c3bab88a267a798b682f2e7b7ca3ad338378b0e8))
+* **harness:** separate persistent sessions from one-shot runs ([#404](https://github.com/sympozium-ai/sympozium/issues/404)) ([776dcc4](https://github.com/sympozium-ai/sympozium/commit/776dcc4c90b004389c0efbad71826582612d3e7f))
+* support keyless local harness inference ([#406](https://github.com/sympozium-ai/sympozium/issues/406)) ([f61e861](https://github.com/sympozium-ai/sympozium/commit/f61e861c6a07712d44cf8465968f89b4ba4a5a53))
+
+## [0.10.52](https://github.com/sympozium-ai/sympozium/compare/v0.10.51...v0.10.52) (2026-09-01)
+
+
+### Features
+
+* add persistent HarnessSession lifecycle ([#395](https://github.com/sympozium-ai/sympozium/issues/395)) ([4019702](https://github.com/sympozium-ai/sympozium/commit/40197029b8f6218ee74119faecb6b74deba9f0f3))
+* **cli:** add dashboard token command ([#388](https://github.com/sympozium-ai/sympozium/issues/388)) ([fb8eeea](https://github.com/sympozium-ai/sympozium/commit/fb8eeea41b7884d6e188478ca059e48de9530165))
+* **harness:** install maintained adapter catalog ([093d0ff](https://github.com/sympozium-ai/sympozium/commit/093d0ff89f0a1f68f9970217a8c26519df7799ba))
+* **harness:** install maintained adapter catalog ([ace6e60](https://github.com/sympozium-ai/sympozium/commit/ace6e60c62f9fa11191c49235e87629a065702fd))
+* install Pi persistent session runtime by default ([#398](https://github.com/sympozium-ai/sympozium/issues/398)) ([945ec14](https://github.com/sympozium-ai/sympozium/commit/945ec149f9eff4d60abb5cf718843a931802ce80))
+* make harness execution a first-class Agent flow ([#391](https://github.com/sympozium-ai/sympozium/issues/391)) ([2bb0fd7](https://github.com/sympozium-ai/sympozium/commit/2bb0fd73e3e9ef43c6be7ff58b445335590256bd))
+* make persistent harness chat agent-first ([#399](https://github.com/sympozium-ai/sympozium/issues/399)) ([718ccf5](https://github.com/sympozium-ai/sympozium/commit/718ccf59aa359cdc3a83c6467d8dec9de0abf9df))
+* make persistent harness chat resumable ([#400](https://github.com/sympozium-ai/sympozium/issues/400)) ([4a27062](https://github.com/sympozium-ai/sympozium/commit/4a27062d846330be0d1f4a12c9a97f03ef58bbd2))
+* stream persistent harness chat responses ([#403](https://github.com/sympozium-ai/sympozium/issues/403)) ([5a4c832](https://github.com/sympozium-ai/sympozium/commit/5a4c8322e5954c47f452ebfb6bca1aef23cab7a2))
+
+## [0.10.51](https://github.com/sympozium-ai/sympozium/compare/v0.10.50...v0.10.51) (2026-08-31)
+
+
+### Features
+
+* **celln:** enable labelled KVM hosts by default ([#385](https://github.com/sympozium-ai/sympozium/issues/385)) ([af3f0bb](https://github.com/sympozium-ai/sympozium/commit/af3f0bb9284da54094a58cb0ca6de83fea730df9))
+* **harness:** select runtime while creating an agent ([#384](https://github.com/sympozium-ai/sympozium/issues/384)) ([bb9baf7](https://github.com/sympozium-ai/sympozium/commit/bb9baf7bd7960de5cc30de0c3b2b7166813eaf62))
+
+## [0.10.50](https://github.com/sympozium-ai/sympozium/compare/v0.10.49...v0.10.50) (2026-08-31)
+
+
+### Features
+
+* **harness:** expose runtime selection in new run flow ([#369](https://github.com/sympozium-ai/sympozium/issues/369)) ([2745414](https://github.com/sympozium-ai/sympozium/commit/27454144c5f31350b6458fda3937d0069b196f4e))
+* **harness:** manage agent runtime from UI ([#376](https://github.com/sympozium-ai/sympozium/issues/376)) ([5b9c67d](https://github.com/sympozium-ai/sympozium/commit/5b9c67d4624bcfb2c88c6c876a6a9480b7129cbf))
+* **harness:** show runtime provenance and reject unsupported settings ([#371](https://github.com/sympozium-ai/sympozium/issues/371)) ([8c2e8e6](https://github.com/sympozium-ai/sympozium/commit/8c2e8e6ff8007ef0b4dcc5222b3e2f459bb139fa))
+* **web:** add approved harness registry ([9eedf0c](https://github.com/sympozium-ai/sympozium/commit/9eedf0c855136c2ff0df79720a3bec2cc08f096d))
+* **web:** add harness trust detail view ([43d7625](https://github.com/sympozium-ai/sympozium/commit/43d762507a9c15102bb00bb8fec482a4da008cc4))
+* **web:** organize agent detail around harness and ensemble ([a6b4c64](https://github.com/sympozium-ai/sympozium/commit/a6b4c641793955b105e75ac87b5875d534e6fba7))
+
+
+### Bug Fixes
+
+* **api:** retain harness prompt for runtime runs ([#373](https://github.com/sympozium-ai/sympozium/issues/373)) ([efe766e](https://github.com/sympozium-ai/sympozium/commit/efe766e9e6ec6cbdb66a20c61cbfb65311fcc9ed))
+* **harness:** allow default use context setting ([#374](https://github.com/sympozium-ai/sympozium/issues/374)) ([4b6733f](https://github.com/sympozium-ai/sympozium/commit/4b6733f89d15a4c85287bfc02b6c0df8f74fcf94))
+* **harness:** preserve inherited runtime provenance ([#380](https://github.com/sympozium-ai/sympozium/issues/380)) ([f79f2f1](https://github.com/sympozium-ai/sympozium/commit/f79f2f15ffbce465c21131881ad18f1a67e386b1))
+* **harness:** probe loopback skill tool server in-container ([#381](https://github.com/sympozium-ai/sympozium/issues/381)) ([e87ae07](https://github.com/sympozium-ai/sympozium/commit/e87ae07549c52b9de157f676fd84912dc7592f3e))
+
+## [0.10.49](https://github.com/sympozium-ai/sympozium/compare/v0.10.48...v0.10.49) (2026-08-30)
+
+
+### Features
+
+* accelerator power draw from a discovered energy collector ([e5aa1e4](https://github.com/sympozium-ai/sympozium/commit/e5aa1e43369ef987839042d38b7c3b3e6cf87906))
+* **collector+apiserver:** discover energy collectors, expose accelerator power ([a1bcbc2](https://github.com/sympozium-ai/sympozium/commit/a1bcbc2949f631f527e9ce601b991d7ff9e70789))
+* **harness:** add the admin-owned AgentRuntime resource ([155c36f](https://github.com/sympozium-ai/sympozium/commit/155c36f7b4b0fa5d0943defce4ef30f307ecc161))
+* **harness:** add the admin-owned AgentRuntime resource ([c05fd7e](https://github.com/sympozium-ai/sympozium/commit/c05fd7ec94a916a8a4132069c696bb77f71820ed))
+* **harness:** inherit an Agent runtime across all run entrypoints ([480c719](https://github.com/sympozium-ai/sympozium/commit/480c71976190aaaec0b86a4992c538b8d70ec1fa))
+* **harness:** reference an approved AgentRuntime from a run ([0e563f1](https://github.com/sympozium-ai/sympozium/commit/0e563f156ad12877e5a8b97091bd3a199ab3df4c))
+* **harness:** reference an approved AgentRuntime from a run ([9abf37d](https://github.com/sympozium-ai/sympozium/commit/9abf37db01b48ae26547c3ac8a8f7dc73fe6fbd6))
+* **security:** isolate Kubernetes identity per agent run ([f9229d4](https://github.com/sympozium-ai/sympozium/commit/f9229d4b9ce85bc881822ef3010ec0b6672655c1))
+* **security:** isolate Kubernetes identity per AgentRun ([5cd37a7](https://github.com/sympozium-ai/sympozium/commit/5cd37a770df142fca52b6af3de7491829fcc2ec5))
+* **security:** restrict harness NATS access ([925e6d9](https://github.com/sympozium-ai/sympozium/commit/925e6d92ef5a1475d39dc2dd71a1047c53a73ad3))
+* **security:** restrict harness NATS access ([c63a2e5](https://github.com/sympozium-ai/sympozium/commit/c63a2e5a81e8a369068817d27641439bb8ed575d))
+* **web:** live accelerator power on density and topology node views ([52c77a6](https://github.com/sympozium-ai/sympozium/commit/52c77a6e70a79ee3300835b524c812c0741e7030))
+* **web:** simulated accelerator power in the topology demo ([409eceb](https://github.com/sympozium-ai/sympozium/commit/409eceb26961988a3484aab661196f05057433e8))
+
+
+### Bug Fixes
+
+* **eventbus:** bound core NATS publish flushes ([#365](https://github.com/sympozium-ai/sympozium/issues/365)) ([2c90d1b](https://github.com/sympozium-ai/sympozium/commit/2c90d1bee58f366e5f341c7c5a374993de3c3373))
+* **harness:** inherit agent runtimes on normal runs ([058ec37](https://github.com/sympozium-ai/sympozium/commit/058ec3793dd99b59e655b2c5de0d5295116bc642))
+* **harness:** require digest-pinned adapter images ([8636cf9](https://github.com/sympozium-ai/sympozium/commit/8636cf9efb5ccd4fc0ca994ef5ba7b5cbb4e3f8a))
+* **harness:** require digest-pinned adapter images and record the digest ([9a9ce81](https://github.com/sympozium-ai/sympozium/commit/9a9ce8112ead856a3050e1272a435cab21395fb1))
+* **harness:** require explicit policy opt-in ([1326b1f](https://github.com/sympozium-ai/sympozium/commit/1326b1f7a9bbdf177dc7225c0a3f6da2eb110737))
+* **harness:** restrict model credentials to agent allowlist ([44ef22a](https://github.com/sympozium-ai/sympozium/commit/44ef22a5fbe0c38631a86d304047969ad35b2f43))
+* **harness:** restrict model credentials to Agent allowlist ([a8d9ff5](https://github.com/sympozium-ai/sympozium/commit/a8d9ff52ca631e56641d8c169db7fcf55750b129))
+* **ipc:** reconcile pre-existing result files on watch registration ([6e08fd9](https://github.com/sympozium-ai/sympozium/commit/6e08fd92a1d34d01fc95c69d8e098040a7d28390))
+* **memory:** reconcile managed server image ([ee1c92f](https://github.com/sympozium-ai/sympozium/commit/ee1c92f39034b35b48d90100345a2cc3656717f8))
+* **memory:** reconcile managed server image ([00c3ac7](https://github.com/sympozium-ai/sympozium/commit/00c3ac72b589c9e950230f99943db2ace4be0344))
+* **nats:** authenticate density subscriber ([9b0c6fa](https://github.com/sympozium-ai/sympozium/commit/9b0c6fab41b69827268df3454a673f9b3575995c))
+* **rbac:** grant controller and apiserver access to agentruntimes ([94ed965](https://github.com/sympozium-ai/sympozium/commit/94ed965a738b735e3a4851ead6db19225f056e0e))
+
+## [0.10.48](https://github.com/sympozium-ai/sympozium/compare/v0.10.47...v0.10.48) (2026-08-18)
+
+
+### Bug Fixes
+
+* allow unauthenticated custom providers in wizard ([db1036d](https://github.com/sympozium-ai/sympozium/commit/db1036dcbf2895f737c043d94a4e4017341363b5))
+* allow unauthenticated custom providers in wizard ([bccce53](https://github.com/sympozium-ai/sympozium/commit/bccce53e8a1882585d8c674ad0d72d16de023fc6))
+
 ## [0.10.47](https://github.com/sympozium-ai/sympozium/compare/v0.10.46...v0.10.47) (2026-08-09)
 
 

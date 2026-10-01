@@ -15,16 +15,20 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	sympoziumv1alpha1 "github.com/sympozium-ai/sympozium/api/v1alpha1"
+	"github.com/sympozium-ai/sympozium/internal/controller/taskmodes"
 )
 
 // newTestCellnRun builds a minimal AgentRun suitable for driving
 // reconcilePendingCelln / reconcileRunningCelln directly.
-func newTestCellnRun(name string, uid types.UID) *sympoziumv1alpha1.AgentRun {
+func newTestCellnRun(t *testing.T, name string, uid types.UID) *sympoziumv1alpha1.AgentRun {
+	t.Helper()
+	configureCellnToken(t)
 	return &sympoziumv1alpha1.AgentRun{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      name,
-			Namespace: "default",
-			UID:       uid,
+			Name:       name,
+			Namespace:  "default",
+			UID:        uid,
+			Generation: 1,
 		},
 		Spec: sympoziumv1alpha1.AgentRunSpec{
 			AgentRef: "my-instance",
@@ -36,6 +40,28 @@ func newTestCellnRun(name string, uid types.UID) *sympoziumv1alpha1.AgentRun {
 
 // ── Fix 1: action IDs must be unique per object identity, not just per name ──
 
+func TestReconcilePendingCelln_IssuanceCannotFallThrough(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("catalogue issuance reached legacy router dispatch")
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer srv.Close()
+	t.Setenv("CELLN_ROUTER_URL", srv.URL)
+	for _, phase := range []string{"Prepared", "Issued"} {
+		t.Run(phase, func(t *testing.T) {
+			run := newTestCellnRun(t, "catalogue", types.UID("catalogue-uid"))
+			run.Status.CellnIssuance = &sympoziumv1alpha1.CellnIssuanceStatus{Phase: phase}
+			r := newAgentRunTestReconciler(t, run)
+			if _, err := r.reconcilePendingCelln(context.Background(), logr.Discard(), run); err == nil {
+				t.Fatal("unconnected catalogue dispatch did not refuse")
+			}
+			if run.Status.CellnRequest != "" || run.Status.CellnActionID != "" {
+				t.Fatal("refusal created legacy execution identity")
+			}
+		})
+	}
+}
+
 func TestReconcilePendingCelln_ActionIDUniquePerUID(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusAccepted)
@@ -43,7 +69,7 @@ func TestReconcilePendingCelln_ActionIDUniquePerUID(t *testing.T) {
 	defer srv.Close()
 	t.Setenv("CELLN_ROUTER_URL", srv.URL)
 
-	runA := newTestCellnRun("dup-name", types.UID("uid-aaaa"))
+	runA := newTestCellnRun(t, "dup-name", types.UID("uid-aaaa"))
 	rA := newAgentRunTestReconciler(t, runA)
 	if _, err := rA.reconcilePendingCelln(context.Background(), logr.Discard(), runA); err != nil {
 		t.Fatalf("reconcilePendingCelln (run A): %v", err)
@@ -53,7 +79,7 @@ func TestReconcilePendingCelln_ActionIDUniquePerUID(t *testing.T) {
 		t.Fatalf("get stored run A: %v", err)
 	}
 
-	runB := newTestCellnRun("dup-name", types.UID("uid-bbbb"))
+	runB := newTestCellnRun(t, "dup-name", types.UID("uid-bbbb"))
 	rB := newAgentRunTestReconciler(t, runB)
 	if _, err := rB.reconcilePendingCelln(context.Background(), logr.Discard(), runB); err != nil {
 		t.Fatalf("reconcilePendingCelln (run B): %v", err)
@@ -82,12 +108,15 @@ func TestReconcilePendingCelln_ActionIDUniquePerUID(t *testing.T) {
 
 func TestReconcileRunningCelln_DeadlineExceeded_FailsRun(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_ = json.NewEncoder(w).Encode(executionRecord{RequestID: "whatever", Phase: "Running"})
+		if r.Method != "POST" || r.URL.Path != "/v1/executions/wedged-run-uid-cccc/cancel" {
+			t.Error("deadline did not cancel remotely")
+		}
+		_ = json.NewEncoder(w).Encode(executionRecord{RequestID: "wedged-run-uid-cccc", Phase: "Cancelled"})
 	}))
 	defer srv.Close()
 	t.Setenv("CELLN_ROUTER_URL", srv.URL)
 
-	run := newTestCellnRun("wedged-run", types.UID("uid-cccc"))
+	run := newTestCellnRun(t, "wedged-run", types.UID("uid-cccc"))
 	run.Spec.Timeout = &metav1.Duration{Duration: 10 * time.Second}
 	run.Status.Phase = sympoziumv1alpha1.AgentRunPhaseRunning
 	run.Status.CellnActionID = "wedged-run-uid-cccc"
@@ -122,7 +151,7 @@ func TestReconcilePendingCelln_RouterUnreachable_RequeuesWithoutError(t *testing
 	// without any real network I/O, so this fails fast and deterministically.
 	t.Setenv("CELLN_ROUTER_URL", "http://127.0.0.1:1")
 
-	run := newTestCellnRun("unreachable-run", types.UID("uid-dddd"))
+	run := newTestCellnRun(t, "unreachable-run", types.UID("uid-dddd"))
 	r := newAgentRunTestReconciler(t, run)
 
 	result, err := r.reconcilePendingCelln(context.Background(), logr.Discard(), run)
@@ -137,7 +166,7 @@ func TestReconcilePendingCelln_RouterUnreachable_RequeuesWithoutError(t *testing
 func TestReconcileRunningCelln_RouterUnreachable_RequeuesWithoutError(t *testing.T) {
 	t.Setenv("CELLN_ROUTER_URL", "http://127.0.0.1:1")
 
-	run := newTestCellnRun("unreachable-poll-run", types.UID("uid-eeee"))
+	run := newTestCellnRun(t, "unreachable-poll-run", types.UID("uid-eeee"))
 	run.Status.Phase = sympoziumv1alpha1.AgentRunPhaseRunning
 	run.Status.CellnActionID = "unreachable-poll-run-uid-eeee"
 	started := metav1.NewTime(time.Now())
@@ -168,7 +197,7 @@ func TestReconcilePendingCelln_PostsAWellFormedForgeExecutionRequest(t *testing.
 	defer srv.Close()
 	t.Setenv("CELLN_ROUTER_URL", srv.URL)
 
-	run := newTestCellnRun("well-formed", types.UID("uid-ffff"))
+	run := newTestCellnRun(t, "well-formed", types.UID("uid-ffff"))
 	run.Spec.Task = sympoziumv1alpha1.NewStringTask("write a haiku generator")
 	run.Spec.Timeout = &metav1.Duration{Duration: 45 * time.Second}
 
@@ -213,17 +242,22 @@ func TestReconcileRunningCelln_SucceededSetsResultFromExecutionRecordOutput(t *t
 			Phase:     "Succeeded",
 			Output:    "42",
 			Receipt: &executionReceipt{
+				APIVersion: "celln.dev/v1alpha1", RequestID: "succeeded-run-uid-9999", Phase: "succeeded", Node: "test-node",
+				StartedAt: "2026-09-06T00:00:00Z", CompletedAt: "2026-09-06T00:00:01Z",
 				CellID:   "cell-abc123",
-				Resolved: executionResolved{Tools: []string{"blake3:deadbeef"}},
+				Resolved: executionResolved{Tools: []string{testCellnHash}},
+				Output:   &executionOutput{Hash: testCellnHash, MediaType: "text/plain", Bytes: 2},
 			},
 		})
 	}))
 	defer srv.Close()
 	t.Setenv("CELLN_ROUTER_URL", srv.URL)
 
-	run := newTestCellnRun("succeeded-run", types.UID("uid-9999"))
+	run := newTestCellnRun(t, "succeeded-run", types.UID("uid-9999"))
 	run.Status.Phase = sympoziumv1alpha1.AgentRunPhaseRunning
 	run.Status.CellnActionID = "succeeded-run-uid-9999"
+	frozen, _ := json.Marshal(testFrozenCellnRequest(run))
+	run.Status.CellnRequest = string(frozen)
 	started := metav1.NewTime(time.Now())
 	run.Status.StartedAt = &started
 
@@ -241,6 +275,9 @@ func TestReconcileRunningCelln_SucceededSetsResultFromExecutionRecordOutput(t *t
 	}
 	if stored.Status.Result != "42" {
 		t.Errorf("expected status.result to come from the executionRecord's own Output field, got %q", stored.Status.Result)
+	}
+	if stored.Status.CellnReceipt == "" {
+		t.Fatal("validated receipt was not persisted")
 	}
 }
 
@@ -283,5 +320,85 @@ func TestReconcilePending_CellnAndAgentSandboxBothEnabled_Rejected(t *testing.T)
 	if stored.Status.SandboxName != "" || stored.Status.SandboxClaimName != "" {
 		t.Errorf("expected no Sandbox CR to have been created, got SandboxName=%q SandboxClaimName=%q",
 			stored.Status.SandboxName, stored.Status.SandboxClaimName)
+	}
+}
+
+// ── backend: celln + a task mode that replaces the agent container ──────────
+
+// The failure this prevents is quiet rather than loud: backend: celln returns
+// before prepareRunPrerequisites, so buildContainers never runs and the
+// operator's harness image is simply never used. Same shape as the
+// agentSandbox case above, one level down.
+func TestReconcilePending_CellnAndAgentContainerOverride_Rejected(t *testing.T) {
+	// As above: a closed port, so reaching the celln dispatch path fails fast
+	// rather than hanging. The assertions confirm it is never reached.
+	t.Setenv("CELLN_ROUTER_URL", "http://127.0.0.1:1")
+
+	run := newTestRun()
+	run.Spec.Backend = "celln"
+	run.Spec.Task = &sympoziumv1alpha1.TaskSpec{
+		Mode: taskmodes.Harness,
+		Parameters: map[string]string{
+			"image":  "ghcr.io/acme/my-harness:v1",
+			"prompt": "summarise the incident",
+		},
+	}
+
+	agent := parityAgent()
+	agent.Spec.PolicyRef = "harness-enabled"
+	policy := &sympoziumv1alpha1.SympoziumPolicy{
+		ObjectMeta: metav1.ObjectMeta{Name: "harness-enabled", Namespace: run.Namespace},
+		Spec: sympoziumv1alpha1.SympoziumPolicySpec{
+			HarnessPolicy: &sympoziumv1alpha1.HarnessPolicySpec{Enabled: true, AllowUnmetered: true},
+		},
+	}
+	r := newAgentRunTestReconciler(t, run, agent, policy)
+
+	result, err := r.reconcilePending(context.Background(), logr.Discard(), run)
+	if err != nil {
+		t.Fatalf("reconcilePending returned error: %v", err)
+	}
+	if result.RequeueAfter != 0 {
+		t.Errorf("expected no requeue on rejection, got RequeueAfter=%v", result.RequeueAfter)
+	}
+	var stored sympoziumv1alpha1.AgentRun
+	if err := r.Client.Get(context.Background(), client.ObjectKeyFromObject(run), &stored); err != nil {
+		t.Fatalf("get stored run: %v", err)
+	}
+	if stored.Status.Phase != sympoziumv1alpha1.AgentRunPhaseFailed {
+		t.Fatalf("expected phase Failed, got %q (error=%q)", stored.Status.Phase, stored.Status.Error)
+	}
+	if !strings.Contains(stored.Status.Error, "celln") || !strings.Contains(stored.Status.Error, taskmodes.Harness) {
+		t.Errorf("expected status.error to name both the backend and the mode, got %q", stored.Status.Error)
+	}
+	if stored.Status.CellnActionID != "" {
+		t.Errorf("expected no Celln dispatch to have occurred, got CellnActionID=%q", stored.Status.CellnActionID)
+	}
+	if stored.Status.JobName != "" {
+		t.Errorf("expected no Job to have been created, got JobName=%q", stored.Status.JobName)
+	}
+}
+
+// A mode that does not replace the agent container is none of this check's
+// business: sidecar-driven keeps agent-runner, so it dispatches to celln like
+// any other run rather than being rejected.
+func TestReconcilePending_CellnWithNonOverridingTaskMode_NotRejected(t *testing.T) {
+	t.Setenv("CELLN_ROUTER_URL", "http://127.0.0.1:1")
+
+	run := newTestRun()
+	run.Spec.Backend = "celln"
+	run.Spec.Task = &sympoziumv1alpha1.TaskSpec{Mode: taskmodes.SidecarDriven, Tool: "primary"}
+
+	r := newAgentRunTestReconciler(t, run, parityAgent())
+
+	if _, err := r.reconcilePending(context.Background(), logr.Discard(), run); err != nil {
+		t.Fatalf("reconcilePending returned error: %v", err)
+	}
+	var stored sympoziumv1alpha1.AgentRun
+	if err := r.Client.Get(context.Background(), client.ObjectKeyFromObject(run), &stored); err != nil {
+		t.Fatalf("get stored run: %v", err)
+	}
+	if strings.Contains(stored.Status.Error, taskmodes.Harness) {
+		t.Errorf("sidecar-driven was rejected by the agent-container-override guard: %q", stored.Status.Error)
 	}
 }

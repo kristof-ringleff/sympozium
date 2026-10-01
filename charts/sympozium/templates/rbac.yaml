@@ -17,6 +17,18 @@ metadata:
     {{- include "sympozium.labels" . | nindent 4 }}
     app.kubernetes.io/component: apiserver
 ---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  # Annotation template only. AgentRun pods use unique sympozium-run-* accounts
+  # that copy workload-identity annotations from this object.
+  name: sympozium-agent
+  namespace: {{ include "sympozium.namespace" . }}
+  labels:
+    {{- include "sympozium.labels" . | nindent 4 }}
+    app.kubernetes.io/component: identity-template
+automountServiceAccountToken: false
+---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -24,10 +36,26 @@ metadata:
   labels:
     {{- include "sympozium.labels" . | nindent 4 }}
 rules:
+  # Catalogue authority is read-only; run requests cannot publish tool grants.
+  - apiGroups: ["sympozium.ai"]
+    resources: ["cellntools"]
+    verbs: ["get", "list", "watch"]
   # CRDs
+  - apiGroups: ["sympozium.ai"]
+    resources: ["agentrunturns"]
+    verbs: ["get", "list", "watch", "update", "patch"]
+  - apiGroups: ["sympozium.ai"]
+    resources: ["agentrunturns/status"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: ["sympozium.ai"]
+    resources: ["agentrunturns/finalizers"]
+    verbs: ["update", "patch"]
   - apiGroups: ["sympozium.ai"]
     resources:
       - agents
+      - agentruntimes
+      - modelconnections
+      - harnesssessions
       - agentruns
       - sympoziumpolicies
       - skillpacks
@@ -36,10 +64,13 @@ rules:
       - sympoziumconfigs
       - mcpservers
       - models
+      - workspacesessions
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   - apiGroups: ["sympozium.ai"]
     resources:
       - agents/status
+      - agentruntimes/status
+      - harnesssessions/status
       - agentruns/status
       - sympoziumpolicies/status
       - skillpacks/status
@@ -48,6 +79,7 @@ rules:
       - sympoziumconfigs/status
       - mcpservers/status
       - models/status
+      - workspacesessions/status
     verbs: ["get", "update", "patch"]
   - apiGroups: ["sympozium.ai"]
     resources:
@@ -60,6 +92,7 @@ rules:
       - sympoziumconfigs/finalizers
       - mcpservers/finalizers
       - models/finalizers
+      - workspacesessions/finalizers
     verbs: ["update"]
   # Claim-based model placement: the controller expresses model requirements
   # as llmfit.ai ModelClaims (docs/positioning.md — models are claimed, not
@@ -189,10 +222,21 @@ metadata:
   labels:
     {{- include "sympozium.labels" . | nindent 4 }}
 rules:
+  # Catalogue selection UI can inspect reviewed metadata, never approve tools.
+  - apiGroups: ["sympozium.ai"]
+    resources: ["agentrunturns"]
+    # Cancellation records intent with a resourceVersion-guarded Update.
+    verbs: ["get", "list", "watch", "create", "update"]
+  - apiGroups: ["sympozium.ai"]
+    resources: ["cellntools"]
+    verbs: ["get", "list", "watch"]
   # Sympozium CRDs — CRUD for REST API / web UI operations
   - apiGroups: ["sympozium.ai"]
     resources:
       - agents
+      - agentruntimes
+      - modelconnections
+      - harnesssessions
       - agentruns
       - sympoziumpolicies
       - skillpacks
@@ -206,6 +250,8 @@ rules:
   - apiGroups: ["sympozium.ai"]
     resources:
       - agents/status
+      - agentruntimes/status
+      - harnesssessions/status
       - agentruns/status
       - sympoziumpolicies/status
       - ensembles/status
@@ -235,6 +281,18 @@ rules:
   - apiGroups: [""]
     resources: ["configmaps", "services", "namespaces", "serviceaccounts"]
     verbs: ["get", "list", "watch", "create"]
+  # Adding a model backend to a running Celln fleet: the extra-backends
+  # ConfigMap and credential Secret in celln-system, a rollout of the
+  # configure DaemonSet, and the backend's profile, policy route and wrappers.
+  - apiGroups: [""]
+    resources: ["configmaps", "namespaces"]
+    verbs: ["update", "patch"]
+  - apiGroups: ["apps"]
+    resources: ["daemonsets", "deployments"]
+    verbs: ["get", "list", "watch", "patch"]
+  - apiGroups: ["sympozium.ai"]
+    resources: ["cellnruntimeprofiles", "cellnexecutionpolicies", "clustercellntools"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
   # Gateway API (apiserver manages gateway config)
   - apiGroups: ["gateway.networking.k8s.io"]
     resources: ["gatewayclasses", "gateways", "httproutes"]
@@ -280,37 +338,6 @@ roleRef:
 subjects:
   - kind: ServiceAccount
     name: sympozium-apiserver
-    namespace: {{ include "sympozium.namespace" . }}
----
-# Canary health-check RBAC — allows the system canary agent to list
-# cluster resources for deterministic health checks.
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
-metadata:
-  name: {{ include "sympozium.fullname" . }}-canary
-  labels:
-    {{- include "sympozium.labels" . | nindent 4 }}
-rules:
-  - apiGroups: [""]
-    resources: ["nodes"]
-    verbs: ["get", "list"]
-  - apiGroups: ["sympozium.ai"]
-    resources: ["sympoziumschedules", "mcpservers"]
-    verbs: ["get", "list"]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata:
-  name: {{ include "sympozium.fullname" . }}-canary
-  labels:
-    {{- include "sympozium.labels" . | nindent 4 }}
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: ClusterRole
-  name: {{ include "sympozium.fullname" . }}-canary
-subjects:
-  - kind: ServiceAccount
-    name: sympozium-agent
     namespace: {{ include "sympozium.namespace" . }}
 {{- end }}
 {{- if and .Values.rbac.create .Values.llmfit.daemonset.enabled }}

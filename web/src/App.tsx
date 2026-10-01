@@ -6,6 +6,7 @@ import { DashboardPage } from "@/pages/dashboard";
 import { AgentsPage } from "@/pages/agents";
 import { AgentDetailPage } from "@/pages/agent-detail";
 import { RunsPage } from "@/pages/runs";
+import { CellnReviewPage } from "@/pages/celln-review";
 import { RunDetailPage } from "@/pages/run-detail";
 import { PoliciesPage } from "@/pages/policies";
 import { SkillsPage } from "@/pages/skills";
@@ -23,6 +24,8 @@ import { TopologyPage } from "@/pages/topology";
 import { TopologyDemoPage } from "@/pages/topology-demo";
 import { SyntheticMembranePage } from "@/pages/synthetic-membrane";
 import { ModelDensityPage } from "@/pages/model-density";
+import { HarnessesPage } from "@/pages/harnesses";
+import { HarnessDetailPage } from "@/pages/harness-detail";
 
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
   const { isAuthenticated } = useAuth();
@@ -42,6 +45,8 @@ export default function App() {
     );
   }
 
+  if (import.meta.env.VITE_CELLN_REVIEW === "true") return <CellnReviewPage />;
+
   return (
     <Routes>
       <Route
@@ -57,6 +62,8 @@ export default function App() {
         <Route path="/topology/demo" element={<TopologyDemoPage />} />
         <Route path="/agents" element={<AgentsPage />} />
         <Route path="/agents/:name" element={<AgentDetailPage />} />
+        <Route path="/harnesses" element={<HarnessesPage />} />
+        <Route path="/harnesses/:name" element={<HarnessDetailPage />} />
         <Route path="/runs" element={<RunsPage />} />
         <Route path="/runs/:name" element={<RunDetailPage />} />
         <Route path="/policies" element={<PoliciesPage />} />

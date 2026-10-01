@@ -87,10 +87,13 @@ nav:
     - Lifecycle Hooks: concepts/lifecycle-hooks.md
     - Task Modes:
       - Sidecar-Driven Mode: modes/sidecar-driven.md
+      - Harness Mode: modes/harness.md
+      - Writing a Harness Adapter: modes/harness-adapters.md
       - Adding a Task Mode: modes/extension-guide.md
     - Channels: concepts/channels.md
     - Agent Sandboxing: concepts/agent-sandbox.md
     - Celln Backend: concepts/celln-backend.md
+    - Skills, Tools & Execution: concepts/skills-tools-and-execution.md
     - Security: concepts/security.md
     - Persistent Memory: concepts/persistent-memory.md
     - Scheduled Tasks: concepts/scheduled-tasks.md
@@ -100,6 +103,11 @@ nav:
     - Writing Orchestrator Sidecars: sidecars/writing-orchestrator-sidecars.md
   - Guides:
     - Your First AgentRun: guides/first-agentrun.md
+    - AgentHarness: guides/agentharness.md
+    - AgentHarness UX: guides/agentharness-ux.md
+    - Native Celln Installation: guides/celln-native-installation.md
+    - Celln Fleet Installation: guides/celln-fleet-installation.md
+    - Celln Mediated Model Access: guides/celln-mediated-model-access.md
     - Using Ollama: guides/ollama.md
     - LM Studio & Local Inference: guides/lm-studio.md
     - Unsloth: guides/unsloth.md

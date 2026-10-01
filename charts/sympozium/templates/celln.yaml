@@ -1,4 +1,94 @@
 {{- if .Values.celln.enabled }}
+{{- $bootstrap := .Values.celln.bootstrap | default dict }}
+{{- $clientSecret := $bootstrap.clientTokenSecret | default "celln-router-client" }}
+{{- $backendSecret := $bootstrap.backendTokenSecret | default "celln-dispatcher-backend" }}
+{{- $capabilitySecret := $bootstrap.capabilityTokenSecret | default "celln-discovery" }}
+{{- $ownershipClaim := $bootstrap.ownershipClaim | default "celln-router-ownership" }}
+{{- $routerImage := "" }}
+{{- if not .Values.celln.router.external }}
+{{- if .Values.celln.router.image.digest }}
+{{- if not (regexMatch "^sha256:[a-f0-9]{64}$" .Values.celln.router.image.digest) }}
+{{- fail "celln.router.image.digest must be a sha256 digest when set" }}
+{{- end }}
+{{- $routerImage = printf "%s@%s" .Values.celln.router.image.repository .Values.celln.router.image.digest }}
+{{- else if .Values.celln.router.image.tag }}
+{{- $routerImage = printf "%s:%s" .Values.celln.router.image.repository .Values.celln.router.image.tag }}
+{{- else }}
+{{- fail "celln.router.image.digest (recommended) or celln.router.image.tag is required" }}
+{{- end }}
+{{- end }}
+{{- $dispatcher := .Values.celln.dispatcher | default dict }}
+{{- $fleet := .Values.celln.fleet | default dict }}
+{{- $parent := $dispatcher.enduring }}
+{{- if $parent.enabled }}
+{{- if or .Values.celln.router.external (ne (len .Values.celln.router.backends) 1) }}
+{{- fail "dispatcher.enduring currently requires one managed dispatcher backend; multi-node authority provisioning is unsupported" }}
+{{- end }}
+{{- if or (not $dispatcher.enabled) .Values.celln.installer.enabled .Values.celln.nativeParent.enabled }}
+{{- fail "dispatcher.enduring requires the in-cluster dispatcher and cannot use installer or nativeParent" }}
+{{- end }}
+{{- if lt (int $dispatcher.maxCells) 2 }}
+{{- fail "dispatcher.enduring requires maxCells >= 2 for a parent and child" }}
+{{- end }}
+{{- if or (ne (int $dispatcher.replicas) 1) (not $parent.nodeName) (not $parent.parentConfigSecret) }}
+{{- fail "dispatcher.enduring requires one dispatcher replica, nodeName and parentConfigSecret" }}
+{{- end }}
+{{- if or (le (int $parent.uid) 0) (le (int $parent.gid) 0) (not .Values.celln.router.parentTokenSecret) }}
+{{- fail "dispatcher.enduring requires non-root uid/gid and router.parentTokenSecret" }}
+{{- end }}
+{{- if not (regexMatch "^/var/lib/sympozium-celln/[a-z0-9][a-z0-9-]{0,62}$" $parent.statePath) }}
+{{- fail "dispatcher.enduring.statePath must be a dedicated /var/lib/sympozium-celln/<installation> directory" }}
+{{- end }}
+{{- if and (hasKey .Values.controller.nodeSelector "kubernetes.io/hostname") (ne (index .Values.controller.nodeSelector "kubernetes.io/hostname") $parent.nodeName) }}
+{{- fail "dispatcher.enduring.nodeName conflicts with controller.nodeSelector" }}
+{{- end }}
+{{- end }}
+{{- $dispatcherImage := $dispatcher.image | default dict }}
+{{- $dispatcherRepo := $dispatcherImage.repository | default .Values.celln.image.repository | default "ghcr.io/sympozium-ai/sympozium/celln-installer" }}
+{{- $dispatcherTag := $dispatcherImage.tag | default .Values.celln.image.tag | default .Chart.AppVersion }}
+{{- $clientToken := randAlphaNum 32 }}
+{{- with lookup "v1" "Secret" .Release.Namespace $clientSecret }}{{ $clientToken = index .data "token" | b64dec }}{{ end }}
+{{- $backendToken := randAlphaNum 32 }}
+{{- with lookup "v1" "Secret" "celln-system" $backendSecret }}{{ $backendToken = index .data "token" | b64dec }}{{ end }}
+{{- $capabilityToken := randAlphaNum 32 }}
+{{- with lookup "v1" "Secret" .Release.Namespace $capabilitySecret }}{{ $capabilityToken = index .data "token" | b64dec }}{{ end }}
+{{- if and (not (hasPrefix "https://" .Values.celln.routerUrl)) (not .Values.celln.allowInsecureHttp) }}
+{{- fail "Celln requires an HTTPS routerUrl or explicit celln.allowInsecureHttp acknowledgement" }}
+{{- end }}
+{{- if .Values.celln.router.external }}
+{{- if or (not .Values.celln.tokenSecret) (not .Values.celln.capabilityTokenSecret) (eq .Values.celln.tokenSecret .Values.celln.capabilityTokenSecret) }}
+{{- fail "external Celln router requires distinct execution and discovery token Secrets" }}
+{{- end }}
+{{- if .Values.celln.installer.enabled }}
+{{- fail "external Celln router cannot enable the legacy host installer" }}
+{{- end }}
+{{- else }}
+{{- if and (not .Values.celln.router.backends) (not $fleet.enabled) }}
+{{- fail "celln.router.backends must contain the complete stable dispatcher endpoint list" }}
+{{- end }}
+{{- range .Values.celln.router.backends }}
+{{- if not (regexMatch "^http://[^/,?#@[:space:]]+(:[0-9]+)?$" .) }}
+{{- fail "celln.router.backends requires explicit HTTP origins (HTTPS is not supported by this router)" }}
+{{- end }}
+{{- end }}
+{{- if not .Values.celln.router.allowInsecureBackends }}
+{{- fail "celln.router.allowInsecureBackends must explicitly acknowledge the plaintext backend transport" }}
+{{- end }}
+{{- if or (not .Values.celln.router.clientTokenSecret) (not .Values.celln.router.backendTokenSecret) (not .Values.celln.tokenSecret) }}
+{{- fail "Celln requires controller, router client, and router backend token Secret references" }}
+{{- end }}
+{{- if eq .Values.celln.router.clientTokenSecret .Values.celln.router.backendTokenSecret }}
+{{- fail "Celln client and backend credentials must use distinct Secrets" }}
+{{- end }}
+{{- if not .Values.celln.router.ownershipClaim }}
+{{- fail "celln.router.ownershipClaim must reference durable shared POSIX storage" }}
+{{- end }}
+{{- if or (not .Values.celln.capabilityTokenSecret) (not .Values.celln.router.capabilityTokenSecret) }}
+{{- fail "Celln requires API-server and router read-only capability token Secret references" }}
+{{- end }}
+{{- if or (eq .Values.celln.capabilityTokenSecret .Values.celln.tokenSecret) (eq .Values.celln.router.capabilityTokenSecret .Values.celln.router.clientTokenSecret) (eq .Values.celln.router.capabilityTokenSecret .Values.celln.router.backendTokenSecret) }}
+{{- fail "Celln capability credentials must use distinct Secrets from execution credentials" }}
+{{- end }}
 ---
 apiVersion: v1
 kind: Namespace
@@ -6,6 +96,81 @@ metadata:
   name: celln-system
   labels:
     app.kubernetes.io/part-of: sympozium
+{{- if $bootstrap.enabled }}
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $clientSecret }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/part-of: sympozium
+type: Opaque
+stringData:
+  token: {{ $clientToken | quote }}
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $clientSecret }}
+  namespace: celln-system
+  labels:
+    app.kubernetes.io/part-of: sympozium
+type: Opaque
+stringData:
+  token: {{ $clientToken | quote }}
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $backendSecret }}
+  namespace: celln-system
+  labels:
+    app.kubernetes.io/part-of: sympozium
+type: Opaque
+stringData:
+  token: {{ $backendToken | quote }}
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $capabilitySecret }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/part-of: sympozium
+type: Opaque
+stringData:
+  token: {{ $capabilityToken | quote }}
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $capabilitySecret }}
+  namespace: celln-system
+  labels:
+    app.kubernetes.io/part-of: sympozium
+type: Opaque
+stringData:
+  token: {{ $capabilityToken | quote }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ $ownershipClaim }}
+  namespace: celln-system
+  labels:
+    app.kubernetes.io/part-of: sympozium
+spec:
+  accessModes:
+  - {{ $bootstrap.ownershipAccessMode | default "ReadWriteOnce" }}
+  resources:
+    requests:
+      storage: {{ $bootstrap.ownershipStorage | default "1Gi" }}
+  {{- with $bootstrap.ownershipStorageClass }}
+  storageClassName: {{ . | quote }}
+  {{- end }}
+{{- end }}
+{{- if .Values.celln.installer.enabled }}
 ---
 apiVersion: v1
 kind: Secret
@@ -46,7 +211,7 @@ spec:
       hostPID: true
       containers:
       - name: installer
-        image: {{ .Values.celln.image.repository | default "ghcr.io/sympozium-ai/celln-installer" }}:{{ .Values.celln.image.tag | default "v0.4.13" }}
+        image: {{ .Values.celln.image.repository | default "ghcr.io/sympozium-ai/sympozium/celln-installer" }}:{{ .Values.celln.image.tag | default .Chart.AppVersion }}
         imagePullPolicy: {{ .Values.image.pullPolicy }}
         securityContext:
           privileged: true
@@ -104,15 +269,204 @@ spec:
           type: CharDevice
       nodeSelector:
         celln.dev/kvm: "true"
+        {{- if $parent.enabled }}
+        kubernetes.io/hostname: {{ $parent.nodeName | quote }}
+        {{- end }}
       tolerations:
       - key: node-role.kubernetes.io/control-plane
         operator: Exists
         effect: NoSchedule
+{{- end }}
+{{- if $dispatcher.enabled }}
 ---
-# Router DaemonSet — one per KVM node. Uses downward API to discover
-# the host IP, forwards to the systemd dispatcher on that IP.
 apiVersion: apps/v1
-kind: DaemonSet
+kind: Deployment
+metadata:
+  name: celln-dispatcher
+  namespace: celln-system
+  labels:
+    app.kubernetes.io/name: celln-dispatcher
+    app.kubernetes.io/part-of: sympozium
+spec:
+  replicas: {{ $dispatcher.replicas | default 1 }}
+  # The dispatcher takes an exclusive flock on its hostPath state root
+  # (/var/lib/celln). RollingUpdate would overlap the outgoing and incoming
+  # pods and they would contend for the lock, so the old pod must be fully
+  # terminated before a replacement starts.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: celln-dispatcher
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: celln-dispatcher
+    spec:
+      automountServiceAccountToken: false
+      {{- if $parent.enabled }}
+      terminationGracePeriodSeconds: 60
+      {{- end }}
+      {{- if $parent.enabled }}
+      nodeSelector:
+        kubernetes.io/hostname: {{ $parent.nodeName | quote }}
+      {{- end }}
+      {{- with $dispatcher.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+      - name: dispatcher
+        {{- if $parent.enabled }}
+        lifecycle:
+          preStop:
+            exec:
+              command:
+                - /bin/sh
+                - -ec
+                - |
+                  printf 'Authorization: Bearer %s\n' "$(cat /etc/celln/backend/token)" | curl --fail --silent --show-error --max-time 50 --header @- --request POST http://127.0.0.1:8787/v1/drain
+        {{- end }}
+        image: {{ printf "%s:%s" $dispatcherRepo $dispatcherTag | quote }}
+        imagePullPolicy: {{ .Values.image.pullPolicy }}
+        command: ["/usr/local/bin/celln"]
+        args:
+        - dispatcher
+        - --listen
+        - 0.0.0.0:8787
+        - --unsafe-non-loopback
+        - --token-file
+        - /etc/celln/backend/token
+        - --root
+        {{- if $parent.enabled }}
+        - {{ printf "%s/authority" $parent.statePath | quote }}
+        {{- else }}
+        - /var/lib/celln
+        {{- end }}
+        - --mote-store
+        {{- if $parent.enabled }}
+        - {{ printf "%s/authority/motes" $parent.statePath | quote }}
+        {{- else }}
+        - /var/lib/celln/motes
+        {{- end }}
+        - --tool-store
+        {{- if $parent.enabled }}
+        - {{ printf "%s/authority/tools" $parent.statePath | quote }}
+        {{- else }}
+        - /var/lib/celln/tools
+        {{- end }}
+        - --node-name
+        - $(NODE_NAME)
+        {{- range $dispatcher.allowEgressHosts | default (list "api.deepseek.com") }}
+        - --allow-egress-host
+        - {{ . | quote }}
+        {{- end }}
+        - --max-cells
+        - {{ $dispatcher.maxCells | int | quote }}
+        - --memory-bytes
+        - {{ $dispatcher.memoryBytes | int64 | quote }}
+        - --egress-slots
+        - {{ $dispatcher.egressSlots | default 1 | quote }}
+        env:
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        readinessProbe:
+          httpGet:
+            path: /v1/health
+            port: 8787
+          periodSeconds: 2
+        securityContext:
+          privileged: true
+          readOnlyRootFilesystem: true
+        volumeMounts:
+        - name: backend
+          mountPath: /etc/celln/backend
+          readOnly: true
+        - name: state
+          mountPath: /var/lib/celln
+        - name: kvm
+          mountPath: /dev/kvm
+        - name: boot
+          mountPath: /boot
+          readOnly: true
+        - name: modules
+          mountPath: /lib/modules
+          readOnly: true
+        - name: tmp
+          mountPath: /tmp
+        {{- if $parent.enabled }}
+        # Preserve absolute artifact/model paths embedded in approved profiles.
+        - name: parent-state
+          mountPath: {{ $parent.statePath | quote }}
+        {{- range $i, $file := $parent.modelCredentialFiles }}
+        - name: parent-model-{{ $i }}
+          mountPath: {{ $file | quote }}
+          readOnly: true
+        {{- end }}
+        {{- end }}
+      volumes:
+      - name: backend
+        secret:
+          secretName: {{ $backendSecret }}
+          defaultMode: 0440
+      - name: state
+        hostPath:
+          path: {{ $dispatcher.statePath | default "/var/lib/celln" }}
+          type: DirectoryOrCreate
+      - name: kvm
+        hostPath:
+          path: /dev/kvm
+          type: CharDevice
+      - name: boot
+        hostPath:
+          path: /boot
+          type: Directory
+      - name: modules
+        hostPath:
+          path: /lib/modules
+          type: Directory
+      - name: tmp
+        emptyDir: {}
+      {{- if $parent.enabled }}
+      - name: parent-state
+        hostPath:
+          path: {{ $parent.statePath | quote }}
+          type: Directory
+      {{- range $i, $file := $parent.modelCredentialFiles }}
+      {{- if or (not (hasPrefix "/" $file)) (contains ".." $file) (eq $file "/") }}
+      {{- fail "dispatcher.enduring.modelCredentialFiles requires absolute file paths without traversal" }}
+      {{- end }}
+      - name: parent-model-{{ $i }}
+        hostPath:
+          path: {{ $file | quote }}
+          type: File
+      {{- end }}
+      {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: celln-dispatcher
+  namespace: celln-system
+  labels:
+    app.kubernetes.io/name: celln-dispatcher
+    app.kubernetes.io/part-of: sympozium
+spec:
+  selector:
+    app.kubernetes.io/name: celln-dispatcher
+  ports:
+  - name: http
+    port: 8787
+    targetPort: 8787
+    protocol: TCP
+{{- end }}
+{{- if not .Values.celln.router.external }}
+---
+# Every replica sees the same backend identities and durable owner ledger.
+apiVersion: apps/v1
+kind: Deployment
 metadata:
   name: celln-router
   namespace: celln-system
@@ -120,6 +474,7 @@ metadata:
     app.kubernetes.io/name: celln-router
     app.kubernetes.io/part-of: sympozium
 spec:
+  replicas: {{ .Values.celln.router.replicas }}
   selector:
     matchLabels:
       app.kubernetes.io/name: celln-router
@@ -128,30 +483,71 @@ spec:
       labels:
         app.kubernetes.io/name: celln-router
     spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
       containers:
       - name: router
-        image: {{ .Values.celln.router.image.repository | default "ghcr.io/sympozium-ai/celln-router" }}:{{ .Values.celln.router.image.tag | default "v0.4.13" }}
+        image: {{ $routerImage | quote }}
         imagePullPolicy: {{ .Values.image.pullPolicy }}
-        command: ["/bin/sh", "-c"]
+        command: ["/usr/local/bin/celln"]
         args:
-        - "exec /usr/local/bin/celln route --listen 0.0.0.0:8788 --backends http://${NODE_IP}:8787 --token-file /etc/celln/dispatcher-token/token --mode round-robin"
+        - route
+        - --listen
+        - 0.0.0.0:8788
+        {{- if .Values.celln.router.backends }}
+        - --backends
+        - {{ join "," .Values.celln.router.backends | quote }}
+        {{- end }}
+        {{- if $fleet.enabled }}
+        # Every ready fleet owner, resolved through the headless Service.
+        - --backends-srv
+        - celln-node.celln-system.svc.cluster.local:8787
+        {{- end }}
+        - --token-file
+        - /etc/celln/backend/token
+        - --client-token-file
+        - /etc/celln/client/token
+        - --capability-token-file
+        - /etc/celln/capability/token
+        {{- if .Values.celln.router.parentTokenSecret }}
+        - --parent-token-file
+        - /etc/celln/parent/token
+        {{- end }}
+        - --ownership-dir
+        - /var/lib/celln/ownership
+        - --mode
+        - round-robin
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: ["ALL"]
         ports:
         - name: http
           containerPort: 8788
           protocol: TCP
-        env:
-        - name: NODE_IP
-          valueFrom:
-            fieldRef:
-              fieldPath: status.hostIP
-        - name: PATH
-          value: /usr/local/bin:/usr/bin:/bin
         volumeMounts:
-        - name: host-bin
-          mountPath: /usr/local/bin/celln
+        {{- if .Values.celln.router.parentTokenSecret }}
+        - name: parent-token
+          mountPath: /etc/celln/parent
           readOnly: true
-        - name: token-vol
-          mountPath: /etc/celln/dispatcher-token
+        {{- end }}
+        - name: client-token
+          mountPath: /etc/celln/client
+          readOnly: true
+        - name: backend-token
+          mountPath: /etc/celln/backend
+          readOnly: true
+        - name: ownership
+          mountPath: /var/lib/celln/ownership
+        - name: capability-token
+          mountPath: /etc/celln/capability
           readOnly: true
         resources:
           requests:
@@ -161,23 +557,27 @@ spec:
             memory: "64Mi"
             cpu: "200m"
       volumes:
-      - name: host-bin
-        hostPath:
-          path: /usr/local/bin/celln
-          type: File
-      # Dispatcher token is generated on the host by the installer script
-      # (openssl rand -base64 32, once) and read here via hostPath — it is
-      # not a Kubernetes Secret and has no Helm-managed source of truth.
-      - name: token-vol
-        hostPath:
-          path: /etc/celln/dispatcher-token
-          type: Directory
-      nodeSelector:
-        celln.dev/kvm: "true"
-      tolerations:
-      - key: node-role.kubernetes.io/control-plane
-        operator: Exists
-        effect: NoSchedule
+      {{- if .Values.celln.router.parentTokenSecret }}
+      - name: parent-token
+        secret:
+          secretName: {{ .Values.celln.router.parentTokenSecret | quote }}
+          defaultMode: 0440
+      {{- end }}
+      - name: client-token
+        secret:
+          secretName: {{ .Values.celln.router.clientTokenSecret | quote }}
+          defaultMode: 0440
+      - name: backend-token
+        secret:
+          secretName: {{ .Values.celln.router.backendTokenSecret | quote }}
+          defaultMode: 0440
+      - name: ownership
+        persistentVolumeClaim:
+          claimName: {{ .Values.celln.router.ownershipClaim | quote }}
+      - name: capability-token
+        secret:
+          secretName: {{ .Values.celln.router.capabilityTokenSecret | quote }}
+          defaultMode: 0440
 ---
 apiVersion: v1
 kind: Service
@@ -195,4 +595,6 @@ spec:
     port: 8787
     targetPort: 8788
     protocol: TCP
+{{- end }}
+{{- end }}
 {{- end }}

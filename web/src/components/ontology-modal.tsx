@@ -1,232 +1,118 @@
-/**
- * OntologyModal — explains the core Sympozium concepts and how they relate.
- */
-
-import { useState } from "react";
+/** Shared concepts guide for both navigation layouts. */
 import {
-  Dialog,
-  DialogContent,
-  DialogHeader,
-  DialogTitle,
-  DialogTrigger,
+  Dialog, DialogContent, DialogDescription, DialogHeader,
+  DialogTitle, DialogTrigger,
 } from "@/components/ui/dialog";
-import { ScrollArea } from "@/components/ui/scroll-area";
-import { HelpCircle, ArrowRight } from "lucide-react";
+import { HelpCircle } from "lucide-react";
 
-interface Concept {
-  name: string;
-  icon: string;
-  short: string;
-  detail: string;
-  relates?: string;
-}
-
-const CONCEPTS: Concept[] = [
-  {
-    name: "Model",
-    icon: "M",
-    short: "A local LLM running inside the cluster",
-    detail:
-      "A Model CRD declares a GGUF model to be downloaded, served via llama-server, and exposed as an OpenAI-compatible endpoint. Models are auto-placed on the best node via llmfit. No external API keys required.",
-    relates: "Referenced by Ensembles and AgentRuns via modelRef",
-  },
-  {
-    name: "Ensemble",
-    icon: "E",
-    short: "A team of AI agents bundled together",
-    detail:
-      "An Ensemble is a Helm-like bundle that defines a group of Agent Configs, their relationships (delegation, sequential, supervision), shared memory, and the AI provider they use. Activating an Ensemble stamps out Agents, Schedules, and memory for each Agent Config.",
-    relates: "Contains Agent Configs, creates Agents when activated",
-  },
-  {
-    name: "Agent Config",
-    icon: "C",
-    short: "A role definition within an Ensemble",
-    detail:
-      "An Agent Config defines an agent's identity: its name, system prompt, model, skills, and schedule. Each Agent Config in an Ensemble becomes an Agent when the Ensemble is activated. Agent Configs can have different models and provider overrides.",
-    relates: "Lives inside an Ensemble, becomes an Agent",
-  },
-  {
-    name: "Agent",
-    icon: "A",
-    short: "A configured, ready-to-run agent",
-    detail:
-      "An Agent is a running agent configuration. It holds the agent's model, provider, API key reference, skills, memory settings, and channel bindings. Agents are the launchpad for AgentRuns.",
-    relates: "Created from an Agent Config, runs AgentRuns",
-  },
-  {
-    name: "AgentRun",
-    icon: "R",
-    short: "A single execution of an agent task",
-    detail:
-      "An AgentRun is a Job-like resource that executes a task using an Agent's configuration. Each run gets its own ephemeral Pod with least-privilege RBAC, skill sidecars, and network policies. Runs can delegate to other agents or be triggered on a schedule.",
-    relates: "Launched from an Agent, runs in a Pod",
-  },
-  {
-    name: "Workflow",
-    icon: "W",
-    short: "How Agent Configs coordinate within an Ensemble",
-    detail:
-      "Workflows define relationships between Agent Configs: delegation (one agent asks another for help), sequential pipelines (output flows to next), and supervision (one agent oversees another). Visualised on the interactive canvas.",
-    relates: "Defined by Ensemble relationships, visible on the canvas",
-  },
-  {
-    name: "SkillPack",
-    icon: "S",
-    short: "A reusable set of tools for agents",
-    detail:
-      "A SkillPack bundles tools that agents can use: Kubernetes operations, GitHub GitOps, SRE observability, memory, llmfit, and more. Each skill runs in its own sidecar container with ephemeral RBAC, auto-provisioned at runtime.",
-    relates: "Mounted into Agents as sidecar containers",
-  },
-  {
-    name: "Policy",
-    icon: "G",
-    short: "Governance rules for agent behaviour",
-    detail:
-      "A SympoziumPolicy enforces sandbox requirements, resource limits, sub-agent depth, tool gating, network isolation, and model access restrictions. Policies are bound to Agents and validated by an admission webhook.",
-    relates: "Bound to Agents via policyRef",
-  },
+const CHOICES = [
+  ["Who?", "Agent", "The identity and defaults: instructions, model settings, skills and approved access. Creating an Agent does not start a process. You can create one directly; an Ensemble is optional."],
+  ["How?", "Harness", "The program that manages the model conversation and tool use. Choose an approved harness, or use the built-in runner where supported. A one-shot tool job may need neither a harness nor a model."],
+  ["Where?", "Execution environment", "Kubernetes is the default and runs work in containers. Celln is opt-in and runs work in hardware-isolated cells. Choosing a harness does not switch the environment. Harness and tool support must match the environment."],
+  ["How long?", "Run lifecycle", "A one-shot completes a task and finishes. An enduring native run stays available for more messages within its limits. Both are AgentRuns—not different kinds of Agent. Save defaults on the Agent (execution environment, harness, lifecycle, approved tools); runs inherit them unless overridden."],
+  ["With what access?", "Skills, tools and policy", "Skills explain how to do a job. Tools perform actions. Policy and permission grants limit which actions are allowed. Selecting a skill or tool requests access; it does not grant permission."],
 ];
 
-export function OntologyModal() {
-  const [open, setOpen] = useState(false);
+const GLOSSARY = [
+  ["AgentRun", "The record of an execution: its task, settings, lifecycle, status and results. One Agent can have multiple runs."],
+  ["AgentRuntime / AgentHarness", "AgentRuntime is the operator-managed resource describing an approved harness and its supported contracts. AgentHarness is the product/design term, not another resource you need to create. Harness selection does not choose a lifecycle or grant tools."],
+  ["Model", "The language model used for reasoning. Agents can use configured external providers or cluster-hosted models. A Model resource describes managed model serving; it is not a prerequisite for every Agent."],
+  ["Ensemble / Agent Config / Workflow", "An Ensemble bundles a team. Its Agent Configs are templates used to create Agents. A Workflow describes how the team coordinates, such as delegation or a sequential pipeline. None is required for a standalone Agent."],
+  ["Skill / SkillPack", "A skill supplies instructions or domain knowledge. A SkillPack packages those instructions and may include tooling and access requirements. Kubernetes administration and observability packs still depend on their supported tools; they are not automatically available in native Celln."],
+  ["Tool / CellnTool / Borrowed tool", "A tool performs an operation. CellnTool describes a reviewed native tool revision and its limits. Borrowing means selecting that revision for a run, subject to grants and host readiness. Tools cannot be added to an already-live native parent."],
+  ["Policy / Permission grant / Preview", "Policy sets constraints. A grant bounds allowed access, such as file sizes or HTTPS destinations. A preview explains effective access; it neither issues permission nor proves host readiness. A native cell cannot expand its own authority."],
+  ["MCP server", "An integration exposing tools and context through Model Context Protocol. It requires a compatible execution path and approved access. An MCP connection is not automatically a borrowed Celln tool."],
+  ["Turn / AgentRunTurn", "A message and its work within a continuing run. In native Celln, the first message is recorded on AgentRun; later messages use AgentRunTurn. Cancelling a turn stops its work once teardown is confirmed; it is different from ending the parent run."],
+  ["Parent cell / Sub-cell", "The native parent keeps live context between turns. Each turn uses a disposable child cell, also called a sub-cell. A child is a separate cell—not an AI sub-agent or a VM nested inside the parent."],
+  ["Persistent context / Workspace / Lease", "The native parent retains bounded conversation context and logical run-owned files between turns. These are not arbitrary host files or durable Agent memory. A lease limits the parent’s lifetime. Losing the parent loses this live state; saved chat history is not a checkpoint."],
+  ["Celln / Cell / Mote", "Celln is the execution plane. A mote is the substrate at rest: a stripped kernel and pilot supervisor. A cell is a live, sealed, tool-loaned mote. Spawn forks a warm mote instead of booting a guest in the hot path."],
+  ["Assay / Warden / Pilot", "Infrastructure, not user-selectable skills: assay is the host daemon and distribution layer; warden is the per-cell virtual-machine monitor (one warden, one microVM, one cell); pilot is the in-cell supervisor."],
+];
 
+function ConceptsGuide() {
   return (
-    <Dialog open={open} onOpenChange={setOpen}>
+    <div className="space-y-6 text-sm">
+      <section aria-labelledby="concepts-start">
+        <h3 id="concepts-start" className="font-semibold">Start with an Agent. Give it work in a Run.</h3>
+        <p className="mt-2 text-muted-foreground leading-relaxed">
+          The Agent holds the configuration. The Run is the execution.
+          A native enduring conversation is one run with multiple turns.
+        </p>
+        <dl className="mt-4 divide-y divide-border rounded-md border px-4">
+          {CHOICES.map(([question, name, detail]) => (
+            <div key={name} className="py-3">
+              <dt className="font-medium"><span className="text-muted-foreground">{question}</span> {name}</dt>
+              <dd className="mt-1 text-muted-foreground leading-relaxed">{detail}</dd>
+            </div>
+          ))}
+        </dl>
+      </section>
+      <section aria-labelledby="concepts-example" className="rounded-md bg-muted/30 p-4 space-y-2">
+        <h3 id="concepts-example" className="font-semibold">Example: keep talking, contain each turn’s work</h3>
+        <p className="text-muted-foreground leading-relaxed">
+          Choose an approved native Harness, Celln and an enduring lifecycle.
+          Select the permitted workspace read/write and HTTPS fetch tools you need.
+          A parent cell keeps the live conversation context. Each turn does its
+          work in a disposable child cell, returns a result and is cleaned up.
+        </p>
+        <p className="text-muted-foreground leading-relaxed">
+          For a one-off Celln task, choose one-shot instead. Its cell finishes and
+          is cleaned up; no persistent parent is needed.
+        </p>
+      </section>
+      <section aria-labelledby="concepts-limits" className="space-y-2">
+        <h3 id="concepts-limits" className="font-semibold">What native Celln supports today</h3>
+        <ul className="list-disc space-y-2 pl-5 text-muted-foreground leading-relaxed">
+          <li>Opt-in Linux amd64/KVM execution with a single owner, one active turn, a small context budget (about 2 KiB), and finite lifetime and usage limits.</li>
+          <li>Approved workspace read/write and allowlisted HTTPS fetch. Model credentials stay on the host. Default tool suggestions are not permission grants.</li>
+          <li>Live context and workspace files last only as long as the parent. Parent loss is context loss—not automatic recovery. Native checkpoints and pause/resume are not available.</li>
+          <li>Existing Kubernetes agents and OCI harnesses remain available. Native Celln does not run arbitrary OCI/Pi/Hermes harnesses, shell, Python, SkillPack sidecars or arbitrary MCP integrations.</li>
+        </ul>
+      </section>
+      <details className="rounded-md border p-4">
+        <summary className="cursor-pointer font-semibold focus-visible:outline focus-visible:outline-2 focus-visible:outline-primary">Technical glossary and YAML names</summary>
+        <p className="mt-3 text-muted-foreground leading-relaxed">
+          AgentRun defaults to Kubernetes when <code>spec.backend</code> is omitted.
+          Select Celln with <code>backend: celln</code>. Native continuing runs use
+          {" "}<code>executionLifecycle: enduring</code> with an <code>enduring</code> limits block.
+          Native selections use <code>cellnSelection.runtimeRef</code> and <code>cellnSelection.toolRefs</code>;
+          the ordinary harness path uses <code>runtimeRef</code>. These fields are not a complete installation manifest.
+        </p>
+        <dl className="mt-4 space-y-4">
+          {GLOSSARY.map(([name, detail]) => (
+            <div key={name}>
+              <dt className="font-medium">{name}</dt>
+              <dd className="mt-1 text-muted-foreground leading-relaxed">{detail}</dd>
+            </div>
+          ))}
+        </dl>
+      </details>
+    </div>
+  );
+}
+
+function ConceptsDialog({ expanded = false }: { expanded?: boolean }) {
+  return (
+    <Dialog>
       <DialogTrigger asChild>
-        <button
-          title="Concepts"
-          className="flex items-center justify-center rounded-md p-1.5 text-muted-foreground hover:bg-white/5 hover:text-foreground transition-colors"
-        >
-          <HelpCircle className="h-4 w-4" />
+        <button aria-label="Concepts" title="Concepts"
+          className={expanded
+            ? "flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-xs font-medium text-muted-foreground hover:bg-white/5 hover:text-foreground transition-colors"
+            : "flex items-center justify-center rounded-md p-1.5 text-muted-foreground hover:bg-white/5 hover:text-foreground transition-colors"}>
+          <HelpCircle className="h-4 w-4" aria-hidden="true" />
+          {expanded && "Concepts"}
         </button>
       </DialogTrigger>
-      <DialogContent className="max-w-lg max-h-[80vh]">
-        <DialogHeader>
-          <DialogTitle className="text-lg">Sympozium Concepts</DialogTitle>
-          <p className="text-sm text-muted-foreground">
-            How the core resources relate to each other.
-          </p>
+      <DialogContent className="flex max-h-[85dvh] w-[calc(100%-2rem)] max-w-2xl flex-col overflow-hidden">
+        <DialogHeader className="shrink-0 pr-5">
+          <DialogTitle>How Sympozium fits together</DialogTitle>
+          <DialogDescription>A short guide to agents, runs and the choices that connect them.</DialogDescription>
         </DialogHeader>
-        <ScrollArea className="max-h-[60vh] pr-2">
-          <div className="space-y-4">
-            {/* Relationship diagram */}
-            <div className="rounded-md border border-border/50 bg-muted/20 px-4 py-3 text-xs font-mono text-muted-foreground">
-              <div className="flex items-center justify-center gap-1 flex-wrap">
-                <span className="text-violet-400">Model</span>
-                <ArrowRight className="h-3 w-3" />
-                <span className="text-blue-400">Ensemble</span>
-                <ArrowRight className="h-3 w-3" />
-                <span className="text-cyan-400">Agent Config</span>
-                <ArrowRight className="h-3 w-3" />
-                <span className="text-emerald-400">Agent</span>
-                <ArrowRight className="h-3 w-3" />
-                <span className="text-amber-400">AgentRun</span>
-              </div>
-              <p className="text-center mt-1 text-[10px]">
-                SkillPacks mount into Instances. Policies govern Instances.
-                Workflows connect Personas.
-              </p>
-            </div>
-
-            {/* Concept cards */}
-            {CONCEPTS.map((c) => (
-              <div
-                key={c.name}
-                className="rounded-md border border-border/50 px-4 py-3 space-y-1"
-              >
-                <div className="flex items-center gap-2">
-                  <span className="flex items-center justify-center h-6 w-6 rounded bg-primary/10 text-primary text-xs font-bold">
-                    {c.icon}
-                  </span>
-                  <h3 className="font-semibold text-sm">{c.name}</h3>
-                  <span className="text-xs text-muted-foreground ml-auto">
-                    {c.short}
-                  </span>
-                </div>
-                <p className="text-xs text-muted-foreground leading-relaxed">
-                  {c.detail}
-                </p>
-                {c.relates && (
-                  <p className="text-[10px] text-primary/70 italic">
-                    {c.relates}
-                  </p>
-                )}
-              </div>
-            ))}
-          </div>
-        </ScrollArea>
+        <div className="min-h-0 overflow-y-auto pr-2"><ConceptsGuide /></div>
       </DialogContent>
     </Dialog>
   );
 }
 
-/** Expanded variant for the sidebar (shows label text). */
-export function OntologyModalExpanded() {
-  const [open, setOpen] = useState(false);
-
-  return (
-    <Dialog open={open} onOpenChange={setOpen}>
-      <DialogTrigger asChild>
-        <button className="flex items-center gap-2 rounded-md px-2 py-1.5 text-xs font-medium text-muted-foreground hover:bg-white/5 hover:text-foreground transition-colors w-full">
-          <HelpCircle className="h-3.5 w-3.5" />
-          Concepts
-        </button>
-      </DialogTrigger>
-      <DialogContent className="max-w-lg max-h-[80vh]">
-        <DialogHeader>
-          <DialogTitle className="text-lg">Sympozium Concepts</DialogTitle>
-          <p className="text-sm text-muted-foreground">
-            How the core resources relate to each other.
-          </p>
-        </DialogHeader>
-        <ScrollArea className="max-h-[60vh] pr-2">
-          <div className="space-y-4">
-            <div className="rounded-md border border-border/50 bg-muted/20 px-4 py-3 text-xs font-mono text-muted-foreground">
-              <div className="flex items-center justify-center gap-1 flex-wrap">
-                <span className="text-violet-400">Model</span>
-                <ArrowRight className="h-3 w-3" />
-                <span className="text-blue-400">Ensemble</span>
-                <ArrowRight className="h-3 w-3" />
-                <span className="text-cyan-400">Agent Config</span>
-                <ArrowRight className="h-3 w-3" />
-                <span className="text-emerald-400">Agent</span>
-                <ArrowRight className="h-3 w-3" />
-                <span className="text-amber-400">AgentRun</span>
-              </div>
-              <p className="text-center mt-1 text-[10px]">
-                SkillPacks mount into Instances. Policies govern Instances.
-                Workflows connect Personas.
-              </p>
-            </div>
-
-            {CONCEPTS.map((c) => (
-              <div
-                key={c.name}
-                className="rounded-md border border-border/50 px-4 py-3 space-y-1"
-              >
-                <div className="flex items-center gap-2">
-                  <span className="flex items-center justify-center h-6 w-6 rounded bg-primary/10 text-primary text-xs font-bold">
-                    {c.icon}
-                  </span>
-                  <h3 className="font-semibold text-sm">{c.name}</h3>
-                  <span className="text-xs text-muted-foreground ml-auto">
-                    {c.short}
-                  </span>
-                </div>
-                <p className="text-xs text-muted-foreground leading-relaxed">
-                  {c.detail}
-                </p>
-                {c.relates && (
-                  <p className="text-[10px] text-primary/70 italic">
-                    {c.relates}
-                  </p>
-                )}
-              </div>
-            ))}
-          </div>
-        </ScrollArea>
-      </DialogContent>
-    </Dialog>
-  );
-}
+export function OntologyModal() { return <ConceptsDialog />; }
+export function OntologyModalExpanded() { return <ConceptsDialog expanded />; }

@@ -1,10 +1,14 @@
-import { useState } from "react";
-import { Link } from "react-router-dom";
+import { useEffect, useState } from "react";
+import { Link, useLocation, useNavigate, useSearchParams } from "react-router-dom";
+import { executionFromWizard } from "@/lib/agent-execution";
+import { skillRefsFromWizard } from "@/lib/create-fields";
 import {
   useAgents,
   useDeleteAgent,
   useCreateAgent,
   useSkills,
+  useRuntimes,
+  usePolicies,
 } from "@/hooks/use-api";
 import { StatusBadge } from "@/components/status-badge";
 import {
@@ -24,17 +28,31 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Skeleton } from "@/components/ui/skeleton";
-import { Plus, Trash2, ExternalLink, ShieldAlert } from "lucide-react";
+import { Trash2, ExternalLink, ShieldAlert, MessageSquare } from "lucide-react";
 import { formatAge } from "@/lib/utils";
 
 export function AgentsPage() {
   const { data, isLoading } = useAgents();
   const { data: skillPacks } = useSkills();
+  const { data: runtimes } = useRuntimes();
+  const { data: policies } = usePolicies();
+  const [searchParams] = useSearchParams();
+  const navigate = useNavigate();
+  const location = useLocation();
   const deleteAgent = useDeleteAgent();
   const createAgent = useCreateAgent();
   const [wizardOpen, setWizardOpen] = useState(false);
   const [search, setSearch] = useState("");
   const [whatsAppInstance, setWhatsAppInstance] = useState<string | null>(null);
+  const harnessIncompatibleSkills = (skillPacks || [])
+    .filter((skill) => skill.spec.sidecar?.hostAccess?.enabled)
+    .map((skill) => skill.metadata.name);
+
+  useEffect(() => {
+    if (searchParams.get("create") === "1") {
+      setWizardOpen(true);
+    }
+  }, [searchParams, location.key]);
 
   const filtered = (data || [])
     .filter((inst) =>
@@ -42,8 +60,10 @@ export function AgentsPage() {
     )
     .sort((a, b) => a.metadata.name.localeCompare(b.metadata.name));
 
+  // Returns the creation so the wizard can say what a failed Celln Agent left
+  // behind; the mutation still reports every failure itself.
   function handleComplete(result: WizardResult) {
-    createAgent.mutate(
+    return createAgent.mutateAsync(
       {
         name: result.name,
         provider: result.provider,
@@ -55,22 +75,10 @@ export function AgentsPage() {
         awsAccessKeyId: result.awsAccessKeyId || undefined,
         awsSecretAccessKey: result.awsSecretAccessKey || undefined,
         awsSessionToken: result.awsSessionToken || undefined,
-        skills: result.skills.map((skillPackRef) => {
-          if (skillPackRef === "web-endpoint") {
-            const params: Record<string, string> = {};
-            if (result.webEndpointRPM && result.webEndpointRPM !== "60") {
-              params.rate_limit_rpm = result.webEndpointRPM;
-            }
-            if (result.webEndpointHostname) {
-              params.hostname = result.webEndpointHostname;
-            }
-            return {
-              skillPackRef,
-              params: Object.keys(params).length > 0 ? params : undefined,
-            };
-          }
-          return { skillPackRef };
-        }),
+        runtimeRef: result.runtimeRef || undefined,
+        policyRef: result.policyRef || undefined,
+        execution: executionFromWizard(result),
+        skills: skillRefsFromWizard(result),
         channels: result.channels.map((type) => ({
           type,
           configRef: result.channelConfigs[type]
@@ -78,6 +86,10 @@ export function AgentsPage() {
             : undefined,
         })),
         heartbeatInterval: result.heartbeatInterval || undefined,
+        nodeSelector:
+          result.nodeSelector && Object.keys(result.nodeSelector).length > 0
+            ? result.nodeSelector
+            : undefined,
         agentSandbox: result.agentSandboxEnabled
           ? {
               enabled: true,
@@ -90,6 +102,11 @@ export function AgentsPage() {
       {
         onSuccess: () => {
           setWizardOpen(false);
+          const runtime = runtimes?.find((candidate) => candidate.metadata.name === result.runtimeRef);
+          if (runtime?.spec.contractVersion === "v1alpha2" && runtime.spec.session?.protocol === "openai-chat") {
+            navigate(`/agents/${encodeURIComponent(result.name)}?tab=chat`);
+            return;
+          }
           if (result.channels.includes("whatsapp")) {
             setWhatsAppInstance(result.name);
           }
@@ -100,20 +117,11 @@ export function AgentsPage() {
 
   return (
     <div className="space-y-4">
-      <div className="flex items-center justify-between">
-        <div>
-          <h1 className="text-2xl font-bold">Agents</h1>
-          <p className="text-sm text-muted-foreground">
-            Manage agents — each represents an agent identity
-          </p>
-        </div>
-        <Button
-          size="sm"
-          className="bg-primary hover:bg-primary/90 text-primary-foreground border-0"
-          onClick={() => setWizardOpen(true)}
-        >
-          <Plus className="mr-2 h-4 w-4" /> Create Agent
-        </Button>
+      <div>
+        <h1 className="text-2xl font-bold">Agents</h1>
+        <p className="text-sm text-muted-foreground">
+          Manage agents — each represents an agent identity
+        </p>
       </div>
 
       <Input
@@ -142,14 +150,7 @@ export function AgentsPage() {
               >
                 Enable an ensemble
               </Link>{" "}
-              to create agents automatically, or{" "}
-              <button
-                onClick={() => setWizardOpen(true)}
-                className="text-blue-400 hover:text-blue-300"
-              >
-                create one manually
-              </button>
-              .
+              to create agents automatically, or use Create in the header.
             </p>
           )}
         </div>
@@ -239,7 +240,12 @@ export function AgentsPage() {
                 <TableCell className="text-sm text-muted-foreground">
                   {formatAge(inst.metadata.creationTimestamp)}
                 </TableCell>
-                <TableCell>
+                <TableCell><div className="flex items-center gap-1">
+                  {(() => {
+                    const runtime = runtimes?.find((candidate) => candidate.metadata.name === inst.spec.runtimeRef);
+                    const persistent = runtime?.spec.contractVersion === "v1alpha2" && runtime.spec.session?.protocol === "openai-chat";
+                    return persistent ? <Button asChild variant="ghost" size="icon" title="Open persistent chat"><Link to={`/agents/${inst.metadata.name}?tab=chat`}><MessageSquare className="h-4 w-4" /></Link></Button> : null;
+                  })()}
                   <Button
                     variant="ghost"
                     size="icon"
@@ -249,7 +255,7 @@ export function AgentsPage() {
                   >
                     <Trash2 className="h-4 w-4 text-destructive" />
                   </Button>
-                </TableCell>
+                </div></TableCell>
               </TableRow>
             ))}
           </TableBody>
@@ -258,14 +264,23 @@ export function AgentsPage() {
 
       {/* Shared onboarding wizard in agent mode */}
       <OnboardingWizard
+        key={location.key}
         open={wizardOpen}
         onClose={() => setWizardOpen(false)}
         mode="agent"
+        creationKind={searchParams.get("kind") === "agent" || searchParams.has("runtime") ? "agent" : "run"}
         availableSkills={(skillPacks || []).map((s) => s.metadata.name)}
+        availableRuntimes={runtimes || []}
+        availablePolicies={policies || []}
+        harnessIncompatibleSkills={harnessIncompatibleSkills}
         defaults={{
           provider: "openai",
           model: "gpt-4o",
           skills: ["k8s-ops", "llmfit", "memory"],
+          ...(searchParams.get("runtime") ? {
+            runtimeRef: searchParams.get("runtime") || "",
+            policyRef: searchParams.get("policy") || "harness-examples",
+          } : {}),
         }}
         onComplete={handleComplete}
         isPending={createAgent.isPending}

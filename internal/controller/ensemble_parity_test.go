@@ -50,6 +50,15 @@ var agentFieldsNotExpressibleByEnsemble = map[string]string{
 	"ImagePullSecrets":            "no EnsembleSpec field; cluster-level registry credentials are not an ensemble concept",
 }
 
+// agentFieldsPreservedOutOfBand are intentionally not derived from an Ensemble
+// but survive reconciliation because a different owner is authoritative for
+// them. Keep this list small: every entry is an exception to whole-spec
+// convergence and needs explicit reconciliation code plus a preservation test.
+var agentFieldsPreservedOutOfBand = map[string]string{
+	"RuntimeRef": "runtime selection is administrator-owned rather than persona-owned",
+	"Execution":  "execution environment/lifecycle/tool defaults are administrator-owned rather than persona-owned",
+}
+
 // ── the properties ────────────────────────────────────────────────────────────
 
 // TestAgentUpdateConvergesToCreate perturbs every field of a persisted Agent and
@@ -66,6 +75,8 @@ func TestAgentUpdateConvergesToCreate(t *testing.T) {
 	// A persisted Agent whose spec is entirely wrong.
 	drifted := wantAgent.DeepCopy()
 	fillStruct(t, reflect.ValueOf(&drifted.Spec).Elem(), 0)
+	wantAgent.Spec.RuntimeRef = drifted.Spec.RuntimeRef
+	wantAgent.Spec.Execution = drifted.Spec.Execution.DeepCopy()
 
 	r := newEnsembleTestReconciler(t, drifted)
 	if _, err := r.reconcileAgentConfig(context.Background(), logr.Discard(), pack, persona, 0, ""); err != nil {
@@ -78,6 +89,41 @@ func TestAgentUpdateConvergesToCreate(t *testing.T) {
 		t.Errorf("update path did not converge at %s\n  buildAgent (create): %s\n  after update:        %s\n\n"+
 			"reconcileAgentConfig assigns the whole spec from buildAgent; a difference here means "+
 			"something is mutating the spec after that assignment.", d.path, d.a, d.b)
+	}
+}
+
+func TestAgentRuntimeRefSurvivesEnsembleReconcile(t *testing.T) {
+	pack, persona := convergenceFixture()
+	instanceName := agentInstanceName(pack, persona)
+	existing := (&EnsembleReconciler{}).buildAgent(pack, persona, instanceName, "")
+	existing.Spec.RuntimeRef = "codex-v1"
+
+	r := newEnsembleTestReconciler(t, existing)
+	if _, err := r.reconcileAgentConfig(context.Background(), logr.Discard(), pack, persona, 0, ""); err != nil {
+		t.Fatalf("reconcileAgentConfig: %v", err)
+	}
+
+	got := getAgent(t, r, instanceName, existing.Namespace)
+	if got.Spec.RuntimeRef != "codex-v1" {
+		t.Fatalf("runtimeRef = %q after Ensemble reconcile, want administrator-owned value preserved", got.Spec.RuntimeRef)
+	}
+}
+
+func TestAgentExecutionDefaultsSurviveEnsembleReconcile(t *testing.T) {
+	pack, persona := convergenceFixture()
+	instanceName := agentInstanceName(pack, persona)
+	existing := (&EnsembleReconciler{}).buildAgent(pack, persona, instanceName, "")
+	existing.Spec.Execution = &sympoziumv1alpha1.AgentExecutionDefaults{
+		Backend: "celln", ExecutionLifecycle: "one-shot", Provider: "deepseek", Model: "deepseek-chat",
+		CellnSelection: &sympoziumv1alpha1.CellnCatalogueSelection{ToolRefs: []sympoziumv1alpha1.CellnCatalogueToolRef{}},
+	}
+	r := newEnsembleTestReconciler(t, existing)
+	if _, err := r.reconcileAgentConfig(context.Background(), logr.Discard(), pack, persona, 0, ""); err != nil {
+		t.Fatalf("reconcileAgentConfig: %v", err)
+	}
+	got := getAgent(t, r, instanceName, existing.Namespace)
+	if got.Spec.Execution == nil || got.Spec.Execution.Backend != "celln" || got.Spec.Execution.CellnSelection == nil {
+		t.Fatalf("execution defaults lost after Ensemble reconcile: %+v", got.Spec.Execution)
 	}
 }
 
@@ -196,9 +242,16 @@ func TestAgentSpecFieldsAreEnsembleExpressible(t *testing.T) {
 				t.Errorf("agentFieldsNotExpressibleByEnsemble[%q] says %q, but buildAgent does set it — delete the entry",
 					path, reason)
 			}
+			if reason, declared := agentFieldsPreservedOutOfBand[path]; declared {
+				t.Errorf("agentFieldsPreservedOutOfBand[%q] says %q, but buildAgent does set it — delete the entry",
+					path, reason)
+			}
 			continue
 		}
 		if _, declared := agentFieldsNotExpressibleByEnsemble[path]; declared {
+			continue
+		}
+		if _, declared := agentFieldsPreservedOutOfBand[path]; declared {
 			continue
 		}
 		t.Errorf("buildAgent leaves AgentSpec.%s unset.\n"+
@@ -221,12 +274,17 @@ func TestInexpressibleFieldsHaveReasons(t *testing.T) {
 	for _, p := range enumerateFieldPaths(specType, "") {
 		valid[p] = true
 	}
-	for path, reason := range agentFieldsNotExpressibleByEnsemble {
-		if strings.TrimSpace(reason) == "" {
-			t.Errorf("agentFieldsNotExpressibleByEnsemble[%q] has an empty reason", path)
-		}
-		if !valid[path] {
-			t.Errorf("agentFieldsNotExpressibleByEnsemble[%q]: no such AgentSpec field path — delete the entry", path)
+	for listName, fields := range map[string]map[string]string{
+		"agentFieldsNotExpressibleByEnsemble": agentFieldsNotExpressibleByEnsemble,
+		"agentFieldsPreservedOutOfBand":       agentFieldsPreservedOutOfBand,
+	} {
+		for path, reason := range fields {
+			if strings.TrimSpace(reason) == "" {
+				t.Errorf("%s[%q] has an empty reason", listName, path)
+			}
+			if !valid[path] {
+				t.Errorf("%s[%q]: no such AgentSpec field path — delete the entry", listName, path)
+			}
 		}
 	}
 }
@@ -339,6 +397,10 @@ func convergenceFixture() (*sympoziumv1alpha1.Ensemble, *sympoziumv1alpha1.Agent
 				{Name: "warm", Image: "busybox:1.36", Command: []string{"sh", "-c", "true"}},
 			},
 		},
+		Workspace: &sympoziumv1alpha1.WorkspaceSpec{PerSessionPVC: true, Size: "2Gi"},
+		Tolerations: []corev1.Toleration{{
+			Key: "dedicated", Operator: corev1.TolerationOpEqual, Value: "agents", Effect: corev1.TaintEffectNoSchedule,
+		}},
 	}
 	return pack, persona
 }

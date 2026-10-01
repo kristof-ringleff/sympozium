@@ -4,14 +4,27 @@ import {
   useAgent,
   useCapabilities,
   usePatchAgent,
+  useCreateHarnessSession,
+  useCellnTools,
+  useHarnessSessions,
+  useSetHarnessSessionState,
+  useRuntimes,
   useRuns,
+  useCellnPlatformProfiles,
 } from "@/hooks/use-api";
+import { HarnessSessionChatDialog } from "@/components/harness-session-dialog";
+import { CellnAgentConversation } from "@/components/celln-agent-conversation";
+import { isCellnEnduringAgent } from "@/lib/persistent-harness";
+import { CellnStarterTools } from "@/components/celln-starter-tools";
+import { CellnPermissionPreview } from "@/components/celln-permission-preview";
+import { CellnAgentConnection } from "@/components/celln-agent-connection";
 import { StatusBadge } from "@/components/status-badge";
 import { GithubAuthDialog } from "@/components/github-auth-dialog";
 import {
   api,
   type SkillRef,
   type Agent,
+  type AgentExecutionDefaults,
   type AgentSandboxInstanceSpec,
   type CapabilityStatus,
   type LifecycleHooks,
@@ -30,6 +43,13 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
 import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import {
   Dialog,
   DialogContent,
   DialogHeader,
@@ -37,6 +57,7 @@ import {
 } from "@/components/ui/dialog";
 import {
   AlertTriangle,
+  MessageSquare,
   Plus,
   Pencil,
   Trash2,
@@ -44,12 +65,14 @@ import {
 } from "lucide-react";
 import { Breadcrumbs } from "@/components/breadcrumbs";
 import { useRunsSeen } from "@/hooks/use-runs-seen";
+import { LEGACY_ENDURING_DEFAULTS } from "@/lib/agent-execution";
 import {
   costTooltip,
   effectiveCost,
   formatAge,
   formatUsd,
   sumEffectiveCosts,
+  taskText,
   truncate,
 } from "@/lib/utils";
 import { YamlButton, instanceYamlFromResource } from "@/components/yaml-panel";
@@ -59,6 +82,9 @@ export function AgentDetailPage() {
   const [searchParams, setSearchParams] = useSearchParams();
   const allowedTabs = new Set([
     "overview",
+    "chat",
+    "harness",
+    "ensemble",
     "runs",
     "channels",
     "skills",
@@ -74,6 +100,11 @@ export function AgentDetailPage() {
   const connectGithub = searchParams.get("connect") === "github";
   const { data: inst, isLoading } = useAgent(name || "");
   const { data: capabilities } = useCapabilities();
+  const { data: runtimes } = useRuntimes();
+  const { data: harnessSessions } = useHarnessSessions();
+  const createHarnessSession = useCreateHarnessSession();
+  const setHarnessSessionState = useSetHarnessSessionState();
+  const [chatOpen, setChatOpen] = useState(false);
   const { data: allRuns } = useRuns();
   const { isUnseen } = useRunsSeen();
   const instanceRuns = (allRuns || [])
@@ -113,12 +144,36 @@ export function AgentDetailPage() {
     return <p className="text-muted-foreground">Agent not found</p>;
   }
 
+  const selectedRuntime = runtimes?.find((runtime) => runtime.metadata.name === inst.spec.runtimeRef);
+  const agentName = inst.metadata.name;
+  const persistentHarness = selectedRuntime?.spec.contractVersion === "v1alpha2" && selectedRuntime.spec.session?.protocol === "openai-chat";
+  // Native Celln conversations are enduring AgentRuns, not HarnessSessions.
+  const nativeCellnEnduring = isCellnEnduringAgent(inst, selectedRuntime);
+  // Every enduring run of this Agent is its own conversation (own parent, own
+  // context); the page lists them all, newest first.
+  const enduringParents = (allRuns || [])
+    .filter(
+      (run) =>
+        run.spec.agentRef === agentName &&
+        run.spec.executionLifecycle === "enduring" &&
+        !run.metadata.deletionTimestamp,
+    )
+    .sort((a, b) =>
+      (b.metadata.creationTimestamp || "").localeCompare(
+        a.metadata.creationTimestamp || "",
+      ),
+    );
+  const chatSession = harnessSessions?.find((session) => session.spec.agentRef === agentName && session.spec.runtimeRef === selectedRuntime?.metadata.name);
+  function startChat() {
+    if (!selectedRuntime) return;
+    createHarnessSession.mutate({ name: defaultChatSessionName(agentName), agentRef: agentName, runtimeRef: selectedRuntime.metadata.name });
+  }
+
   return (
     <div className="space-y-6">
       <div className="space-y-1">
         <Breadcrumbs
           items={[
-            { label: "Ensembles", to: "/ensembles" },
             { label: "Agents", to: "/agents" },
             { label: inst.metadata.name },
           ]}
@@ -133,6 +188,9 @@ export function AgentDetailPage() {
       <Tabs value={activeTab} onValueChange={setActiveTab}>
         <TabsList>
           <TabsTrigger value="overview">Overview</TabsTrigger>
+          {persistentHarness && <TabsTrigger value="chat"><MessageSquare className="mr-1 h-3.5 w-3.5" />Chat</TabsTrigger>}
+          <TabsTrigger value="harness">Harness</TabsTrigger>
+          <TabsTrigger value="ensemble">Ensemble</TabsTrigger>
           <TabsTrigger value="runs">
             Runs{instanceRuns.length > 0 ? ` (${instanceRuns.length})` : ""}
           </TabsTrigger>
@@ -210,6 +268,41 @@ export function AgentDetailPage() {
           </div>
         </TabsContent>
 
+        {persistentHarness && <TabsContent value="chat">
+          <Card>
+            <CardHeader><CardTitle className="flex items-center gap-2 text-base"><MessageSquare className="h-4 w-4" />Persistent chat</CardTitle></CardHeader>
+            <CardContent className="space-y-4 text-sm">
+              <p className="text-muted-foreground">This Agent’s harness is a durable conversation pod. Chat turns stay in that harness; use the Runs tab only for explicit one-shot or workflow executions.</p>
+              {!chatSession ? <Button onClick={startChat} disabled={createHarnessSession.isPending}>{createHarnessSession.isPending ? "Requesting chat…" : "Retry session creation"}</Button> : chatSession.status?.phase === "Ready" ? <div className="flex items-center justify-between rounded border p-3"><div><p className="font-mono text-xs">{chatSession.metadata.name}</p><p className="text-xs text-muted-foreground">Ready · durable {selectedRuntime.metadata.name} conversation</p></div><div className="flex gap-2"><Button variant="outline" onClick={() => setHarnessSessionState.mutate({ name: chatSession.metadata.name, desiredState: "stopped" })} disabled={setHarnessSessionState.isPending}>Stop</Button><Button onClick={() => setChatOpen(true)}><MessageSquare className="mr-2 h-4 w-4" />Open chat</Button></div></div> : chatSession.status?.phase === "Failed" ? <div className="rounded border border-destructive/50 bg-destructive/5 p-3"><p className="font-medium text-destructive">Persistent chat failed to start</p><p className="mt-1 text-xs text-muted-foreground">{chatSession.status.conditions?.find((condition) => condition.type === "Ready")?.message || "The session controller did not provide a failure reason."}</p><div className="mt-3 flex gap-2"><Button variant="outline" onClick={() => setHarnessSessionState.mutate({ name: chatSession.metadata.name, desiredState: "running" })} disabled={setHarnessSessionState.isPending}>Retry</Button></div></div> : chatSession.spec.desiredState === "stopped" || chatSession.status?.phase === "Draining" ? <div className="flex items-center justify-between rounded border p-3"><div><p className="font-mono text-xs">{chatSession.metadata.name}</p><p className="text-xs text-muted-foreground">Chat is stopped. Resume it when you want to continue.</p></div><Button onClick={() => setHarnessSessionState.mutate({ name: chatSession.metadata.name, desiredState: "running" })} disabled={setHarnessSessionState.isPending}>Resume chat</Button></div> : <div className="rounded border p-3 text-muted-foreground">Starting persistent chat session… <span className="font-mono">{chatSession.status?.phase || "Pending"}</span>{(() => { const ready = chatSession.status?.conditions?.find((condition) => condition.type === "Ready"); return ready?.message && ready.reason !== "WaitingForDeployment" ? <p className="mt-1 text-xs">{ready.message}</p> : null; })()}<div className="mt-3"><Button variant="outline" size="sm" onClick={() => setHarnessSessionState.mutate({ name: chatSession.metadata.name, desiredState: "stopped" })} disabled={setHarnessSessionState.isPending}>Stop</Button></div></div>}
+            </CardContent>
+          </Card>
+        </TabsContent>}
+
+        <TabsContent value="harness">
+          <div className="space-y-4">
+            <Card>
+              <CardHeader>
+                <CardTitle className="text-base">How this Agent executes</CardTitle>
+              </CardHeader>
+              <CardContent className="text-sm text-muted-foreground">
+                A harness supplies the agent loop. Sympozium still owns the
+                AgentRun lifecycle, policy, per-run identity, skills, memory,
+                MCP integrations, and execution audit. Leave the runtime on
+                <span className="font-medium text-foreground"> Built-in agent-runner</span>
+                to preserve the native execution path.
+              </CardContent>
+            </Card>
+            <AgentRuntimeCard inst={inst} runtimes={runtimes || []} />
+            {nativeCellnEnduring && (
+              <CellnAgentConversation agent={inst} parents={enduringParents} />
+            )}
+          </div>
+        </TabsContent>
+
+        <TabsContent value="ensemble">
+          <AgentEnsembleCard inst={inst} />
+        </TabsContent>
+
         <TabsContent value="runs">
           <Card>
             <CardContent className="pt-6">
@@ -247,7 +340,7 @@ export function AgentDetailPage() {
                           {run.metadata.name}
                         </span>
                         <span className="text-xs text-muted-foreground truncate max-w-xs hidden sm:inline">
-                          {truncate(run.spec.task, 50)}
+                          {truncate(taskText(run.spec.task), 50)}
                         </span>
                       </div>
                       <div className="flex items-center gap-3 shrink-0">
@@ -417,7 +510,241 @@ export function AgentDetailPage() {
           </Card>
         </TabsContent>
       </Tabs>
+      {chatSession && <HarnessSessionChatDialog open={chatOpen} onOpenChange={setChatOpen} session={chatSession} />}
     </div>
+  );
+}
+
+function defaultChatSessionName(agentName: string) {
+  return `${agentName.slice(0, 57).replace(/-+$/, "")}-chat`;
+}
+
+function AgentRuntimeCard({ inst, runtimes }: { inst: Agent; runtimes: import("@/lib/api").AgentRuntime[] }) {
+  const patchAgent = usePatchAgent();
+  const catalogue = useCellnTools();
+  const capabilities = useCapabilities();
+  const platformProfiles = useCellnPlatformProfiles();
+  const selected = inst.spec.runtimeRef || "none";
+  const selectedRuntime = runtimes.find((runtime) => runtime.metadata.name === (inst.spec.runtimeRef || ""));
+  const execution = inst.spec.execution;
+  const backend = execution?.backend || "job";
+  const lifecycle =
+    execution?.executionLifecycle || (backend === "celln" ? "enduring" : "one-shot");
+  const tools = execution?.cellnSelection?.toolRefs || [];
+  // A fleet wrapper (cellnProfileRef) is native Celln too: its tools and model
+  // route come from the shared platform policy rather than namespace grants.
+  const wrapperRuntime = !!selectedRuntime?.spec.cellnProfileRef;
+  const wrapperProfile = wrapperRuntime ? (platformProfiles.data || []).find((profile) => profile.name === selectedRuntime?.spec.cellnProfileRef?.name) : undefined;
+  const compatibleHarness = selectedRuntime?.spec.celln?.contractVersion === "celln.json-tools/v1" || wrapperRuntime;
+  const hasSkills = !!inst.spec.skills?.length;
+  // Every save keeps the selection's runtime and shared tools; only the
+  // borrowed (namespaced) tool list is what the card edits.
+  const selectionWith = (toolRefs: typeof tools) => ({ ...(execution?.cellnSelection || {}), toolRefs });
+  const enduringDefaults = execution?.enduring || wrapperProfile?.sessionDefaults || LEGACY_ENDURING_DEFAULTS;
+  const runtimeLabel = (runtime: import("@/lib/api").AgentRuntime) => {
+    const profile = runtime.spec.cellnProfileRef ? (platformProfiles.data || []).find((candidate) => candidate.name === runtime.spec.cellnProfileRef?.name) : undefined;
+    if (profile) return `${runtime.metadata.name} — Celln fleet runtime (${profile.name})`;
+    return `${runtime.metadata.name}${runtime.spec.supportOwner ? ` — ${runtime.spec.supportOwner}` : ""}${runtime.spec.celln?.contractVersion === "celln.json-tools/v1" ? " · native Celln" : ""}`;
+  };
+
+  function saveExecution(next: AgentExecutionDefaults | undefined) {
+    if (!next) {
+      patchAgent.mutate({ name: inst.metadata.name, data: { clearExecution: true } });
+      return;
+    }
+    patchAgent.mutate({ name: inst.metadata.name, data: { execution: next } });
+  }
+
+  return (
+    <Card data-testid="agent-execution-defaults">
+      <CardHeader>
+        <CardTitle className="text-base">Execution defaults</CardTitle>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        <p className="text-sm text-muted-foreground">
+          Saved on the Agent and inherited by New Run, feed quick-send, API, channels and schedules unless a run overrides them. Defaults and starter suggestions do not grant authority. Changing these settings does not mutate an already-live native Celln parent.
+        </p>
+
+        <div className="space-y-2" data-testid="agent-execution-environment">
+          <Label>Execution environment</Label>
+          <div className="grid gap-2 sm:grid-cols-2">
+            {([["job", "Kubernetes", "Default · containers and OCI harnesses"], ["celln", "Celln", "Opt-in · hardware-isolated cells"]] as const).map(([value, title, description]) => (
+              <button
+                key={value}
+                type="button"
+                className={`rounded-md border p-3 text-left ${backend === value ? "border-primary bg-primary/5" : "border-border"}`}
+                disabled={patchAgent.isPending || (value === "celln" && hasSkills)}
+                onClick={() => {
+                  if (value === "job") {
+                    saveExecution({ backend: "job", executionLifecycle: "one-shot" });
+                    return;
+                  }
+                  // Switching to Celln defaults to the enduring native parent;
+                  // an explicit lifecycle already chosen for Celln is preserved.
+                  const nextLifecycle = backend === "celln" ? lifecycle : "enduring";
+                  saveExecution({
+                    backend: "celln",
+                    executionLifecycle: nextLifecycle,
+                    provider: execution?.modelConnectionRef ? undefined : execution?.provider || "deepseek",
+                    modelConnectionRef: execution?.modelConnectionRef,
+                    model: execution?.model || wrapperProfile?.model || "deepseek-chat",
+                    cellnSelection: selectionWith(tools),
+                    enduring: nextLifecycle === "enduring" ? enduringDefaults : undefined,
+                  });
+                }}
+              >
+                <p className="font-medium text-sm">{title}</p>
+                <p className="text-xs text-muted-foreground">{description}</p>
+              </button>
+            ))}
+          </div>
+          {hasSkills && <p role="alert" className="text-xs text-red-400">This Agent has SkillPacks. Native Celln needs a dedicated Agent with borrowed tools instead.</p>}
+          <p className="text-xs text-muted-foreground">
+            {capabilities.data?.celln.available
+              ? (capabilities.data.celln.oneShot?.reason || capabilities.data.celln.reason || "Celln one-shot preflight eligible.")
+              : `Celln readiness: ${capabilities.data?.celln.state || "unknown"} — ${capabilities.data?.celln.reason || "not confirmed"}. Transport/config issues are not the same as Celln being absent.`}
+          </p>
+        </div>
+
+        <div className="space-y-2">
+          <Label>Default harness</Label>
+          <Select
+            value={selected}
+            onValueChange={(value) => patchAgent.mutate({
+              name: inst.metadata.name,
+              data: { runtimeRef: value === "none" ? "" : value },
+            })}
+            disabled={patchAgent.isPending}
+          >
+            <SelectTrigger>
+              <SelectValue placeholder="Built-in agent-runner" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="none">Built-in agent-runner</SelectItem>
+              {runtimes.map((runtime) => (
+                <SelectItem key={runtime.metadata.name} value={runtime.metadata.name}>
+                  {runtimeLabel(runtime)}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          <p className="text-xs text-muted-foreground">Harness selection does not by itself select Celln or grant tools.</p>
+          {backend === "celln" && !compatibleHarness && <p role="alert" className="text-xs text-red-400">Celln defaults need a harness that declares celln.json-tools/v1.</p>}
+        </div>
+
+        {backend === "celln" && <CellnAgentConnection agent={inst} />}
+
+        {backend === "celln" && (
+          <div className="space-y-3 rounded-md border p-3">
+            <Label>Default lifecycle</Label>
+            <div className="grid gap-2 sm:grid-cols-2 text-sm" data-testid="agent-lifecycle">
+              {([["one-shot", "One-shot", "Answers once on a single-turn parent, then releases its cells."], ["enduring", "Enduring", "A conversation: the parent keeps its context for the lease and takes follow-up turns."]] as const).map(([value, title, description]) => (
+                <label key={value} className={`flex items-start gap-2 rounded-md border p-3 ${lifecycle === value ? "border-primary bg-primary/5" : "border-border"}`}>
+                  <input
+                    type="radio"
+                    name="agent-lifecycle"
+                    className="mt-1"
+                    checked={lifecycle === value}
+                    disabled={patchAgent.isPending}
+                    onChange={() => saveExecution({
+                      backend: "celln",
+                      executionLifecycle: value,
+                      provider: execution?.modelConnectionRef ? undefined : execution?.provider || "deepseek",
+                      modelConnectionRef: execution?.modelConnectionRef,
+                      model: execution?.model || wrapperProfile?.model || "deepseek-chat",
+                      cellnSelection: selectionWith(tools),
+                      enduring: value === "enduring" ? enduringDefaults : undefined,
+                    })}
+                  />
+                  <span>
+                    <span className="font-medium">{title}</span>
+                    <span className="block text-xs text-muted-foreground">{description}</span>
+                  </span>
+                </label>
+              ))}
+            </div>
+            {wrapperRuntime ? (
+              <div className="space-y-1" data-testid="agent-shared-tools">
+                <Label>Shared tools (from the fleet policy)</Label>
+                <p className="text-xs text-muted-foreground">
+                  {(execution?.cellnSelection?.clusterToolRefs || []).map((tool) => tool.name).join(", ") || "none (chat only)"}. Lent by the platform policy; nothing is copied into this namespace. Commands such as grep or jq are real programs from digest-pinned images; the Runs page shows each tool's source image.
+                </p>
+              </div>
+            ) : (
+            <div className="space-y-2">
+              <Label>Approved borrowed tools (default)</Label>
+              <p className="text-xs text-muted-foreground">An explicit empty selection lends no tools and is distinct from leaving defaults unset. Starter suggestions do not grant permission.</p>
+              {compatibleHarness && !catalogue.isLoading && !catalogue.isError && (
+                <CellnStarterTools agentRef={inst.metadata.name} runtimeRef={inst.spec.runtimeRef || undefined} catalogue={catalogue.data || []} onSelect={(toolRefs) => saveExecution({
+                  backend: "celln",
+                  executionLifecycle: lifecycle === "enduring" ? "enduring" : "one-shot",
+                  provider: execution?.modelConnectionRef ? undefined : execution?.provider || "deepseek",
+                  modelConnectionRef: execution?.modelConnectionRef,
+                  model: execution?.model || "deepseek-chat",
+                  cellnSelection: selectionWith(toolRefs),
+                  enduring: lifecycle === "enduring" ? enduringDefaults : undefined,
+                })} />
+              )}
+              {compatibleHarness && <CellnPermissionPreview enduring={lifecycle === "enduring"} agentRef={inst.metadata.name} selection={{ runtimeRef: inst.spec.runtimeRef || undefined, toolRefs: tools }} />}
+              <Button type="button" variant="outline" size="sm" disabled={patchAgent.isPending || !execution?.cellnSelection} onClick={() => saveExecution({
+                backend: "celln",
+                executionLifecycle: lifecycle === "enduring" ? "enduring" : "one-shot",
+                provider: execution?.modelConnectionRef ? undefined : execution?.provider || "deepseek",
+                modelConnectionRef: execution?.modelConnectionRef,
+                model: execution?.model || "deepseek-chat",
+                cellnSelection: selectionWith([]),
+                enduring: lifecycle === "enduring" ? enduringDefaults : undefined,
+              })}>Set explicit empty tools</Button>
+            </div>
+            )}
+          </div>
+        )}
+
+        {execution && (
+          <Button type="button" variant="ghost" size="sm" disabled={patchAgent.isPending} onClick={() => saveExecution(undefined)}>
+            Clear execution defaults (restore Kubernetes-only behaviour)
+          </Button>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+function AgentEnsembleCard({ inst }: { inst: Agent }) {
+  const ensembleName = inst.metadata.labels?.["sympozium.ai/ensemble"];
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="text-base">Ensemble membership</CardTitle>
+      </CardHeader>
+      <CardContent className="space-y-3 text-sm">
+        {ensembleName ? (
+          <>
+            <p className="text-muted-foreground">
+              This Agent was created and is coordinated by the following Ensemble.
+              Its runtime remains a separate administrator-owned execution choice.
+            </p>
+            <Link
+              to={`/ensembles/${ensembleName}`}
+              className="inline-flex items-center gap-2 rounded-md border px-3 py-2 font-mono text-blue-400 hover:bg-white/5"
+            >
+              {ensembleName}
+              <ExternalLink className="h-3.5 w-3.5" />
+            </Link>
+          </>
+        ) : (
+          <>
+            <p className="text-muted-foreground">
+              This is a standalone Agent. It is not currently managed by an Ensemble.
+            </p>
+            <Link to="/ensembles" className="text-blue-400 hover:text-blue-300">
+              Browse Ensembles
+            </Link>
+          </>
+        )}
+      </CardContent>
+    </Card>
   );
 }
 

@@ -2,7 +2,12 @@ import { useEffect } from "react";
 import { useParams, Link } from "react-router-dom";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { useRun, useGateVerdict } from "@/hooks/use-api";
+import { CellnResult } from "@/components/celln-result";
+import { CellnConversation } from "@/components/celln-conversation";
+import { RunDiagnosis } from "@/components/run-diagnosis";
+import { CellnScopedExecution } from "@/components/celln-scoped-execution";
+import { ApiError } from "@/lib/api";
+import { useRun, useGateVerdict, useRuntimes } from "@/hooks/use-api";
 import { StatusBadge } from "@/components/status-badge";
 import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -25,12 +30,13 @@ import {
 } from "lucide-react";
 import { Breadcrumbs } from "@/components/breadcrumbs";
 import { useRunsSeen } from "@/hooks/use-runs-seen";
-import { costTooltip, effectiveCost, formatAge, formatUsd } from "@/lib/utils";
+import { costTooltip, effectiveCost, formatAge, formatUsd, taskText } from "@/lib/utils";
 
 export function RunDetailPage() {
   const { name } = useParams<{ name: string }>();
-  const { data: run, isLoading } = useRun(name || "");
+  const { data: run, isLoading, error } = useRun(name || "");
   const gateVerdict = useGateVerdict();
+  const runtimes = useRuntimes();
   const { markSeenUpTo } = useRunsSeen();
 
   const isAwaitingGate =
@@ -54,7 +60,7 @@ export function RunDetailPage() {
     );
   }
 
-  if (!run) {
+  if (!run || (error instanceof ApiError && error.status === 404)) {
     return <p className="text-muted-foreground">Run not found</p>;
   }
 
@@ -63,6 +69,15 @@ export function RunDetailPage() {
     ? `${(usage.durationMs / 1000).toFixed(1)}s`
     : "—";
   const est = effectiveCost(run);
+  const taskMode = typeof run.spec.task === "object" ? run.spec.task : undefined;
+  const runtimeName = (taskMode?.mode === "harness" ? taskMode.parameters?.runtime : undefined) || run.spec.cellnSelection?.runtimeRef || run.status?.harnessRuntimeRef;
+  const runtime = runtimeName ? runtimes.data?.find((item) => item.metadata.name === runtimeName) : undefined;
+  const isHarnessRun = Boolean(runtimeName || run.status?.harnessImageDigest);
+  const scopedCondition = run.status?.conditions?.find((condition) =>
+    condition.type === "CellnScopedExecution" &&
+    run.metadata.generation !== undefined &&
+    condition.observedGeneration === run.metadata.generation);
+  const scopedIntent = Boolean(run.status?.cellnScoped || scopedCondition || run.spec.cellnSelection?.clusterToolRefs?.length || runtime?.spec.cellnProfileRef);
 
   return (
     <div className="space-y-6">
@@ -84,6 +99,8 @@ export function RunDetailPage() {
           {formatAge(run.metadata.creationTimestamp)} ago
         </div>
       </div>
+
+      <RunDiagnosis key={run.metadata.uid} run={run} />
 
       {/* Stats row */}
       {(usage || est) && (
@@ -229,6 +246,27 @@ export function RunDetailPage() {
         </div>
       )}
 
+      {run.spec.executionLifecycle === "enduring" && <CellnConversation key={run.metadata.uid} run={run} observationUnavailable={Boolean(error)} showDiagnosis={false} />}
+      {run.status?.cellnScoped && run.spec.executionLifecycle !== "enduring" && <CellnScopedExecution
+        status={run.status.cellnScoped}
+        condition={scopedCondition}
+        mode="one-shot"
+        label="Scoped one-shot execution"
+      />}
+      {scopedIntent && !run.status?.cellnScoped && run.spec.executionLifecycle !== "enduring" && <div className="space-y-2 rounded-lg border border-amber-500/30 p-3 text-sm" data-testid="celln-scoped-pending">
+        <p className="font-medium">Scoped Celln — one-shot request</p>
+        <p>{scopedCondition?.message || "No current scoped controller observation is recorded."}</p>
+        <p className="text-muted-foreground">Receiver ownership and native execution are not yet confirmed. The UI will not infer them from catalogue selection or legacy grant status.</p>
+      </div>}
+      {run.spec.cellnSelection && !scopedIntent && run.spec.executionLifecycle !== "enduring" && <div className="space-y-2 rounded-lg border border-amber-500/30 p-3 text-sm" data-testid="catalogue-run-summary">
+        <p className="font-medium">Harness in Celln — catalogue request</p>
+        <p className="text-muted-foreground">Runtime: {run.spec.cellnSelection.runtimeRef || "Agent default (resolved by trusted issuance)"}</p>
+        <p className="text-muted-foreground">Borrowed tools: {run.spec.cellnSelection.toolRefs.map((ref) => `${ref.name}@${ref.revision}`).join(" → ") || "none"}</p>
+        {!!run.spec.cellnSelection.clusterToolRefs?.length && <p className="text-muted-foreground">Shared catalogue tools: {run.spec.cellnSelection.clusterToolRefs.map((ref) => `${ref.name}@${ref.revision}`).join(" → ")}</p>}
+        <p>{run.status?.conditions?.find((condition) => condition.type === "CellnIssuanceCommitted")?.message || "Waiting for a catalogue issuance observation. A submitted request does not establish readiness."}</p>
+		{run.status?.conditions?.find((condition) => condition.type === "CellnExecutionObserved")?.message && <p>{run.status.conditions.find((condition) => condition.type === "CellnExecutionObserved")?.message}</p>}
+      </div>}
+
       {/* PostRunFailed condition */}
       {run.status?.conditions?.some(
         (c) => c.type === "PostRunFailed" && c.status === "True",
@@ -279,6 +317,25 @@ export function RunDetailPage() {
         </div>
       )}
 
+      {isHarnessRun && (
+        <Card>
+          <CardHeader className="pb-3">
+            <CardTitle className="flex items-center gap-2 text-base">
+              <ShieldCheck className="h-4 w-4 text-cyan-400" />
+              External runtime provenance
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="grid gap-3 text-sm sm:grid-cols-2">
+            <div><span className="text-muted-foreground">Runtime</span><p className="font-mono">{runtimeName || "inline image"}</p></div>
+            <div><span className="text-muted-foreground">Selection</span><p>{run.status?.harnessRuntimeSource === "agent-default" ? "Agent default" : "Run override"}</p></div>
+            <div><span className="text-muted-foreground">Image digest</span><p className="font-mono break-all">{run.status?.harnessImageDigest || runtime?.status?.resolvedImageDigest || "pending"}</p></div>
+            <div><span className="text-muted-foreground">Contract</span><p>{run.status?.harnessContractVersion || runtime?.spec.contractVersion || "not declared"}</p></div>
+            <div><span className="text-muted-foreground">Support owner</span><p>{runtime?.spec.supportOwner || "not declared"}</p></div>
+            <div className="sm:col-span-2"><span className="text-muted-foreground">Capability provenance</span><p>{runtime?.spec.capabilities?.length ? runtime.spec.capabilities.join(", ") + " (runtime claim; platform policy still enforced)" : "No runtime capabilities claimed"}</p></div>
+          </CardContent>
+        </Card>
+      )}
+
       <Tabs defaultValue="task">
         <TabsList>
           <TabsTrigger value="task">Task</TabsTrigger>
@@ -289,7 +346,7 @@ export function RunDetailPage() {
         <TabsContent value="task">
           <Card>
             <CardContent className="pt-6">
-              <pre className="whitespace-pre-wrap text-sm">{run.spec.task}</pre>
+              <pre className="whitespace-pre-wrap text-sm">{taskText(run.spec.task)}</pre>
             </CardContent>
           </Card>
         </TabsContent>
@@ -297,7 +354,9 @@ export function RunDetailPage() {
         <TabsContent value="result">
           <Card>
             <CardContent className="pt-6">
-              {run.status?.result ? (
+              {run.status?.result && run.spec.backend === "celln" && run.spec.cellnSelection ? (
+                <CellnResult output={run.status.result} />
+              ) : run.status?.result ? (
                 <div className="prose prose-sm prose-invert max-w-none">
                   <ReactMarkdown remarkPlugins={[remarkGfm]}>
                     {run.status.result}

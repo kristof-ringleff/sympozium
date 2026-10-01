@@ -19,6 +19,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	sympoziumv1alpha1 "github.com/sympozium-ai/sympozium/api/v1alpha1"
+	"github.com/sympozium-ai/sympozium/internal/sessionkey"
 	"github.com/sympozium-ai/sympozium/internal/toolpolicy"
 )
 
@@ -268,9 +269,10 @@ func (r *SympoziumScheduleReconciler) Reconcile(ctx context.Context, req ctrl.Re
 			},
 		},
 		Spec: sympoziumv1alpha1.AgentRunSpec{
-			AgentRef: schedule.Spec.AgentRef,
-			Task:     sympoziumv1alpha1.NewStringTask(task),
-			AgentID:  fmt.Sprintf("schedule-%s", schedule.Name),
+			AgentRef:   schedule.Spec.AgentRef,
+			Task:       sympoziumv1alpha1.NewStringTask(task),
+			AgentID:    fmt.Sprintf("schedule-%s", schedule.Name),
+			SessionKey: sessionkey.ForSchedule(schedule.Name),
 			Model: sympoziumv1alpha1.ModelSpec{
 				Provider: resolveProvider(instance),
 				Model:    instance.Spec.Agents.Default.Model,
@@ -306,6 +308,9 @@ func (r *SympoziumScheduleReconciler) Reconcile(ctx context.Context, req ctrl.Re
 	if len(instance.Spec.Agents.Default.NodeSelector) > 0 {
 		agentRun.Spec.Model.NodeSelector = instance.Spec.Agents.Default.NodeSelector
 	}
+	if len(instance.Spec.Agents.Default.Tolerations) > 0 {
+		agentRun.Spec.Tolerations = instance.Spec.Agents.Default.Tolerations
+	}
 	if len(instance.Spec.Agents.Default.ProviderHeaders) > 0 {
 		agentRun.Spec.Model.ProviderHeaders = instance.Spec.Agents.Default.ProviderHeaders
 	}
@@ -315,6 +320,13 @@ func (r *SympoziumScheduleReconciler) Reconcile(ctx context.Context, req ctrl.Re
 
 	// Resolve auth secret from the instance.
 	agentRun.Spec.Model.AuthSecretRef = resolveAuthSecret(instance)
+
+	if err := applyAgentExecutionDefaults(instance, agentRun); err != nil {
+		log.Error(err, "agent execution defaults are incompatible with this schedule run")
+		schedule.Status.Phase = "Error"
+		_ = r.Status().Update(ctx, schedule)
+		return ctrl.Result{RequeueAfter: 60 * time.Second}, nil
+	}
 
 	// Copy skill refs, excluding server-mode skills (e.g. web-endpoint) that
 	// should not be spawned as ephemeral schedule runs.
@@ -437,19 +449,11 @@ func (r *SympoziumScheduleReconciler) nextScheduledRunNumber(ctx context.Context
 //     works. An orchestrator can sit here for tens of minutes.
 //   - "": the AgentRun controller has not observed the run yet.
 //
-// Omitting a phase here makes a Forbid schedule stack a second run on top of
-// a live one, so keep this in sync with the AgentRunPhase constants.
+// Treating a live phase as finished makes a Forbid schedule stack a second run
+// on top of a live one, so the phase set lives in AgentRunPhase.IsTerminal()
+// rather than being spelled out again here.
 func isAgentRunActive(phase sympoziumv1alpha1.AgentRunPhase) bool {
-	switch phase {
-	case sympoziumv1alpha1.AgentRunPhasePending,
-		sympoziumv1alpha1.AgentRunPhaseRunning,
-		sympoziumv1alpha1.AgentRunPhaseServing,
-		sympoziumv1alpha1.AgentRunPhasePostRunning,
-		sympoziumv1alpha1.AgentRunPhaseAwaitingDelegate,
-		"":
-		return true
-	}
-	return false
+	return !phase.IsTerminal()
 }
 
 // pipelineInFlight reports whether any AgentRun belonging to the given ensemble

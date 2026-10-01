@@ -24,6 +24,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	sympoziumv1alpha1 "github.com/sympozium-ai/sympozium/api/v1alpha1"
+	"github.com/sympozium-ai/sympozium/internal/sessionkey"
 )
 
 const sympoziumInstanceFinalizer = "sympozium.ai/finalizer"
@@ -650,17 +651,19 @@ func memoryServerContainer(spec *corev1.PodSpec) *corev1.Container {
 	return nil
 }
 
-// syncMemoryServerEnv reconciles the token env vars on an existing memory
-// Deployment, and nothing else:
+// syncMemoryDeployment reconciles controller-owned settings on an existing
+// memory Deployment. The rest of the spec remains create-only, while:
 //
-//   - MEMORY_ADMIN_TOKEN: added when adminDelete is switched on, repointed when
-//     the Secret name changes, removed when the feature is switched off.
-//   - MEMORY_WRITER_TOKEN: always set, pointing at the Deployment's own
-//     writer-token Secret. This is how memory servers created by an older
-//     release start requiring the writer token after an upgrade.
+//   - the memory-server image tracks the configured Sympozium image tag;
+//   - MEMORY_ADMIN_TOKEN is added when adminDelete is switched on, repointed
+//     when the Secret name changes, and removed when the feature is switched
+//     off;
+//   - MEMORY_WRITER_TOKEN always points at the Deployment's own writer-token
+//     Secret. This is how memory servers created by an older release start
+//     requiring the writer token after an upgrade.
 //
-// It issues at most one Update, and none when the env already matches, so
-// steady-state reconciles do not restart the pod.
+// It issues at most one Update, and none when everything already matches, so
+// steady-state reconciles issue no writes and the pod is not restarted.
 //
 // Shared by the per-agent memory Deployment (AgentReconciler) and the shared
 // workflow memory Deployment (EnsembleReconciler), both of which are otherwise
@@ -669,10 +672,17 @@ func memoryServerContainer(spec *corev1.PodSpec) *corev1.Container {
 // Note this reacts to the Secret *reference* changing, not to the token value
 // inside the Secret. Rotating the value in place leaves the pod holding the old
 // token in its env until it restarts.
-func syncMemoryServerEnv(ctx context.Context, c client.Client, log logr.Logger, deploy *appsv1.Deployment) error {
+func syncMemoryDeployment(ctx context.Context, c client.Client, log logr.Logger, deploy *appsv1.Deployment, image string) error {
 	container := memoryServerContainer(&deploy.Spec.Template.Spec)
 	if container == nil {
 		return nil
+	}
+
+	changed := false
+	if image != "" && container.Image != image {
+		log.Info("Updating memory server image", "deployment", deploy.Name, "from", container.Image, "to", image)
+		container.Image = image
+		changed = true
 	}
 
 	var adminWant *corev1.EnvVar
@@ -681,7 +691,7 @@ func syncMemoryServerEnv(ctx context.Context, c client.Client, log logr.Logger, 
 	}
 	writerWant := memoryWriterTokenEnv(memoryWriterTokenEnvName, deploy.Name)
 
-	changed := syncContainerEnvVar(log, deploy.Name, container, "MEMORY_ADMIN_TOKEN", adminWant)
+	changed = syncContainerEnvVar(log, deploy.Name, container, "MEMORY_ADMIN_TOKEN", adminWant) || changed
 	changed = syncContainerEnvVar(log, deploy.Name, container, memoryWriterTokenEnvName, &writerWant) || changed
 	if !changed {
 		return nil
@@ -717,6 +727,12 @@ func syncContainerEnvVar(log logr.Logger, deployName string, container *corev1.C
 		log.Info("Updating memory server env", "deployment", deployName, "env", name)
 	}
 	return true
+}
+
+// syncMemoryAdminTokenEnv is retained for callers and focused tests that only
+// need to reconcile the token env vars without changing the image.
+func syncMemoryAdminTokenEnv(ctx context.Context, c client.Client, log logr.Logger, deploy *appsv1.Deployment) error {
+	return syncMemoryDeployment(ctx, c, log, deploy, "")
 }
 
 // reconcileMemoryDeployment ensures a Deployment + Service exist for the memory
@@ -757,10 +773,10 @@ func (r *AgentReconciler) reconcileMemoryDeployment(ctx context.Context, log log
 	}
 	if err == nil {
 		// Already exists. The rest of the spec is deliberately left alone, but the
-		// token env is reconciled so enabling adminDelete (or pointing it at a
-		// different Secret), and the writer token after an upgrade, take effect
-		// without deleting the Deployment.
-		return syncMemoryServerEnv(ctx, r.Client, log, &existingDeploy)
+		// image and token env are reconciled so a new image tag, enabling
+		// adminDelete (or pointing it at a different Secret), and the writer
+		// token after an upgrade take effect without deleting the Deployment.
+		return syncMemoryDeployment(ctx, r.Client, log, &existingDeploy, image)
 	}
 
 	replicas := int32(1)
@@ -992,7 +1008,7 @@ func (r *AgentReconciler) ensureWebEndpointAgentRun(ctx context.Context, instanc
 		Spec: sympoziumv1alpha1.AgentRunSpec{
 			AgentRef:   instance.Name,
 			AgentID:    "web-endpoint",
-			SessionKey: "web-endpoint",
+			SessionKey: sessionkey.ForWebEndpoint(instance.Name),
 			Task:       sympoziumv1alpha1.NewStringTask("Serve HTTP requests for this instance"),
 			Mode:       "server",
 			Model: sympoziumv1alpha1.ModelSpec{
@@ -1016,6 +1032,9 @@ func (r *AgentReconciler) ensureWebEndpointAgentRun(ctx context.Context, instanc
 	}
 	if len(instance.Spec.Agents.Default.NodeSelector) > 0 {
 		agentRun.Spec.Model.NodeSelector = instance.Spec.Agents.Default.NodeSelector
+	}
+	if len(instance.Spec.Agents.Default.Tolerations) > 0 {
+		agentRun.Spec.Tolerations = instance.Spec.Agents.Default.Tolerations
 	}
 
 	if err := controllerutil.SetControllerReference(instance, agentRun, r.Scheme); err != nil {

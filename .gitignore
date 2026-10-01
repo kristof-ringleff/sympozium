@@ -38,6 +38,9 @@ coverage.out
 coverage.html
 main
 
+# Local tool state (e.g. Go telemetry)
+.config/
+
 # Web UI build output (keep placeholder for go:embed)
 web/dist/*
 !web/dist/index.html
@@ -60,3 +63,6 @@ mcp-bridge
 
 # Local machine-specific Claude notes (not shared)
 CLAUDE.local.md
+
+# Local catalogue proof binaries and full execution evidence (publish summaries)
+/target/celln-live-proof/

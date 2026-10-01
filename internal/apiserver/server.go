@@ -6,7 +6,11 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"github.com/sympozium-ai/sympozium/internal/agentexecution"
+	"github.com/sympozium-ai/sympozium/internal/cellnauthority"
+	"github.com/sympozium-ai/sympozium/internal/modelconnection"
 	"io"
 	"io/fs"
 	"net"
@@ -33,11 +37,16 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	sympoziumv1alpha1 "github.com/sympozium-ai/sympozium/api/v1alpha1"
 	"github.com/sympozium-ai/sympozium/internal/agentedit"
+	"github.com/sympozium-ai/sympozium/internal/cellninstall"
+	"github.com/sympozium-ai/sympozium/internal/cellnplatform"
+	"github.com/sympozium-ai/sympozium/internal/collector"
 	"github.com/sympozium-ai/sympozium/internal/controller"
 	"github.com/sympozium-ai/sympozium/internal/eventbus"
+	"github.com/sympozium-ai/sympozium/internal/sessionkey"
 )
 
 const systemNamespace = "sympozium-system"
@@ -56,13 +65,20 @@ var memoryProxyClient = &http.Client{
 
 // Server is the Sympozium API server.
 type Server struct {
+	cellnPreview map[types.NamespacedName]cellnauthority.Loader
 	client       client.Client
 	eventBus     eventbus.EventBus
 	kube         kubernetes.Interface
 	log          logr.Logger
 	upgrader     websocket.Upgrader
 	densityCache *controller.DensityCache // optional: set when llmfit DaemonSet is enabled
+	powerClient  *collector.Client        // optional: nil when energy collection is disabled
 	authEnabled  bool                     // set by buildMux; gates pricing writes
+	version      string                   // build version, reported by /api/v1/cluster/identity
+	cellnCells   cellnCellsSource         // gateway `/v1/cells` client and its "unsupported" verdict
+	// completeCellnBackend finishes an added fleet backend in the background;
+	// nil runs completeCellnFleetBackend (tests replace it).
+	completeCellnBackend func(name string, facts cellninstall.FleetFacts, cellnHint string)
 }
 
 // NewServer creates a new API server.
@@ -76,6 +92,12 @@ func NewServer(c client.Client, bus eventbus.EventBus, kube kubernetes.Interface
 			CheckOrigin: func(r *http.Request) bool { return true },
 		},
 	}
+}
+
+// SetPowerClient sets the energy collector client for power API endpoints.
+// Leaving it nil disables the power surface entirely.
+func (s *Server) SetPowerClient(c *collector.Client) {
+	s.powerClient = c
 }
 
 // SetDensityCache sets the fitness cache for fitness API endpoints.
@@ -101,7 +123,7 @@ func (s *Server) Start(addr string, expected *tokenReader) error {
 func (s *Server) StartWithUI(addr string, expected *tokenReader, frontendFS fs.FS) error {
 	server := &http.Server{
 		Addr:              addr,
-		Handler:           s.buildMux(frontendFS, expected),
+		Handler:           s.HandlerWithUI(expected, frontendFS),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
@@ -109,9 +131,44 @@ func (s *Server) StartWithUI(addr string, expected *tokenReader, frontendFS fs.F
 	return server.ListenAndServe()
 }
 
+// ServeContext joins HTTP shutdown when the owning process is cancelled. The
+// legacy Start methods remain available for callers that own their lifecycle.
+func (s *Server) ServeContext(ctx context.Context, addr string, expected *tokenReader, frontendFS fs.FS) error {
+	var handler http.Handler = s.Handler(expected)
+	if frontendFS != nil {
+		handler = s.HandlerWithUI(expected, frontendFS)
+	}
+	server := &http.Server{Addr: addr, Handler: handler, ReadHeaderTimeout: 10 * time.Second}
+	done := make(chan error, 1)
+	go func() { done <- server.ListenAndServe() }()
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		shutdown, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		if err := server.Shutdown(shutdown); err != nil {
+			_ = server.Close()
+			<-done
+			return err
+		}
+		err := <-done
+		if errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
+		return err
+	}
+}
+
 // Handler returns the HTTP handler for testing. Pass nil or a reader whose
 // current() returns "" to skip auth.
 func (s *Server) Handler(expected *tokenReader) http.Handler { return s.buildMux(nil, expected) }
+
+// HandlerWithUI serves the same authenticated API and SPA as StartWithUI,
+// allowing an embedding server to own its listener and graceful shutdown.
+func (s *Server) HandlerWithUI(expected *tokenReader, frontendFS fs.FS) http.Handler {
+	return s.buildMux(frontendFS, expected)
+}
 
 // buildMux creates the HTTP mux with all API routes.
 // When frontendFS is non-nil, it serves the SPA for non-API paths.
@@ -133,9 +190,36 @@ func (s *Server) buildMux(frontendFS fs.FS, expected *tokenReader) http.Handler 
 	mux.HandleFunc("PATCH /api/v1/agents/{name}", s.patchAgent)
 	mux.HandleFunc("GET /api/v1/agents/{name}/web-endpoint", s.getWebEndpointStatus)
 
+	// Administrator-approved harness runtimes
+	mux.HandleFunc("GET /api/v1/runtimes", s.listRuntimes)
+	mux.HandleFunc("GET /api/v1/model-connections", s.listModelConnections)
+	mux.HandleFunc("POST /api/v1/model-connections", s.createModelConnection)
+	mux.HandleFunc("GET /api/v1/celln-tools", s.listCellnTools)
+	mux.HandleFunc("GET /api/v1/cluster-celln-tools", s.listClusterCellnTools)
+	mux.HandleFunc("GET /api/v1/celln-platform/profiles", s.listCellnPlatformProfiles)
+	mux.HandleFunc("POST /api/v1/celln-platform/wrappers", s.ensureCellnPlatformWrappers)
+	mux.HandleFunc("GET /api/v1/celln-platform/mediation", s.getCellnMediation)
+	mux.HandleFunc("GET /api/v1/celln-platform/key-secrets", s.listCellnKeySecrets)
+	mux.HandleFunc("GET /api/v1/celln-platform/backends", s.listCellnFleetBackends)
+	mux.HandleFunc("GET /api/v1/celln-platform/cells", s.listCellnFleetCells)
+	mux.HandleFunc("POST /api/v1/celln-platform/backends", s.addCellnFleetBackend)
+	mux.HandleFunc("POST /api/v1/celln-selection/preview", s.previewCellnSelection)
+	mux.HandleFunc("POST /api/v1/runtimes/install-defaults", s.installDefaultRuntimes)
+	// Persistent harness sessions. The API server owns the only browser-facing
+	// route to a session's private in-cluster Service.
+	mux.HandleFunc("GET /api/v1/harness-sessions", s.listHarnessSessions)
+	mux.HandleFunc("POST /api/v1/harness-sessions", s.createHarnessSession)
+	mux.HandleFunc("PATCH /api/v1/harness-sessions/{name}", s.patchHarnessSession)
+	mux.HandleFunc("DELETE /api/v1/harness-sessions/{name}", s.deleteHarnessSession)
+	mux.HandleFunc("POST /api/v1/harness-sessions/{name}/chat", s.chatHarnessSession)
+
 	// Run endpoints
 	mux.HandleFunc("GET /api/v1/runs", s.listRuns)
 	mux.HandleFunc("GET /api/v1/runs/{name}", s.getRun)
+	mux.HandleFunc("GET /api/v1/runs/{name}/turns", s.listRunTurns)
+	mux.HandleFunc("POST /api/v1/runs/{name}/continue", s.continueRun)
+	mux.HandleFunc("POST /api/v1/runs/{name}/turns", s.createRunTurn)
+	mux.HandleFunc("POST /api/v1/runs/{name}/turns/{turn}/cancel", s.cancelRunTurn)
 	mux.HandleFunc("GET /api/v1/runs/{name}/telemetry", s.getRunTelemetry)
 	mux.HandleFunc("POST /api/v1/runs", s.createRun)
 	mux.HandleFunc("DELETE /api/v1/runs/{name}", s.deleteRun)
@@ -225,12 +309,16 @@ func (s *Server) buildMux(frontendFS fs.FS, expected *tokenReader) http.Handler 
 	mux.HandleFunc("DELETE /api/v1/pricing/simulated", s.deleteSimulatedPrices)
 
 	// Provider discovery endpoints (model listing, node discovery)
+	// Accelerator power draw from a discovered energy collector (optional).
+	mux.HandleFunc("GET /api/v1/power", s.listPower)
+
 	mux.HandleFunc("GET /api/v1/providers/nodes", s.listProviderNodes)
 	mux.HandleFunc("GET /api/v1/providers/models", s.proxyProviderModels)
 	mux.HandleFunc("POST /api/v1/providers/bedrock/models", s.listBedrockModels)
 
 	// Cluster info & capabilities
 	mux.HandleFunc("GET /api/v1/cluster", s.getClusterInfo)
+	mux.HandleFunc("GET /api/v1/cluster/identity", s.getClusterIdentity)
 	mux.HandleFunc("GET /api/v1/capabilities", s.getCapabilities)
 
 	// Agent Sandbox CRD management
@@ -385,6 +473,294 @@ func (s *Server) listAgents(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, list.Items)
 }
 
+func (s *Server) listRuntimes(w http.ResponseWriter, r *http.Request) {
+	ns := r.URL.Query().Get("namespace")
+	if ns == "" {
+		ns = "default"
+	}
+
+	var list sympoziumv1alpha1.AgentRuntimeList
+	if err := s.client.List(r.Context(), &list, client.InNamespace(ns)); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	sort.Slice(list.Items, func(i, j int) bool { return list.Items[i].Name < list.Items[j].Name })
+	writeJSON(w, list.Items)
+}
+
+// Catalogue metadata is review input, not per-Agent authority or readiness.
+// This endpoint intentionally provides no create/approve/status mutation.
+func (s *Server) listCellnTools(w http.ResponseWriter, r *http.Request) {
+	ns := r.URL.Query().Get("namespace")
+	if ns == "" {
+		ns = "default"
+	}
+	var list sympoziumv1alpha1.CellnToolList
+	if err := s.client.List(r.Context(), &list, client.InNamespace(ns)); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	sort.Slice(list.Items, func(i, j int) bool { return list.Items[i].Name < list.Items[j].Name })
+	if list.Items == nil {
+		list.Items = []sympoziumv1alpha1.CellnTool{}
+	}
+	writeJSON(w, list.Items)
+}
+
+// listClusterCellnTools lists the platform's shared tool catalogue. Listing is
+// discovery only: policy decides which revisions a namespace may select.
+func (s *Server) listClusterCellnTools(w http.ResponseWriter, r *http.Request) {
+	var list sympoziumv1alpha1.ClusterCellnToolList
+	if err := s.client.List(r.Context(), &list); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	sort.Slice(list.Items, func(i, j int) bool { return list.Items[i].Name < list.Items[j].Name })
+	if list.Items == nil {
+		list.Items = []sympoziumv1alpha1.ClusterCellnTool{}
+	}
+	writeJSON(w, list.Items)
+}
+
+// CellnPlatformProfile is what a tenant sees of a runtime profile its
+// namespace may run: identity and route, never provisioning material.
+type CellnPlatformProfile struct {
+	Name              string `json:"name"`
+	Revision          string `json:"revision"`
+	Policy            string `json:"policy"`
+	Model             string `json:"model"`
+	Provider          string `json:"provider"`
+	Endpoint          string `json:"endpoint"`
+	CredentialProfile string `json:"credentialProfile"`
+	SystemPrompt      string `json:"systemPrompt"`
+	// Backend names the fleet model backend this profile runs on ("native"
+	// for the default); Wrapper and Agent are the namespace's AgentRuntime
+	// and Agent for it, created on first use.
+	Backend string `json:"backend"`
+	Wrapper string `json:"wrapper"`
+	Agent   string `json:"agent"`
+	// Tools are the shared catalogue revisions the policy lends to runs on
+	// this profile; a run selects them as cellnSelection.clusterToolRefs.
+	Tools []sympoziumv1alpha1.ClusterCellnToolRef `json:"tools"`
+	// Ceilings are the policy's per-parent maxima; SessionDefaults is the
+	// budget a new conversation should ask for (within them).
+	Ceilings        sympoziumv1alpha1.EnduringRunSpec `json:"ceilings"`
+	SessionDefaults sympoziumv1alpha1.EnduringRunSpec `json:"sessionDefaults"`
+}
+
+// platformPersona returns the system prompt a fleet runtime profile binds
+// when the Agent (or the run's runtime override) is a platform wrapper.
+func (s *Server) platformPersona(ctx context.Context, ns string, inst *sympoziumv1alpha1.Agent, runtimeRef string) (string, bool) {
+	name := runtimeRef
+	if name == "" {
+		name = inst.Spec.RuntimeRef
+	}
+	if name == "" {
+		return "", false
+	}
+	var runtime sympoziumv1alpha1.AgentRuntime
+	if err := s.client.Get(ctx, types.NamespacedName{Namespace: ns, Name: name}, &runtime); err != nil || runtime.Spec.CellnProfileRef == nil {
+		return "", false
+	}
+	var profile sympoziumv1alpha1.CellnRuntimeProfile
+	if err := s.client.Get(ctx, types.NamespacedName{Name: runtime.Spec.CellnProfileRef.Name}, &profile); err != nil || profile.Spec.Native == nil || profile.Spec.Native.SystemPrompt == "" {
+		return "", false
+	}
+	return profile.Spec.Native.SystemPrompt, true
+}
+
+// listCellnPlatformProfiles lists the native profiles the request namespace's
+// execution policies admit, evaluated the way the resolver evaluates them.
+func (s *Server) listCellnPlatformProfiles(w http.ResponseWriter, r *http.Request) {
+	ns := r.URL.Query().Get("namespace")
+	if ns == "" {
+		ns = "default"
+	}
+	authorised, err := cellnplatform.AuthorisedProfiles(r.Context(), s.client, ns)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	out := make([]CellnPlatformProfile, 0, len(authorised))
+	for _, a := range authorised {
+		objects, err := cellnplatform.TenantWrappers(ns, &a.Profile, &a.Policy)
+		if err != nil {
+			continue // a profile without a usable route is not offered
+		}
+		connection := objects[2].(*sympoziumv1alpha1.ModelConnection)
+		c := a.Policy.Spec.Ceilings
+		ceilings := sympoziumv1alpha1.EnduringRunSpec{LeaseSeconds: int32(min(c.MaxParentLeaseSeconds, 86400)), MaxTurns: int32(min(c.MaxTurns, 1024)), MaxModelRequests: int32(min(c.MaxModelRequests, 6144)), MaxOutputTokens: c.MaxOutputTokens}
+		names := cellnplatform.WrapperNames(cellnplatform.Backend(&a.Profile))
+		tools := make([]sympoziumv1alpha1.ClusterCellnToolRef, 0, len(a.Policy.Spec.Tools))
+		for _, t := range a.Policy.Spec.Tools {
+			tools = append(tools, t.Ref)
+		}
+		out = append(out, CellnPlatformProfile{Name: a.Profile.Name, Revision: a.Profile.Spec.Revision, Policy: a.Policy.Name, Model: connection.Spec.Models[0], Provider: connection.Spec.Provider, Endpoint: connection.Spec.Endpoint, CredentialProfile: connection.Spec.CredentialProfile, SystemPrompt: a.Profile.Spec.Native.SystemPrompt, Backend: names.Backend, Wrapper: names.Runtime, Agent: names.Agent, Tools: tools, Ceilings: ceilings, SessionDefaults: *cellninstall.SessionDefaultsFor(ceilings, &a.Profile)})
+	}
+	writeJSON(w, out)
+}
+
+// ensureCellnPlatformWrappers creates the namespace's wrapper objects for an
+// authorised profile on first use. Existing objects are never modified. With
+// runtimeOnly it creates the AgentRuntime alone: all an Agent with its own
+// Secret-backed ModelConnection needs, leaving the backend's shared Agent and
+// host-profile connection out of the namespace.
+func (s *Server) ensureCellnPlatformWrappers(w http.ResponseWriter, r *http.Request) {
+	ns := r.URL.Query().Get("namespace")
+	if ns == "" {
+		ns = "default"
+	}
+	var req struct {
+		Profile     string `json:"profile"`
+		RuntimeOnly bool   `json:"runtimeOnly,omitempty"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&req); err != nil || req.Profile == "" {
+		http.Error(w, "profile is required", http.StatusBadRequest)
+		return
+	}
+	var wrappers cellnplatform.Wrappers
+	var err error
+	if req.RuntimeOnly {
+		// The same authorisation as the full set: only a profile one of the
+		// namespace's policies admits gets a wrapper.
+		wrappers, err = s.ensureCellnRuntimeWrapper(r.Context(), ns, req.Profile)
+	} else {
+		wrappers, err = cellnplatform.EnsureWrappers(r.Context(), s.client, ns, req.Profile)
+	}
+	if err != nil {
+		if k8serrors.IsNotFound(err) || strings.Contains(err.Error(), "no execution policy admits") {
+			http.Error(w, err.Error(), http.StatusForbidden)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, wrappers)
+}
+
+// ensureCellnRuntimeWrapper is EnsureRuntimeWrapper answered in the shape of
+// the full set: the agent and connection stay empty because none is created.
+func (s *Server) ensureCellnRuntimeWrapper(ctx context.Context, namespace, profileName string) (cellnplatform.Wrappers, error) {
+	var profile sympoziumv1alpha1.CellnRuntimeProfile
+	if err := s.client.Get(ctx, types.NamespacedName{Name: profileName}, &profile); err != nil {
+		return cellnplatform.Wrappers{}, err
+	}
+	names := cellnplatform.WrapperNames(cellnplatform.Backend(&profile))
+	out := cellnplatform.Wrappers{Backend: names.Backend, Runtime: names.Runtime, Created: []string{}}
+	var existing sympoziumv1alpha1.AgentRuntime
+	missing := k8serrors.IsNotFound(s.client.Get(ctx, types.NamespacedName{Namespace: namespace, Name: names.Runtime}, &existing))
+	runtime, err := cellnplatform.EnsureRuntimeWrapper(ctx, s.client, namespace, profileName)
+	if err != nil {
+		return cellnplatform.Wrappers{}, err
+	}
+	out.Runtime = runtime
+	if missing {
+		out.Created = append(out.Created, runtime)
+	}
+	return out, nil
+}
+
+// InstallDefaultRuntimesResponse records an idempotent installation of the
+// curated harness catalog into a namespace. The API takes no image input: it
+// can only copy the chart-managed catalog from sympozium-system.
+type InstallDefaultRuntimesResponse struct {
+	SourceNamespace string   `json:"sourceNamespace"`
+	TargetNamespace string   `json:"targetNamespace"`
+	Copied          []string `json:"copied"`
+	AlreadyPresent  []string `json:"alreadyPresent"`
+}
+
+func (s *Server) installDefaultRuntimes(w http.ResponseWriter, r *http.Request) {
+	targetNS := r.URL.Query().Get("namespace")
+	if targetNS == "" {
+		targetNS = "default"
+	}
+	const sourceNS = "sympozium-system"
+	const catalogLabel = "sympozium.ai/harness-example"
+
+	// A harness runtime is only usable under the accompanying policy. Copy the
+	// policy first and never replace a namespace owner's object of the same name.
+	var sourcePolicy sympoziumv1alpha1.SympoziumPolicy
+	if err := s.client.Get(r.Context(), types.NamespacedName{Name: "harness-examples", Namespace: sourceNS}, &sourcePolicy); err != nil {
+		if k8serrors.IsNotFound(err) {
+			http.Error(w, "default harness catalog is not installed in sympozium-system", http.StatusNotFound)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if sourcePolicy.Labels[catalogLabel] != "true" || sourcePolicy.Spec.HarnessPolicy == nil || !sourcePolicy.Spec.HarnessPolicy.Enabled {
+		http.Error(w, "default harness catalog policy is invalid", http.StatusInternalServerError)
+		return
+	}
+
+	var sourceRuntimes sympoziumv1alpha1.AgentRuntimeList
+	if err := s.client.List(r.Context(), &sourceRuntimes, client.InNamespace(sourceNS), client.MatchingLabels{catalogLabel: "true"}); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if len(sourceRuntimes.Items) == 0 {
+		http.Error(w, "default harness catalog contains no runtimes", http.StatusNotFound)
+		return
+	}
+
+	resp := InstallDefaultRuntimesResponse{SourceNamespace: sourceNS, TargetNamespace: targetNS, Copied: []string{}, AlreadyPresent: []string{}}
+	installPolicy := &sympoziumv1alpha1.SympoziumPolicy{ObjectMeta: metav1.ObjectMeta{Name: sourcePolicy.Name, Namespace: targetNS, Labels: sourcePolicy.Labels, Annotations: sourcePolicy.Annotations}, Spec: sourcePolicy.Spec}
+	var existingPolicy sympoziumv1alpha1.SympoziumPolicy
+	err := s.client.Get(r.Context(), types.NamespacedName{Name: installPolicy.Name, Namespace: targetNS}, &existingPolicy)
+	if err == nil {
+		resp.AlreadyPresent = append(resp.AlreadyPresent, "policy/"+installPolicy.Name)
+	} else if !k8serrors.IsNotFound(err) {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	} else if err := s.client.Create(r.Context(), installPolicy); err != nil {
+		if k8serrors.IsAlreadyExists(err) {
+			resp.AlreadyPresent = append(resp.AlreadyPresent, "policy/"+installPolicy.Name)
+		} else {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+	} else {
+		resp.Copied = append(resp.Copied, "policy/"+installPolicy.Name)
+	}
+
+	for _, src := range sourceRuntimes.Items {
+		// The default product path is interactive. One-shot adapters remain
+		// supported as explicitly installed AgentRun runtimes, but copying them
+		// here made the Create → Harness picker promise a session they cannot
+		// provide.
+		if src.Spec.ContractVersion != "v1alpha2" || src.Spec.Session == nil || src.Spec.Session.Protocol != "openai-chat" {
+			continue
+		}
+		if src.Spec.Image == "" { // Defensive: never turn malformed catalog data into a target resource.
+			http.Error(w, "default harness catalog contains an invalid runtime", http.StatusInternalServerError)
+			return
+		}
+		var existing sympoziumv1alpha1.AgentRuntime
+		err := s.client.Get(r.Context(), types.NamespacedName{Name: src.Name, Namespace: targetNS}, &existing)
+		if err == nil {
+			resp.AlreadyPresent = append(resp.AlreadyPresent, "runtime/"+src.Name)
+			continue
+		}
+		if !k8serrors.IsNotFound(err) {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		runtime := &sympoziumv1alpha1.AgentRuntime{ObjectMeta: metav1.ObjectMeta{Name: src.Name, Namespace: targetNS, Labels: src.Labels, Annotations: src.Annotations}, Spec: src.Spec}
+		if err := s.client.Create(r.Context(), runtime); err != nil {
+			if k8serrors.IsAlreadyExists(err) {
+				resp.AlreadyPresent = append(resp.AlreadyPresent, "runtime/"+src.Name)
+				continue
+			}
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		resp.Copied = append(resp.Copied, "runtime/"+src.Name)
+	}
+
+	writeJSON(w, resp)
+}
+
 func (s *Server) getAgent(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	ns := r.URL.Query().Get("namespace")
@@ -424,6 +800,13 @@ type PatchInstanceRequest struct {
 	WebEndpoint     *PatchWebEndpoint                 `json:"webEndpoint,omitempty"`
 	Lifecycle       *sympoziumv1alpha1.LifecycleHooks `json:"lifecycle,omitempty"`
 	RequireApproval *bool                             `json:"requireApproval,omitempty"`
+	// RuntimeRef is administrator-owned. It is deliberately not an Ensemble
+	// persona setting, so runtime selection remains stable across reconciliation.
+	RuntimeRef *string `json:"runtimeRef,omitempty"`
+	// Execution updates Agent-level run defaults when non-nil.
+	Execution *sympoziumv1alpha1.AgentExecutionDefaults `json:"execution,omitempty"`
+	// ClearExecution removes Agent execution defaults. Takes precedence over Execution.
+	ClearExecution bool `json:"clearExecution,omitempty"`
 }
 
 // PatchWebEndpoint is the web endpoint patch payload.
@@ -456,6 +839,44 @@ func (s *Server) patchAgent(w http.ResponseWriter, r *http.Request) {
 		}
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
+	}
+	if req.RuntimeRef != nil {
+		inst.Spec.RuntimeRef = strings.TrimSpace(*req.RuntimeRef)
+		if err := s.client.Update(r.Context(), &inst); err != nil {
+			http.Error(w, "updating runtime reference: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+	}
+	if req.ClearExecution || req.Execution != nil {
+		if req.ClearExecution {
+			inst.Spec.Execution = nil
+		} else {
+			if reason := req.Execution.Validate(); reason != "" {
+				http.Error(w, reason, http.StatusBadRequest)
+				return
+			}
+			if req.Execution.Backend == "celln" && (len(inst.Spec.Skills) > 0 || len(inst.Spec.MCPServers) > 0) {
+				http.Error(w, "Celln execution defaults cannot be combined with SkillPacks or MCP connections; use a dedicated native Agent", http.StatusBadRequest)
+				return
+			}
+			inst.Spec.Execution = req.Execution.DeepCopy()
+			if req.Execution.Backend == "celln" && req.Execution.ModelConnectionRef != "" {
+				// Keep the Agent's grant on the Secret its own connection names
+				// now (a replaced key may live in another Secret), as creation does.
+				secretRef, err := s.cellnConnectionSecret(r.Context(), ns, req.Execution.ModelConnectionRef)
+				if err != nil {
+					http.Error(w, err.Error(), http.StatusBadRequest)
+					return
+				}
+				if secretRef != nil {
+					inst.Spec.AuthRefs = []sympoziumv1alpha1.SecretRef{*secretRef}
+				}
+			}
+		}
+		if err := s.client.Update(r.Context(), &inst); err != nil {
+			http.Error(w, "updating execution defaults: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
 	}
 
 	// Build the edit rather than mutating the Agent directly: agentedit routes it
@@ -593,24 +1014,26 @@ func (s *Server) getWebEndpointStatus(w http.ResponseWriter, r *http.Request) {
 
 // CreateInstanceRequest is the request body for creating a new Agent.
 type CreateInstanceRequest struct {
-	Name               string                                  `json:"name"`
-	Provider           string                                  `json:"provider"`
-	Model              string                                  `json:"model"`
-	BaseURL            string                                  `json:"baseURL,omitempty"`
-	SecretName         string                                  `json:"secretName,omitempty"`
-	APIKey             string                                  `json:"apiKey,omitempty"`
-	AWSRegion          string                                  `json:"awsRegion,omitempty"`
-	AWSAccessKeyID     string                                  `json:"awsAccessKeyId,omitempty"`
-	AWSSecretAccessKey string                                  `json:"awsSecretAccessKey,omitempty"`
-	AWSSessionToken    string                                  `json:"awsSessionToken,omitempty"`
-	PolicyRef          string                                  `json:"policyRef,omitempty"`
-	Skills             []sympoziumv1alpha1.SkillRef            `json:"skills,omitempty"`
-	Channels           []sympoziumv1alpha1.ChannelSpec         `json:"channels,omitempty"`
-	HeartbeatInterval  string                                  `json:"heartbeatInterval,omitempty"`
-	NodeSelector       map[string]string                       `json:"nodeSelector,omitempty"`
-	AgentSandbox       *sympoziumv1alpha1.AgentSandboxDefaults `json:"agentSandbox,omitempty"`
-	RunTimeout         string                                  `json:"runTimeout,omitempty"`
-	RequireApproval    bool                                    `json:"requireApproval,omitempty"`
+	Name               string                                    `json:"name"`
+	Provider           string                                    `json:"provider"`
+	Model              string                                    `json:"model"`
+	BaseURL            string                                    `json:"baseURL,omitempty"`
+	SecretName         string                                    `json:"secretName,omitempty"`
+	APIKey             string                                    `json:"apiKey,omitempty"`
+	AWSRegion          string                                    `json:"awsRegion,omitempty"`
+	AWSAccessKeyID     string                                    `json:"awsAccessKeyId,omitempty"`
+	AWSSecretAccessKey string                                    `json:"awsSecretAccessKey,omitempty"`
+	AWSSessionToken    string                                    `json:"awsSessionToken,omitempty"`
+	PolicyRef          string                                    `json:"policyRef,omitempty"`
+	RuntimeRef         string                                    `json:"runtimeRef,omitempty"`
+	Skills             []sympoziumv1alpha1.SkillRef              `json:"skills,omitempty"`
+	Channels           []sympoziumv1alpha1.ChannelSpec           `json:"channels,omitempty"`
+	HeartbeatInterval  string                                    `json:"heartbeatInterval,omitempty"`
+	NodeSelector       map[string]string                         `json:"nodeSelector,omitempty"`
+	AgentSandbox       *sympoziumv1alpha1.AgentSandboxDefaults   `json:"agentSandbox,omitempty"`
+	RunTimeout         string                                    `json:"runTimeout,omitempty"`
+	RequireApproval    bool                                      `json:"requireApproval,omitempty"`
+	Execution          *sympoziumv1alpha1.AgentExecutionDefaults `json:"execution,omitempty"`
 }
 
 func (s *Server) createAgent(w http.ResponseWriter, r *http.Request) {
@@ -625,9 +1048,54 @@ func (s *Server) createAgent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if req.Execution != nil && req.Execution.ModelConnectionRef != "" {
+		if req.APIKey != "" || req.SecretName != "" || req.BaseURL != "" {
+			http.Error(w, "select a model connection or inline credentials/endpoint", http.StatusBadRequest)
+			return
+		}
+		if req.Execution.Backend == "celln" {
+			// Only the provider is read here. An Agent may own a Secret-backed
+			// connection; which path may execute it is decided per run.
+			resolvedModel, err := modelconnection.ResolveMediated(r.Context(), s.client, ns, sympoziumv1alpha1.ModelSpec{ConnectionRef: req.Execution.ModelConnectionRef, Model: req.Model})
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			req.Provider = resolvedModel.Provider
+			// An Agent's own key: grant the connection's Secret in authRefs so
+			// the grant survives a later change of the execution defaults. The
+			// name comes from the connection, never from the request.
+			secretRef, err := s.cellnConnectionSecret(r.Context(), ns, req.Execution.ModelConnectionRef)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			if secretRef != nil {
+				req.SecretName = secretRef.Secret
+			}
+		} else {
+			model, _, err := modelconnection.ResolveHarness(r.Context(), s.client, ns, req.Execution.ModelConnectionRef, req.Model)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			req.Provider, req.BaseURL, req.SecretName = model.Provider, model.BaseURL, model.AuthSecretRef
+		}
+	}
 	if req.Name == "" || req.Provider == "" || req.Model == "" {
 		http.Error(w, "name, provider, and model are required", http.StatusBadRequest)
 		return
+	}
+	// Reject invalid execution defaults before any credential Secret is written.
+	if req.Execution != nil {
+		if reason := req.Execution.Validate(); reason != "" {
+			http.Error(w, reason, http.StatusBadRequest)
+			return
+		}
+		if req.Execution.Backend == "celln" && len(req.Skills) > 0 {
+			http.Error(w, "Celln execution defaults cannot be combined with SkillPacks; choose Kubernetes or explicitly remove the SkillPacks", http.StatusBadRequest)
+			return
+		}
 	}
 
 	inst := &sympoziumv1alpha1.Agent{
@@ -700,6 +1168,33 @@ func (s *Server) createAgent(w http.ResponseWriter, r *http.Request) {
 	}
 
 	secretAutoCreated := false
+	// First-party harness adapters configure local OpenAI-compatible routes
+	// through Pi/Hermes provider files. Those clients require an API-key field
+	// even when the endpoint itself is intentionally keyless (LocalAI,
+	// llama.cpp, LM Studio, Ollama, and similar). Give only harness-backed,
+	// explicitly keyless Agents a scoped compatibility value; the built-in
+	// runner and genuinely authenticated providers retain their existing
+	// credential behavior.
+	if req.RuntimeRef != "" && (req.Execution == nil || req.Execution.Backend != "celln") && req.APIKey == "" && req.SecretName == "" && inst.Spec.Agents.Default.BaseURL != "" {
+		secretAutoCreated = true
+		req.SecretName = defaultProviderSecretName(req.Name, "harness-local")
+		secret := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      req.SecretName,
+				Namespace: ns,
+				Labels: map[string]string{
+					"app.kubernetes.io/managed-by": "sympozium",
+					"sympozium.ai/instance":        req.Name,
+					"sympozium.ai/credential-kind": "harness-local-compatibility",
+				},
+			},
+			StringData: map[string]string{"OPENAI_API_KEY": "local-no-key"},
+		}
+		if err := createOrUpdateSecret(r.Context(), s.client, secret); err != nil {
+			http.Error(w, "failed to create harness compatibility secret: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+	}
 	if req.Provider != "" && req.APIKey != "" && req.SecretName == "" {
 		secretAutoCreated = true
 		req.SecretName = defaultProviderSecretName(req.Name, req.Provider)
@@ -758,6 +1253,26 @@ func (s *Server) createAgent(w http.ResponseWriter, r *http.Request) {
 	if req.PolicyRef != "" {
 		inst.Spec.PolicyRef = req.PolicyRef
 	}
+	if req.RuntimeRef != "" {
+		inst.Spec.RuntimeRef = req.RuntimeRef
+	}
+	if req.Execution != nil {
+		if reason := req.Execution.Validate(); reason != "" {
+			http.Error(w, reason, http.StatusBadRequest)
+			return
+		}
+		if req.Execution.Backend == "celln" && (len(req.Skills) > 0 || len(inst.Spec.Skills) > 0 || len(inst.Spec.MCPServers) > 0) {
+			http.Error(w, "Celln execution defaults cannot be combined with SkillPacks or MCP connections; use a dedicated native Agent", http.StatusBadRequest)
+			return
+		}
+		// OCI HarnessSession auto-create is gated below when backend is celln.
+		inst.Spec.Execution = req.Execution.DeepCopy()
+		if req.Execution.Backend == "celln" {
+			// Native files/context belong to the live parent, not the Kubernetes
+			// memory controller. Do not provision an unrelated memory service.
+			inst.Spec.Memory.Enabled = false
+		}
+	}
 
 	if len(req.Skills) > 0 {
 		inst.Spec.Skills = req.Skills
@@ -770,6 +1285,37 @@ func (s *Server) createAgent(w http.ResponseWriter, r *http.Request) {
 	if err := s.client.Create(r.Context(), inst); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
+	}
+
+	// A persistent-capable Agent is usable only when its session exists. Create
+	// the deterministic session as part of the Agent creation path so every UI
+	// and API caller gets the same Agent-first lifecycle.
+	// OCI persistent sessions remain a separate path from native Celln defaults.
+	if req.RuntimeRef != "" && (req.Execution == nil || req.Execution.Backend != "celln") {
+		var selectedRuntime sympoziumv1alpha1.AgentRuntime
+		if err := s.client.Get(r.Context(), types.NamespacedName{Name: req.RuntimeRef, Namespace: ns}, &selectedRuntime); err == nil &&
+			selectedRuntime.Spec.ContractVersion == "v1alpha2" && selectedRuntime.Spec.Session != nil && selectedRuntime.Spec.Session.Protocol == "openai-chat" {
+			session := &sympoziumv1alpha1.HarnessSession{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      defaultHarnessSessionName(req.Name),
+					Namespace: ns,
+					Labels: map[string]string{
+						"app.kubernetes.io/managed-by": "sympozium",
+						"sympozium.ai/agent":           req.Name,
+					},
+				},
+				Spec: sympoziumv1alpha1.HarnessSessionSpec{AgentRef: req.Name, RuntimeRef: req.RuntimeRef, DesiredState: "running"},
+			}
+			// Owning the session by the Agent lets Kubernetes garbage collection
+			// remove it, its workload, and its state claim with the Agent, so a
+			// deleted Agent never leaves a credential-bearing harness pod behind.
+			if err := controllerutil.SetOwnerReference(inst, session, s.client.Scheme()); err != nil {
+				s.log.Error(err, "failed to bind persistent harness session to its Agent", "agent", req.Name)
+			}
+			if err := s.client.Create(r.Context(), session); err != nil && !k8serrors.IsAlreadyExists(err) {
+				s.log.Error(err, "failed to create persistent harness session", "agent", req.Name, "runtime", req.RuntimeRef)
+			}
+		}
 	}
 
 	// Auto-create a heartbeat schedule when an interval is provided.
@@ -801,6 +1347,14 @@ func (s *Server) createAgent(w http.ResponseWriter, r *http.Request) {
 
 	w.WriteHeader(http.StatusCreated)
 	writeJSON(w, inst)
+}
+
+func defaultHarnessSessionName(agentName string) string {
+	name := strings.TrimRight(agentName, "-")
+	if len(name) > 57 {
+		name = strings.TrimRight(name[:57], "-")
+	}
+	return name + "-chat"
 }
 
 // intervalToCronExpr converts a human-readable interval (e.g. "1h", "30m") to a cron expression.
@@ -872,7 +1426,11 @@ func (s *Server) getRun(w http.ResponseWriter, r *http.Request) {
 
 	var run sympoziumv1alpha1.AgentRun
 	if err := s.client.Get(r.Context(), types.NamespacedName{Name: name, Namespace: ns}, &run); err != nil {
-		http.Error(w, err.Error(), http.StatusNotFound)
+		if k8serrors.IsNotFound(err) {
+			http.Error(w, "run not found", http.StatusNotFound)
+		} else {
+			http.Error(w, "run storage unavailable", http.StatusServiceUnavailable)
+		}
 		return
 	}
 
@@ -884,13 +1442,27 @@ func (s *Server) getRun(w http.ResponseWriter, r *http.Request) {
 
 // CreateRunRequest is the request body for creating a new AgentRun.
 type CreateRunRequest struct {
-	AgentRef   string `json:"agentRef"`
-	Task       string `json:"task"`
-	AgentID    string `json:"agentId,omitempty"`
-	SessionKey string `json:"sessionKey,omitempty"`
-	Model      string `json:"model,omitempty"`
-	Timeout    string `json:"timeout,omitempty"`
-	Backend    string `json:"backend,omitempty"`
+	// Lifecycle is an explicit request, not proof of host admission/readiness.
+	ExecutionLifecycle string                             `json:"executionLifecycle,omitempty"`
+	Enduring           *sympoziumv1alpha1.EnduringRunSpec `json:"enduring,omitempty"`
+	AgentRef           string                             `json:"agentRef"`
+	Task               string                             `json:"task"`
+	SystemPrompt       string                             `json:"systemPrompt,omitempty"`
+	AgentID            string                             `json:"agentId,omitempty"`
+	SessionKey         string                             `json:"sessionKey,omitempty"`
+	Model              string                             `json:"model,omitempty"`
+	Timeout            string                             `json:"timeout,omitempty"`
+	Backend            string                             `json:"backend,omitempty"`
+	// RuntimeRef selects an administrator-approved AgentRuntime. When omitted,
+	// the Agent's runtimeRef inheritance and legacy string-task behaviour apply.
+	RuntimeRef string `json:"runtimeRef,omitempty"`
+	// Catalogue Harness runs require explicit model/provider selection and use
+	// host-issued model authority, never inherited Kubernetes auth credentials.
+	ModelConnectionRef string                                     `json:"modelConnectionRef,omitempty"`
+	CellnSelection     *sympoziumv1alpha1.CellnCatalogueSelection `json:"cellnSelection,omitempty"`
+	// Do not silently discard an advanced artifact block sent to this endpoint.
+	Celln    json.RawMessage `json:"celln,omitempty"`
+	Provider string          `json:"provider,omitempty"`
 }
 
 func (s *Server) createRun(w http.ResponseWriter, r *http.Request) {
@@ -909,18 +1481,23 @@ func (s *Server) createRun(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "agentRef and task are required", http.StatusBadRequest)
 		return
 	}
+	// A shared-catalogue selection may omit legacy toolRefs; the persisted
+	// field is still an explicit (empty) list, never a null lending nothing.
+	if req.CellnSelection != nil && req.CellnSelection.ToolRefs == nil && len(req.CellnSelection.ClusterToolRefs) != 0 {
+		req.CellnSelection.ToolRefs = []sympoziumv1alpha1.CellnCatalogueToolRef{}
+	}
+	// Explicit catalogue selections are validated before Agent lookup so malformed
+	// overrides fail closed without depending on inheritance.
+	if req.CellnSelection != nil && (req.Backend != "celln" || req.RuntimeRef != "" || (req.Provider == "" && req.ModelConnectionRef == "") || req.Model == "" || req.CellnSelection.ToolRefs == nil || len(req.CellnSelection.ToolRefs) > 16) {
+		http.Error(w, "catalogue selection requires backend celln, a provider or model connection, model and toolRefs; use only cellnSelection.runtimeRef for an override", http.StatusBadRequest)
+		return
+	}
+	if len(req.Celln) != 0 && string(req.Celln) != "null" {
+		http.Error(w, "explicit celln artifacts require the AgentRun Kubernetes API and cannot be mixed with catalogue selection", http.StatusBadRequest)
+		return
+	}
 
-	if req.AgentID == "" {
-		req.AgentID = "primary"
-	}
-	if req.SessionKey == "" {
-		req.SessionKey = fmt.Sprintf("session-%d", time.Now().UnixNano())
-	}
-	if req.Timeout == "" {
-		req.Timeout = "5m"
-	}
-
-	// Look up the Agent to inherit auth, model, and skills.
+	// Look up the Agent to inherit auth, model, skills, and execution defaults.
 	var inst sympoziumv1alpha1.Agent
 	if err := s.client.Get(r.Context(), types.NamespacedName{Name: req.AgentRef, Namespace: ns}, &inst); err != nil {
 		if k8serrors.IsNotFound(err) {
@@ -929,6 +1506,61 @@ func (s *Server) createRun(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "failed to get instance: "+err.Error(), http.StatusInternalServerError)
 		}
 		return
+	}
+
+	resolved, err := agentexecution.Resolve(&inst, agentexecution.Input{
+		Backend:            req.Backend,
+		ExecutionLifecycle: req.ExecutionLifecycle,
+		Enduring:           req.Enduring,
+		CellnSelection:     req.CellnSelection,
+		ModelConnectionRef: req.ModelConnectionRef,
+		Provider:           req.Provider,
+		Model:              req.Model,
+		RuntimeRef:         req.RuntimeRef,
+	})
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	req.Backend = resolved.Backend
+	req.ExecutionLifecycle = resolved.ExecutionLifecycle
+	req.Enduring = resolved.Enduring
+	req.CellnSelection = resolved.CellnSelection
+	req.ModelConnectionRef = resolved.ModelConnectionRef
+	req.Provider = resolved.Provider
+	req.Model = resolved.Model
+	// A run on a fleet profile must carry the profile's bound persona
+	// verbatim; a client that sends none gets it here rather than a
+	// mismatch at admission.
+	if req.SystemPrompt == "" && req.Backend == "celln" && req.CellnSelection != nil && len(req.CellnSelection.ToolRefs) == 0 {
+		if persona, ok := s.platformPersona(r.Context(), ns, &inst, req.CellnSelection.RuntimeRef); ok {
+			req.SystemPrompt = persona
+		}
+	}
+
+	if req.ExecutionLifecycle == "enduring" && (len(req.Task) > 2048 || strings.ContainsRune(req.Task, '\x00')) {
+		http.Error(w, "enduring initial message must be at most 2048 UTF-8 bytes without NUL", http.StatusBadRequest)
+		return
+	}
+
+	if req.AgentID == "" {
+		req.AgentID = "primary"
+	}
+	if req.SessionKey == "" {
+		req.SessionKey = sessionkey.ForAPIServerDefault()
+	}
+	if req.Timeout == "" {
+		req.Timeout = "5m"
+		if req.ExecutionLifecycle == "enduring" {
+			req.Timeout = fmt.Sprintf("%ds", req.Enduring.LeaseSeconds)
+		}
+	}
+	if req.ExecutionLifecycle == "enduring" {
+		duration, err := time.ParseDuration(req.Timeout)
+		if err != nil || duration < time.Duration(req.Enduring.LeaseSeconds)*time.Second {
+			http.Error(w, "enduring run timeout must be a valid duration at least as long as its lease", http.StatusBadRequest)
+			return
+		}
 	}
 
 	// Resolve auth secret and provider from instance — first AuthRef wins.
@@ -955,7 +1587,7 @@ func (s *Server) createRun(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Cloud providers require an API key; local providers with a baseURL do not.
-	if authSecret == "" && inst.Spec.Agents.Default.BaseURL == "" {
+	if req.CellnSelection == nil && authSecret == "" && inst.Spec.Agents.Default.BaseURL == "" {
 		http.Error(w, fmt.Sprintf("instance %q has no API key configured (authRefs is empty)", req.AgentRef), http.StatusBadRequest)
 		return
 	}
@@ -983,11 +1615,14 @@ func (s *Server) createRun(w http.ResponseWriter, r *http.Request) {
 			},
 		},
 		Spec: sympoziumv1alpha1.AgentRunSpec{
-			AgentRef:   req.AgentRef,
-			AgentID:    req.AgentID,
-			SessionKey: req.SessionKey,
-			Task:       sympoziumv1alpha1.NewStringTask(req.Task),
-			Backend:    req.Backend,
+			ExecutionLifecycle: req.ExecutionLifecycle,
+			Enduring:           req.Enduring.DeepCopy(),
+			AgentRef:           req.AgentRef,
+			AgentID:            req.AgentID,
+			SessionKey:         req.SessionKey,
+			Task:               sympoziumv1alpha1.NewStringTask(req.Task),
+			SystemPrompt:       req.SystemPrompt,
+			Backend:            req.Backend,
 			Model: sympoziumv1alpha1.ModelSpec{
 				Provider:                 provider,
 				Model:                    model,
@@ -1000,9 +1635,45 @@ func (s *Server) createRun(w http.ResponseWriter, r *http.Request) {
 			Skills:           inst.Spec.Skills,
 			ImagePullSecrets: inst.Spec.ImagePullSecrets,
 			Lifecycle:        inst.Spec.Agents.Default.Lifecycle,
+			Tolerations:      inst.Spec.Agents.Default.Tolerations,
 			Env:              inst.Spec.Agents.Default.Env,
 			Timeout:          timeout,
 		},
+	}
+	if req.CellnSelection != nil {
+		run.Spec.CellnSelection = req.CellnSelection.DeepCopy()
+		run.Spec.Model = sympoziumv1alpha1.ModelSpec{Provider: req.Provider, Model: req.Model, ConnectionRef: req.ModelConnectionRef}
+		// A shared-catalogue selection (no namespaced toolRefs) is resolved by
+		// the platform resolver, whose route auth picks the path: a Secret-backed
+		// or credential-free connection runs gateway-mediated and is frozen
+		// without any credential reference. A legacy namespaced selection has no
+		// gateway and keeps requiring a host credential profile.
+		resolveConnection := modelconnection.Resolve
+		if len(req.CellnSelection.ToolRefs) == 0 {
+			resolveConnection = modelconnection.ResolveMediated
+		}
+		run.Spec.Model, err = resolveConnection(r.Context(), s.client, ns, run.Spec.Model)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+	}
+	if len(resolved.Inherited) > 0 {
+		if run.Annotations == nil {
+			run.Annotations = map[string]string{}
+		}
+		run.Annotations["sympozium.ai/execution-inherited"] = strings.Join(resolved.Inherited, ",")
+	}
+	if strings.TrimSpace(req.RuntimeRef) != "" {
+		run.Spec.Task = &sympoziumv1alpha1.TaskSpec{
+			Mode: "harness",
+			Parameters: map[string]string{
+				"runtime": strings.TrimSpace(req.RuntimeRef),
+				// Harness object-form tasks carry their prompt in parameters;
+				// without this admission correctly rejects the run as incomplete.
+				"prompt": req.Task,
+			},
+		}
 	}
 
 	if err := s.client.Create(r.Context(), run); err != nil {
@@ -1010,6 +1681,7 @@ func (s *Server) createRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	writeJSON(w, run)
 }
@@ -1024,7 +1696,22 @@ func (s *Server) deleteRun(w http.ResponseWriter, r *http.Request) {
 	run := &sympoziumv1alpha1.AgentRun{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
 	}
-	if err := s.client.Delete(r.Context(), run); err != nil {
+	// Optional for compatibility with existing callers. Interactive enduring
+	// clients must supply the observed UID so a reused name cannot be retargeted.
+	options := []client.DeleteOption{}
+	if values, supplied := r.URL.Query()["uid"]; supplied {
+		if len(values) != 1 || len(values[0]) == 0 || len(values[0]) > 128 {
+			http.Error(w, "one bounded run UID required", http.StatusBadRequest)
+			return
+		}
+		uid := types.UID(values[0])
+		options = append(options, client.Preconditions{UID: &uid})
+	}
+	if err := s.client.Delete(r.Context(), run, options...); err != nil {
+		if k8serrors.IsConflict(err) {
+			http.Error(w, "run identity changed; deletion refused", http.StatusConflict)
+			return
+		}
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -1033,6 +1720,10 @@ func (s *Server) deleteRun(w http.ResponseWriter, r *http.Request) {
 }
 
 const manualGateHookName = "manual-approval-gate"
+
+// manualGateApprovalWindow is how long a run waits for a human verdict before
+// gateDefault decides for them. It matches the gate hook's own `sleep 86400`.
+const manualGateApprovalWindow = 24 * time.Hour
 
 // applyRequireApproval adds or removes a built-in manual approval gate hook
 // on the instance's lifecycle. When enabled, all runs from this instance will
@@ -1056,9 +1747,14 @@ func applyRequireApproval(inst *sympoziumv1alpha1.Agent, enable bool) {
 
 		lc.GateDefault = "block"
 		lc.PostRun = append(lc.PostRun, sympoziumv1alpha1.LifecycleHookContainer{
-			Name:    manualGateHookName,
-			Image:   "busybox:1.36",
-			Gate:    true,
+			Name:  manualGateHookName,
+			Image: "busybox:1.36",
+			Gate:  true,
+			// The hook sleeps for a day; declare that as its timeout so the
+			// postRun Job's deadline matches. Without it the reviewer gets the
+			// 10-minute default, and a run left overnight is blocked by
+			// gateDefault before anyone has looked at it.
+			Timeout: &metav1.Duration{Duration: manualGateApprovalWindow},
 			Command: []string{"sh", "-c", "echo 'Waiting for manual approval...'; sleep 86400"},
 		})
 
@@ -2212,10 +2908,14 @@ func (s *Server) triggerStimulus(w http.ResponseWriter, r *http.Request) {
 
 	// Same builder the controller's readiness path uses, so a manual trigger
 	// produces an identical run — including the agent config's ToolPolicy.
-	agentRun := controller.BuildStimulusRun(
+	agentRun, err := controller.BuildStimulusRun(
 		r.Context(), s.client, &ensemble, &targetInst, targetPersona,
 		controller.StimulusTriggerSourceManual, time.Now(),
 	)
+	if err != nil {
+		http.Error(w, "stimulus execution defaults: "+err.Error(), http.StatusBadRequest)
+		return
+	}
 	runName := agentRun.Name
 
 	if err := s.client.Create(r.Context(), agentRun); err != nil {
@@ -2317,9 +3017,14 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 }
 
 // providerEnvKey returns the environment variable key for a provider's API key.
+// The key must be one the controller mounts (allowedAuthSecretKeys) and the
+// runner reads, or the credential never reaches the model call. The
+// OpenAI-compatible providers share OPENAI_API_KEY: the agent runner and the
+// Hermes adapter both read it, and the provider-named slots on the allowlist
+// (MISTRAL_API_KEY etc.) are read by nothing.
 func providerEnvKey(provider string) string {
 	switch provider {
-	case "openai":
+	case "openai", "custom", "ollama", "openrouter", "mistral", "groq", "deepseek":
 		return "OPENAI_API_KEY"
 	case "anthropic":
 		return "ANTHROPIC_API_KEY"
@@ -3567,9 +4272,21 @@ func (s *Server) getClusterInfo(w http.ResponseWriter, r *http.Request) {
 // ── Capabilities endpoint ────────────────────────────────────────────────────
 
 // CapabilityStatus describes whether a feature is available in the cluster.
+// State is a stable machine-readable cause when known:
+// disabled, not_installed, unreachable, transport_invalid, credential_invalid,
+// not_approved, incompatible, no_capacity, ready, unknown.
+// For Celln, OneShot and Enduring keep router preflight distinct from native
+// parent readiness. A non-ready preflight must not be labelled "not installed"
+// when the failure is transport or credentials, and must not claim that every
+// existing Celln run will fail.
 type CapabilityStatus struct {
 	Available bool   `json:"available"`
 	Reason    string `json:"reason,omitempty"`
+	State     string `json:"state,omitempty"`
+	// OneShot is populated for Celln only: authenticated one-shot router preflight.
+	OneShot *CapabilityStatus `json:"oneShot,omitempty"`
+	// Enduring is populated for Celln only: native parent path (not inferred from one-shot).
+	Enduring *CapabilityStatus `json:"enduring,omitempty"`
 }
 
 // CapabilitiesResponse lists optional features and whether their prerequisites are met.
@@ -3583,30 +4300,10 @@ type CapabilitiesResponse struct {
 // set on this pod, so capability reporting checks the same default.
 const defaultCellnRouterURL = "http://celln-router.celln-system.svc.cluster.local:8787"
 
-// getCellnStatus reports whether the Celln backend is reachable from the
-// apiserver. The router has no HTTP health endpoint, so this does a short
-// TCP dial, matching the TCP probes the chart's own Service/pod probes use.
+// getCellnStatus validates authenticated, versioned node preflight. It does
+// not certify a selected runtime or artifact bundle.
 func (s *Server) getCellnStatus() CapabilityStatus {
-	routerURL := os.Getenv("CELLN_ROUTER_URL")
-	if routerURL == "" {
-		routerURL = defaultCellnRouterURL
-	}
-	u, err := url.Parse(routerURL)
-	if err != nil || u.Host == "" {
-		return CapabilityStatus{
-			Available: false,
-			Reason:    fmt.Sprintf("Celln router URL is misconfigured: %q", routerURL),
-		}
-	}
-	conn, err := net.DialTimeout("tcp", u.Host, 2*time.Second)
-	if err != nil {
-		return CapabilityStatus{
-			Available: false,
-			Reason:    fmt.Sprintf("Celln router at %s is not reachable: %v", u.Host, err),
-		}
-	}
-	_ = conn.Close()
-	return CapabilityStatus{Available: true}
+	return cellnCapabilityStatus()
 }
 
 func (s *Server) getCapabilities(w http.ResponseWriter, r *http.Request) {

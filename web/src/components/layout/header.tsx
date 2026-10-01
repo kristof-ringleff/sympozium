@@ -9,11 +9,14 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { Activity, LogOut, Wifi, WifiOff } from "lucide-react";
+import { Activity, LogOut, Wifi, WifiOff, Plus, Bot, Play } from "lucide-react";
 import { useWebSocket } from "@/hooks/use-websocket";
 import { useState } from "react";
 import { formatAge } from "@/lib/utils";
 import { ThemeToggle } from "@/components/theme-toggle";
+import { ClusterBadge } from "@/components/cluster-identity";
+import { useNavigate } from "react-router-dom";
+import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 
 export function Header() {
   const { logout } = useAuth();
@@ -21,6 +24,8 @@ export function Header() {
   const { data: namespaces } = useNamespaces();
   const { data: canary } = useCanaryConfig();
   const [ns, setNs] = useState(getNamespace());
+  const [createOpen, setCreateOpen] = useState(false);
+  const navigate = useNavigate();
 
   const handleNsChange = (value: string) => {
     setNs(value);
@@ -46,8 +51,12 @@ export function Header() {
             </SelectContent>
           </Select>
         </div>
+        <ClusterBadge />
       </div>
       <div className="flex items-center gap-3">
+        <Button size="sm" onClick={() => setCreateOpen(true)}>
+          <Plus className="mr-1.5 h-4 w-4" /> Create
+        </Button>
         {/* Canary health indicator */}
         {canary?.enabled && canary.healthStatus && (
           <div
@@ -101,6 +110,26 @@ export function Header() {
           <LogOut className="h-4 w-4" />
         </Button>
       </div>
+      <Dialog open={createOpen} onOpenChange={setCreateOpen}>
+        <DialogContent className="sm:max-w-lg">
+          <DialogHeader>
+            <DialogTitle>Create</DialogTitle>
+            <DialogDescription>Choose how you want to work.</DialogDescription>
+          </DialogHeader>
+          <div className="grid gap-3 sm:grid-cols-2">
+            <button className="rounded-lg border p-4 text-left hover:border-primary" onClick={() => { setCreateOpen(false); navigate("/agents?create=1&kind=agent"); }}>
+              <Bot className="mb-2 h-5 w-5" />
+              <p className="font-medium">Agent</p>
+              <p className="mt-1 text-xs text-muted-foreground">Ongoing work that keeps its context. Choose an execution plane — Celln or Kubernetes — then its runtime and tools.</p>
+            </button>
+            <button className="rounded-lg border p-4 text-left hover:border-primary" onClick={() => { setCreateOpen(false); navigate("/agents?create=1&kind=run"); }}>
+              <Play className="mb-2 h-5 w-5" />
+              <p className="font-medium">Run</p>
+              <p className="mt-1 text-xs text-muted-foreground">One-shot work that finishes and exits. Configure an Agent with a provider, model, and SkillPacks.</p>
+            </button>
+          </div>
+        </DialogContent>
+      </Dialog>
     </header>
   );
 }

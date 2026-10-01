@@ -5,6 +5,7 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"os"
 	"time"
 
@@ -23,6 +24,9 @@ import (
 	llmfitv1alpha1 "github.com/sympozium-ai/llmfit-dra/api/v1alpha1"
 
 	sympoziumv1alpha1 "github.com/sympozium-ai/sympozium/api/v1alpha1"
+	"github.com/sympozium-ai/sympozium/internal/cellnparent"
+	"github.com/sympozium-ai/sympozium/internal/cellnreview"
+	"github.com/sympozium-ai/sympozium/internal/cellnscoped"
 	"github.com/sympozium-ai/sympozium/internal/controller"
 	"github.com/sympozium-ai/sympozium/internal/dra"
 	"github.com/sympozium-ai/sympozium/internal/eventbus"
@@ -51,9 +55,15 @@ func main() {
 	var natsURL string
 	var maxRunHistory int
 	var delegationControllerExecutor bool
+	var watchNamespace string
+	var excludedNamespaces string
+	var parentOnly bool
+	flag.BoolVar(&parentOnly, "celln-parent-only", false, "Run only native Celln parent/turn controllers; requires an explicit watch namespace and parent configuration.")
 
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metric endpoint binds to.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
+	flag.StringVar(&watchNamespace, "watch-namespace", "", "Restrict namespaced cache watches to one namespace; empty watches all. This is not an authorization boundary; scope Kubernetes RBAC separately.")
+	flag.StringVar(&excludedNamespaces, "exclude-watch-namespaces", "", "Comma-separated namespaces owned by another manager; preserves watches in all other namespaces. Mutually exclusive with --watch-namespace; not an RBAC boundary.")
 	flag.BoolVar(&enableLeaderElection, "leader-elect", false,
 		"Enable leader election for controller manager. "+
 			"Enabling this will ensure there is only one active controller manager.")
@@ -66,6 +76,10 @@ func main() {
 			"tool-driven delegation path is unchanged. Also enabled via "+
 			"SYMPOZIUM_DELEGATION_CONTROLLER_EXECUTOR=true.")
 	flag.Parse()
+	if parentOnly && (watchNamespace == "" || os.Getenv("CELLN_PARENT_CONFIG") == "" || os.Getenv("CELLN_PARENT_REGISTRATIONS") == "") {
+		fmt.Fprintln(os.Stderr, "parent-only mode requires an explicit watch namespace, CELLN_PARENT_CONFIG and CELLN_PARENT_REGISTRATIONS")
+		os.Exit(1)
+	}
 
 	// Resolve the image tag used for runtime-spawned pods (agent-runner,
 	// memory-server, MCP servers, channel sidecars). The package-level
@@ -92,6 +106,11 @@ func main() {
 	}
 
 	ctrl.SetLogger(zap.New(zap.UseDevMode(true)))
+	cacheOptions, err := controllerCacheOptions(watchNamespace, excludedNamespaces)
+	if err != nil {
+		setupLog.Error(err, "invalid watch namespace")
+		os.Exit(1)
+	}
 
 	// Initialize OpenTelemetry SDK. Falls back to noop if OTEL_EXPORTER_OTLP_ENDPOINT is unset.
 	tel, err := telemetry.Init(context.Background(), telemetry.Config{
@@ -104,16 +123,26 @@ func main() {
 
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
 		Scheme: scheme,
+		Cache:  cacheOptions,
 		Metrics: metricsserver.Options{
 			BindAddress: metricsAddr,
 		},
-		HealthProbeBindAddress: probeAddr,
-		LeaderElection:         enableLeaderElection,
-		LeaderElectionID:       "sympozium-controller-leader",
+		HealthProbeBindAddress:  probeAddr,
+		LeaderElection:          enableLeaderElection,
+		LeaderElectionID:        "sympozium-controller-leader",
+		LeaderElectionNamespace: watchNamespace,
 	})
 	if err != nil {
 		setupLog.Error(err, "unable to start manager")
 		os.Exit(1)
+	}
+
+	if parentOnly {
+		if err := runParentOnly(mgr, natsURL); err != nil {
+			setupLog.Error(err, "parent-only manager stopped")
+			os.Exit(1)
+		}
+		return
 	}
 
 	// Set up the PodBuilder used by AgentRunReconciler
@@ -172,6 +201,7 @@ func main() {
 	}
 
 	agentRunReconciler := &controller.AgentRunReconciler{
+		ParentConfigPath:             os.Getenv("CELLN_PARENT_CONFIG"),
 		Client:                       mgr.GetClient(),
 		APIReader:                    mgr.GetAPIReader(),
 		Scheme:                       mgr.GetScheme(),
@@ -184,9 +214,48 @@ func main() {
 		DynamicClient:                dynamicClient,
 		Pricing:                      pricingLoader,
 	}
+	// The shared-catalogue native lifecycle path is disabled unless an operator
+	// supplies the complete receiver/gateway/issuer configuration. A malformed
+	// explicit configuration is a startup error, never a legacy fallback.
+	if configPath := os.Getenv("CELLN_SCOPED_CONFIG"); configPath != "" {
+		dispatcher, err := cellnscoped.LoadDispatcher(configPath, mgr.GetClient(), mgr.GetAPIReader())
+		if err != nil {
+			setupLog.Error(err, "invalid scoped Celln controller configuration")
+			os.Exit(1)
+		}
+		agentRunReconciler.ScopedDispatcher = dispatcher
+		setupLog.Info("Scoped Celln one-shot and enduring execution enabled")
+	}
+	if configPath := os.Getenv("CELLN_PARENT_REGISTRATIONS"); configPath != "" {
+		dispatcher, err := cellnparent.LoadRegistrationDispatcher(configPath, agentRunReconciler.ParentConfigPath, mgr.GetAPIReader())
+		if err != nil {
+			setupLog.Error(err, "invalid prepared Celln parent admission configuration")
+			os.Exit(1)
+		}
+		agentRunReconciler.ParentAdmission = dispatcher
+	}
+	if configPath := os.Getenv("CELLN_CATALOGUE_CONFIG"); configPath != "" {
+		dispatcher, closeDispatcher, err := cellnreview.LoadRunDispatcher(configPath, mgr.GetClient(), mgr.GetAPIReader())
+		if err != nil {
+			setupLog.Error(err, "invalid Celln catalogue controller configuration")
+			os.Exit(1)
+		}
+		defer closeDispatcher()
+		agentRunReconciler.CatalogueDispatcher = dispatcher
+		setupLog.Info("Celln catalogue execution recovery enabled; new submission requires CELLN_HARNESS_ENABLED=true")
+	}
 	if err := agentRunReconciler.SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "AgentRun")
 		os.Exit(1)
+	}
+	// Follow-up turns are served by whichever enduring path is configured: the
+	// scoped receiver, or the prepared native parent path folded into this
+	// manager (docs/design/celln-single-execution-plane.md).
+	if agentRunReconciler.ScopedDispatcher != nil || agentRunReconciler.ParentAdmission != nil {
+		if err := (&controller.AgentRunTurnReconciler{Client: mgr.GetClient(), APIReader: mgr.GetAPIReader(), ScopedDispatcher: agentRunReconciler.ScopedDispatcher, ParentConfigPath: agentRunReconciler.ParentConfigPath}).SetupWithManager(mgr); err != nil {
+			setupLog.Error(err, "unable to create AgentRunTurn controller")
+			os.Exit(1)
+		}
 	}
 
 	if err := (&controller.SympoziumPolicyReconciler{
@@ -216,6 +285,15 @@ func main() {
 		os.Exit(1)
 	}
 
+	if err := (&controller.WorkspaceSessionReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+		Log:    ctrl.Log.WithName("controllers").WithName("WorkspaceSession"),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "WorkspaceSession")
+		os.Exit(1)
+	}
+
 	ensembleReconciler := &controller.EnsembleReconciler{
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
@@ -242,6 +320,24 @@ func main() {
 		Log:    ctrl.Log.WithName("controllers").WithName("SympoziumConfig"),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "SympoziumConfig")
+		os.Exit(1)
+	}
+
+	if err := (&controller.AgentRuntimeReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+		Log:    ctrl.Log.WithName("controllers").WithName("AgentRuntime"),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "AgentRuntime")
+		os.Exit(1)
+	}
+
+	if err := (&controller.HarnessSessionReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+		Log:    ctrl.Log.WithName("controllers").WithName("HarnessSession"),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "HarnessSession")
 		os.Exit(1)
 	}
 

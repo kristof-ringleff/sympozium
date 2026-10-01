@@ -3,12 +3,14 @@ package controller
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
 	"os"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -41,11 +43,14 @@ import (
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	sympoziumv1alpha1 "github.com/sympozium-ai/sympozium/api/v1alpha1"
+	"github.com/sympozium-ai/sympozium/internal/cellnscoped"
 	"github.com/sympozium-ai/sympozium/internal/controller/taskmodes"
 	"github.com/sympozium-ai/sympozium/internal/eventbus"
 	"github.com/sympozium-ai/sympozium/internal/ipc"
+	"github.com/sympozium-ai/sympozium/internal/modelconnection"
 	"github.com/sympozium-ai/sympozium/internal/orchestrator"
 	"github.com/sympozium-ai/sympozium/internal/pricing"
+	"github.com/sympozium-ai/sympozium/internal/sessionkey"
 	"github.com/sympozium-ai/sympozium/internal/toolpolicy"
 	"github.com/sympozium-ai/sympozium/pkg/sidecartools"
 	"gopkg.in/yaml.v3"
@@ -92,6 +97,13 @@ var (
 const agentRunFinalizer = "sympozium.ai/agentrun-finalizer"
 const systemNamespace = "sympozium-system"
 
+const (
+	legacyAgentServiceAccountName = "sympozium-agent"
+	runAPIAccessVolumeName        = "sympozium-run-api-access"
+	runAPIAccessMountPath         = "/var/run/secrets/kubernetes.io/serviceaccount"
+	runNATSBridgeSecretPrefix     = "sympozium-run-nats-"
+)
+
 // tokenBudgetCountedAnnotation marks an AgentRun whose token usage has already
 // been aggregated into its ensemble's budget, so repeated reconciles of the
 // completed run cannot double-count it.
@@ -120,6 +132,12 @@ var allowedAuthSecretKeys = []string{
 	"API_KEY",
 }
 
+// IsAllowedAuthSecretKey reports whether key is on the auth secret allowlist,
+// i.e. whether a Secret entry under that key reaches the agent container.
+func IsAllowedAuthSecretKey(key string) bool {
+	return slices.Contains(allowedAuthSecretKeys, key)
+}
+
 // deniedEnvVarKeys lists environment variable names that cannot be set via
 // agentRun.spec.env to prevent injection attacks.
 var deniedEnvVarKeys = map[string]bool{
@@ -139,7 +157,23 @@ const DefaultRunHistoryLimit = 50
 // AgentRunReconciler reconciles AgentRun objects.
 // It watches AgentRun CRDs and reconciles them into Kubernetes Jobs/Pods.
 type AgentRunReconciler struct {
+	// ParentOnly refuses unrelated workloads before any status/finalizer writes.
+	// Use with a namespace-scoped cache and restricted parent-controller RBAC.
+	ParentOnly bool
 	client.Client
+	// CatalogueDispatcher is explicit operator wiring; nil refuses catalogue
+	// issuance rather than falling through to legacy forge or OCI execution.
+	CatalogueDispatcher CatalogueDispatcher
+	// ScopedDispatcher is the explicit operator-configured shared-catalogue
+	// one-shot/enduring path. Nil is disabled and never falls back to legacy.
+	ScopedDispatcher *cellnscoped.Dispatcher
+	// ScopedOnly ignores non-catalogue runs before finalizers or legacy side effects.
+	ScopedOnly bool
+	// ParentConfigPath explicitly enables experimental enduring-parent startup.
+	// Empty refuses new enduring runs; existing cleanup remains fail-closed.
+	ParentConfigPath string
+	// ParentAdmission optionally publishes prepared registrations before startup.
+	ParentAdmission ParentAdmission
 	// APIReader bypasses the controller cache for reads — needed when we
 	// must see status mutations committed by a concurrent reconcile that
 	// the watch-based cache may not yet have observed.
@@ -270,6 +304,18 @@ func (r *AgentRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		}
 		return ctrl.Result{}, err
 	}
+	if r.ParentOnly && !parentOnlyRun(agentRun) {
+		return ctrl.Result{}, nil
+	}
+	if r.ScopedOnly {
+		selected, err := r.sharedCatalogueSelected(ctx, agentRun)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if !selected {
+			return ctrl.Result{}, nil
+		}
+	}
 
 	// If the AgentRun carries a traceparent annotation (set by channel router),
 	// use it as parent context so this span joins the original trace.
@@ -296,9 +342,20 @@ func (r *AgentRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	// their finalizer removed in reconcileCompleted; we must not re-add it or
 	// we create an infinite remove→add→remove loop.
 	// Serving-mode runs are long-lived and also need a finalizer.
-	isTerminal := agentRun.Status.Phase == sympoziumv1alpha1.AgentRunPhaseSucceeded ||
-		agentRun.Status.Phase == sympoziumv1alpha1.AgentRunPhaseFailed ||
-		agentRun.Status.Phase == sympoziumv1alpha1.AgentRunPhaseSkipped
+	isTerminal := agentRun.Status.Phase.IsTerminal()
+	// Persist this boundary only for untouched new runs, before adding our
+	// finalizer or creating any resources. Never infer it from mutable backend
+	// intent on an existing run. Requeue to confirm the API retains the field.
+	if agentRun.Generation == 1 && agentRun.Spec.Backend == "celln" && len(agentRun.Finalizers) == 0 && apiequality.Semantic.DeepEqual(agentRun.Status, sympoziumv1alpha1.AgentRunStatus{}) {
+		agentRun.Status.CellnOnly = true
+		if err := r.Status().Update(ctx, agentRun); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{Requeue: true}, nil
+	}
+	if !isTerminal && agentRun.Status.CellnOnly && agentRun.Spec.Backend != "celln" {
+		return ctrl.Result{}, r.failRun(ctx, agentRun, "Celln-only run cannot change execution backend; create a new run")
+	}
 	if !isTerminal && !controllerutil.ContainsFinalizer(agentRun, agentRunFinalizer) {
 		controllerutil.AddFinalizer(agentRun, agentRunFinalizer)
 		if err := r.Update(ctx, agentRun); err != nil {
@@ -311,21 +368,67 @@ func (r *AgentRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		}
 	}
 
+	// Shared-catalogue one-shot selection is decided before model connection
+	// normalization and every legacy/OCI prerequisite. Once a scoped identity is
+	// present it remains on this path even if mutable intent is later edited.
+	sharedScoped, selectionErr := r.sharedCatalogueSelected(ctx, agentRun)
+	if selectionErr != nil {
+		return ctrl.Result{}, selectionErr
+	}
+	if sharedScoped {
+		if !scopedCatalogueSelected(agentRun) && !isTerminal {
+			return ctrl.Result{}, r.failRun(ctx, agentRun, "Scoped Celln run selection or lifecycle changed; create a new run")
+		}
+		switch phase := agentRun.Status.Phase; {
+		case phase == "" || phase == sympoziumv1alpha1.AgentRunPhasePending:
+			return r.reconcilePendingScoped(ctx, log, agentRun)
+		case phase == sympoziumv1alpha1.AgentRunPhaseRunning:
+			return r.reconcileRunningScoped(ctx, log, agentRun)
+		case phase.IsTerminal():
+			return r.reconcileCompleted(ctx, log, agentRun)
+		default:
+			return ctrl.Result{}, r.failRun(ctx, agentRun, "Scoped Celln run entered an unsupported controller phase")
+		}
+	}
+
+	// Resolve connection intent before any native model/template binding. Persist
+	// the exact route first so YAML and HTTP creation freeze the same spec.
+	if !isTerminal && agentRun.Spec.Model.ConnectionRef != "" && (agentRun.Status.Phase == "" || agentRun.Status.Phase == sympoziumv1alpha1.AgentRunPhasePending) {
+		if agentRun.Spec.Backend != "celln" {
+			return ctrl.Result{}, r.failRun(ctx, agentRun, "model connections currently require native Celln execution")
+		}
+		reader := r.APIReader
+		if reader == nil {
+			reader = r.Client
+		}
+		model, resolveErr := modelconnection.Resolve(ctx, reader, agentRun.Namespace, agentRun.Spec.Model)
+		if resolveErr != nil {
+			return ctrl.Result{}, r.failRun(ctx, agentRun, resolveErr.Error())
+		}
+		if !apiequality.Semantic.DeepEqual(model, agentRun.Spec.Model) {
+			agentRun.Spec.Model = model
+			if err := r.Update(ctx, agentRun); err != nil {
+				return ctrl.Result{}, err
+			}
+			return ctrl.Result{Requeue: true}, nil
+		}
+	}
+
 	// Reconcile based on current phase
 	var result ctrl.Result
 	var err error
-	switch agentRun.Status.Phase {
-	case "", sympoziumv1alpha1.AgentRunPhasePending:
+	switch phase := agentRun.Status.Phase; {
+	case phase == "" || phase == sympoziumv1alpha1.AgentRunPhasePending:
 		result, err = r.reconcilePending(ctx, log, agentRun)
-	case sympoziumv1alpha1.AgentRunPhaseRunning:
+	case phase == sympoziumv1alpha1.AgentRunPhaseRunning:
 		result, err = r.reconcileRunning(ctx, log, agentRun)
-	case sympoziumv1alpha1.AgentRunPhasePostRunning:
+	case phase == sympoziumv1alpha1.AgentRunPhasePostRunning:
 		result, err = r.reconcilePostRunning(ctx, log, agentRun)
-	case sympoziumv1alpha1.AgentRunPhaseServing:
+	case phase == sympoziumv1alpha1.AgentRunPhaseServing:
 		result, err = r.reconcileServing(ctx, log, agentRun)
-	case sympoziumv1alpha1.AgentRunPhaseAwaitingDelegate:
+	case phase == sympoziumv1alpha1.AgentRunPhaseAwaitingDelegate:
 		result, err = r.reconcileAwaitingDelegate(ctx, log, agentRun)
-	case sympoziumv1alpha1.AgentRunPhaseSucceeded, sympoziumv1alpha1.AgentRunPhaseFailed, sympoziumv1alpha1.AgentRunPhaseSkipped:
+	case phase.IsTerminal():
 		result, err = r.reconcileCompleted(ctx, log, agentRun)
 	default:
 		log.Info("Unknown phase", "phase", agentRun.Status.Phase)
@@ -351,6 +454,25 @@ type agentRunInputs struct {
 	// Threaded into the ipc-bridge, which drops tool sends to any other channel
 	// (agents are adversarial — this limits the data-exfil surface).
 	allowedOutboundChannels []string
+}
+
+// agentAllowsModelCredential checks the Agent-owned allowlist for a model
+// Secret. An empty reference is valid for cluster-local and unauthenticated
+// providers. Empty provider on an AuthRef is an explicit provider-agnostic
+// grant by the Agent owner.
+func agentAllowsModelCredential(agent *sympoziumv1alpha1.Agent, provider, secret string) bool {
+	if strings.TrimSpace(secret) == "" {
+		return true
+	}
+	for _, ref := range agent.Spec.AuthRefs {
+		if ref.Secret != secret {
+			continue
+		}
+		if ref.Provider == "" || strings.EqualFold(ref.Provider, provider) {
+			return true
+		}
+	}
+	return false
 }
 
 // resolveAgentRunInputs looks up the backing Agent, folds its configuration into
@@ -481,9 +603,14 @@ func (r *AgentRunReconciler) prepareRunPrerequisites(
 ) (runPrerequisites, error) {
 	var out runPrerequisites
 
-	// Ensure the sympozium-agent ServiceAccount exists in the target namespace.
-	if err := r.ensureAgentServiceAccount(ctx, agentRun.Namespace); err != nil {
+	// Give every AgentRun its own Kubernetes identity. The namespace-level
+	// sympozium-agent account is retained only as an annotation template for
+	// workload-identity integrations; no run pod executes as that shared account.
+	if err := r.ensureAgentServiceAccount(ctx, agentRun); err != nil {
 		return out, fmt.Errorf("ensuring agent service account: %w", err)
+	}
+	if err := r.ensureNATSBridgeCredentials(ctx, agentRun); err != nil {
+		return out, fmt.Errorf("ensuring IPC bridge NATS credentials: %w", err)
 	}
 
 	// Create the input ConfigMap with the task.
@@ -499,11 +626,18 @@ func (r *AgentRunReconciler) prepareRunPrerequisites(
 	out.inputs = inputs
 	out.mcpServers = inputs.mcpServers
 
+	// Resolve skill sidecars from SkillPack CRDs. This runs before the MCP
+	// registry below because the registry's contents depend on it: a run whose
+	// agent container is replaced reaches its SkillPack tools through the skill
+	// tool server, which appears in the registry as one more MCP server.
+	out.sidecars = r.resolveSkillSidecars(ctx, log, agentRun)
+	needsSkillTools := RunNeedsSkillToolServer(agentRun, out.sidecars)
+
 	// Resolve MCPServer CRs: for any mcpServer entry without a URL, look up the
 	// MCPServer CR by name and use its status.url, then write the MCP ConfigMap.
-	if len(out.mcpServers) > 0 {
+	if len(out.mcpServers) > 0 || needsSkillTools {
 		out.mcpServers = r.resolveMCPServerURLs(ctx, agentRun.Namespace, out.mcpServers)
-		if err := r.ensureMCPConfigMap(ctx, agentRun, out.mcpServers); err != nil {
+		if err := r.ensureMCPConfigMap(ctx, agentRun, out.mcpServers, needsSkillTools); err != nil {
 			return out, fmt.Errorf("creating MCP ConfigMap: %w", err)
 		}
 	}
@@ -515,9 +649,6 @@ func (r *AgentRunReconciler) prepareRunPrerequisites(
 		}
 		agentRun.Annotations["otel.dev/traceparent"] = traceparent
 	}
-
-	// Resolve skill sidecars from SkillPack CRDs.
-	out.sidecars = r.resolveSkillSidecars(ctx, log, agentRun)
 
 	return out, nil
 }
@@ -536,13 +667,14 @@ func (r *AgentRunReconciler) prepareTaskPrerequisites(
 ) ([]resolvedSidecar, *ctrl.Result, error) {
 	// Filter out server-only sidecars (RequiresServer) — they are not meaningful
 	// in a task-mode pod and would waste resources.
-	sidecars := make([]resolvedSidecar, 0, len(resolved))
+	sidecars := taskModeSidecars(resolved)
 	for _, sc := range resolved {
 		if sc.sidecar.RequiresServer {
 			log.V(1).Info("Skipping server-only sidecar in task mode", "skillPack", sc.skillPackName)
-			continue
 		}
-		sidecars = append(sidecars, sc)
+	}
+	if err := validateHarnessIsolation(agentRun, sidecars); err != nil {
+		return nil, &ctrl.Result{}, r.failRun(ctx, agentRun, err.Error())
 	}
 
 	// Write the native sidecar-tools manifest as a read-only ConfigMap when any
@@ -604,6 +736,10 @@ func (r *AgentRunReconciler) prepareTaskPrerequisites(
 	//   - Clock skew between cluster nodes (`date` on each node vs NTP)
 	//   - Controller ClusterRole missing RBAC delegation permissions
 	//     (re-run `helm upgrade` to sync the latest chart RBAC)
+	if err := r.ensureCanaryRBAC(ctx, agentRun); err != nil {
+		return nil, &ctrl.Result{}, r.failRun(ctx, agentRun,
+			fmt.Sprintf("failed to create isolated canary RBAC: %v", err))
+	}
 	if err := r.ensureSkillRBAC(ctx, log, agentRun, sidecars); err != nil {
 		return nil, &ctrl.Result{}, r.failRun(ctx, agentRun,
 			fmt.Sprintf("failed to create skill RBAC — the agent would run without Kubernetes permissions. "+
@@ -637,6 +773,38 @@ func (r *AgentRunReconciler) prepareTaskPrerequisites(
 
 // reconcilePending handles an AgentRun that needs a Job created.
 func (r *AgentRunReconciler) reconcilePending(ctx context.Context, log logr.Logger, agentRun *sympoziumv1alpha1.AgentRun) (ctrl.Result, error) {
+	if agentRun.Status.CellnParent != nil {
+		return r.reconcileCellnParent(ctx, agentRun)
+	}
+	if reason := agentRun.Spec.ValidateLifecycle(); reason != "" {
+		return ctrl.Result{}, r.failRun(ctx, agentRun, reason)
+	}
+	if agentRun.Spec.ExecutionLifecycle == "enduring" {
+		if r.ParentConfigPath != "" {
+			return r.reconcileCellnParent(ctx, agentRun)
+		}
+		// Fail closed until the authenticated persistent-owner serving path is
+		// integrated. Never turn explicit enduring intent into a one-shot Job.
+		return ctrl.Result{}, r.failRun(ctx, agentRun, "Celln enduring lifecycle is not yet available on this controller")
+	}
+	if agentRun.Spec.CellnSelection != nil {
+		if agentRun.Spec.Backend != "celln" || agentRun.Spec.Celln != nil || !agentRun.Spec.Task.IsString() {
+			return ctrl.Result{}, r.failRun(ctx, agentRun, "Catalogue selection requires backend celln, a string task and no explicit artifacts")
+		}
+		// A one-shot on the shared catalogue is a single-turn native parent
+		// when the platform admits it; it never reaches namespace issuance.
+		if platform, err := r.platformOneShotSelected(ctx, agentRun); err != nil {
+			return ctrl.Result{}, err
+		} else if platform {
+			return r.reconcileCellnParent(ctx, agentRun)
+		}
+		if agentRun.Status.CellnIssuance == nil || agentRun.Status.CellnIssuance.Phase == "Prepared" {
+			return r.awaitCatalogueIssuance(ctx, log, agentRun)
+		}
+	}
+	if agentRun.Spec.Backend == "celln" && agentRun.Status.CellnIssuance != nil {
+		return r.reconcilePendingCatalogue(ctx, log, agentRun)
+	}
 	ctx, span := controllerTracer.Start(ctx, "agentrun.create_job",
 		trace.WithAttributes(
 			attribute.String("agentrun.name", agentRun.Name),
@@ -653,7 +821,7 @@ func (r *AgentRunReconciler) reconcilePending(ctx context.Context, log logr.Logg
 	// inside the agent-runner. Fail fast with a clear status.error so the
 	// operator sees why the run never started instead of a runtime crash.
 	// PR #302 review (issuecomment 5033007953) — second smaller ask.
-	if agentRun.Spec.Task == nil {
+	if agentRun.Spec.Task == nil && !(agentRun.Spec.Backend == "celln" && agentRun.Spec.Celln != nil) {
 		return ctrl.Result{}, r.failRun(ctx, agentRun,
 			"spec.task is required and must not be empty; provide a string prompt (Path A) or a {mode, tool, parameters} object (Path B)")
 	}
@@ -674,6 +842,37 @@ func (r *AgentRunReconciler) reconcilePending(ctx context.Context, log logr.Logg
 		agentRun.Spec.Model.AuthSecretRef = "" // cluster-internal, no auth needed
 	}
 
+	// Resolve a harness runtime reference into inline image/capabilities so the
+	// policy check, task-mode dispatch, and pod build all see resolved values
+	// instead of a runtime name. When the task names neither an image nor a
+	// runtime, the Agent's runtimeRef is inherited.
+	var runtimeInstance sympoziumv1alpha1.Agent
+	if err := r.Get(ctx, client.ObjectKey{Namespace: agentRun.Namespace, Name: agentRun.Spec.AgentRef}, &runtimeInstance); err != nil {
+		if errors.IsNotFound(err) {
+			return ctrl.Result{}, r.failRun(ctx, agentRun, fmt.Sprintf("Agent %q not found while resolving runtime", agentRun.Spec.AgentRef))
+		}
+		return ctrl.Result{}, fmt.Errorf("reading Agent %q while resolving runtime: %w", agentRun.Spec.AgentRef, err)
+	}
+	// Remember the source before an Agent default converts a string task into a
+	// harness task. The normalized task is intentionally not persisted to spec;
+	// status is the immutable execution record used by run detail and audit.
+	inheritedHarnessRuntime := strings.TrimSpace(runtimeInstance.Spec.RuntimeRef) != "" &&
+		(agentRun.Spec.Task.IsString() || (agentRun.Spec.Task.GetMode() == taskmodes.Harness &&
+			strings.TrimSpace(agentRun.Spec.Task.Parameters["image"]) == "" &&
+			strings.TrimSpace(agentRun.Spec.Task.Parameters["runtime"]) == ""))
+	agentRun.Spec.Task = taskmodes.ApplyAgentRuntime(agentRun.Spec.Task, runtimeInstance.Spec.RuntimeRef)
+	harnessRuntimeRef := taskmodes.HarnessRuntimeRef(agentRun.Spec.Task)
+	if normalized, err := taskmodes.NormalizeHarnessTask(agentRun.Namespace, agentRun.Spec.Task, func(ns, name string) (*sympoziumv1alpha1.AgentRuntime, error) {
+		var rt sympoziumv1alpha1.AgentRuntime
+		if err := r.Get(ctx, client.ObjectKey{Namespace: ns, Name: name}, &rt); err != nil {
+			return nil, err
+		}
+		return &rt, nil
+	}); err != nil {
+		return ctrl.Result{}, r.failRun(ctx, agentRun, fmt.Sprintf("runtime resolution failed: %v", err))
+	} else {
+		agentRun.Spec.Task = normalized
+	}
 	// Validate against policy
 	if err := r.validatePolicy(ctx, agentRun); err != nil {
 		return ctrl.Result{}, r.failRun(ctx, agentRun, fmt.Sprintf("policy validation failed: %v", err))
@@ -693,9 +892,28 @@ func (r *AgentRunReconciler) reconcilePending(ctx context.Context, log logr.Logg
 	// backends at once. Without this check AgentSandbox is evaluated first
 	// below and celln would be silently dropped with no signal to whoever
 	// authored the run that their backend: celln choice was ignored.
+	if agentRun.Spec.Celln != nil && agentRun.Spec.Backend != "celln" {
+		return ctrl.Result{}, r.failRun(ctx, agentRun, "spec.celln requires backend: celln")
+	}
 	if agentRun.Spec.Backend == "celln" && agentRun.Spec.AgentSandbox != nil && agentRun.Spec.AgentSandbox.Enabled {
 		return ctrl.Result{}, r.failRun(ctx, agentRun,
 			"backend: celln and agentSandbox.enabled are mutually exclusive execution backends; set only one")
+	}
+
+	// Same failure, one level down: a task mode that replaces the agent
+	// container (mode: harness) has nothing to replace under backend: celln,
+	// which dispatches the task string to the router instead of building a
+	// pod. buildContainers never runs on that path, so without this the run
+	// is admitted, dispatched, and the operator's harness image is silently
+	// ignored. agentSandbox is fine — it reaches buildContainers through
+	// buildAgentPodTemplate, so task-mode dispatch still applies there.
+	if agentRun.Spec.Backend == "celln" && taskModeReplacesAgentContainer(agentRun.Spec.Task) {
+		return ctrl.Result{}, r.failRun(ctx, agentRun, fmt.Sprintf(
+			"task.mode %q replaces the agent container, which backend: celln never creates; use the default job backend (or agentSandbox) for this mode",
+			agentRun.Spec.Task.GetMode()))
+	}
+	if taskmodes.HarnessImage(agentRun.Spec.Task) != "" && !agentAllowsModelCredential(&runtimeInstance, agentRun.Spec.Model.Provider, agentRun.Spec.Model.AuthSecretRef) {
+		return ctrl.Result{}, r.failRun(ctx, agentRun, fmt.Sprintf("harness model credential %q is not declared in Agent %q spec.authRefs for provider %q", agentRun.Spec.Model.AuthSecretRef, runtimeInstance.Name, agentRun.Spec.Model.Provider))
 	}
 
 	// Agent Sandbox mode — create Sandbox CR instead of Job.
@@ -731,6 +949,108 @@ func (r *AgentRunReconciler) reconcilePending(ctx context.Context, log logr.Logg
 	}
 	if err != nil {
 		return ctrl.Result{}, err
+	}
+
+	// Per-session workspace PVC (opt-in via Agent.Spec.Workspace.PerSessionPVC).
+	// When enabled, this AgentRun:
+	//   1. Acquires a session lock — only one AgentRun per (agent, session)
+	//      may be Running/Serving at a time, since RWO PVCs cannot
+	//      multi-attach. Blocked runs requeue without creating a Job.
+	//   2. Resolves (or creates) the WorkspaceSession that owns the PVC,
+	//      and stamps the PVC name onto an annotation so buildVolumes
+	//      mounts it at /workspace in place of the emptyDir.
+	if agentRunQualifiesForSessionPVC(agentRun, &runtimeInstance) {
+		hash := sessionkey.Hash(agentRun.Spec.SessionKey)
+
+		// Stamp the session-key-hash label so peer lookups are cheap.
+		// If the label is missing, persist it first and requeue — we
+		// must persist the label before we trust the lock query.
+		if agentRun.Labels[SessionKeyHashLabel] != hash {
+			if agentRun.Labels == nil {
+				agentRun.Labels = map[string]string{}
+			}
+			agentRun.Labels[SessionKeyHashLabel] = hash
+			if err := r.Update(ctx, agentRun); err != nil {
+				return ctrl.Result{}, fmt.Errorf("stamping session-key-hash label: %w", err)
+			}
+			return ctrl.Result{Requeue: true}, nil
+		}
+
+		// Session lock: refuse to admit while a peer with the same
+		// session holds the lock (Running/Serving or Job created) or
+		// an older waiter is queued ahead of us (FIFO admission).
+		peers, err := listBlockingSessionPeers(ctx, r.Client, agentRun, agentRun.Spec.AgentRef, hash)
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf("checking session peers: %w", err)
+		}
+		if len(peers) > 0 {
+			peerNames := make([]string, 0, len(peers))
+			for _, p := range peers {
+				peerNames = append(peerNames, p.Name)
+			}
+			log.Info("Session busy; deferring run",
+				"sessionKeyHash", hash, "blockingPeers", peerNames)
+			if statusErr := r.updateStatusWithRetry(ctx, agentRun, func(ar *sympoziumv1alpha1.AgentRun) {
+				ar.Status.Conditions = setCondition(ar.Status.Conditions, metav1.Condition{
+					Type:               "Blocked",
+					Status:             metav1.ConditionTrue,
+					Reason:             "SessionBusy",
+					Message:            fmt.Sprintf("waiting for session peer(s): %v", peerNames),
+					LastTransitionTime: metav1.Now(),
+				})
+			}); statusErr != nil {
+				log.Error(statusErr, "Failed to update Blocked condition")
+			}
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+		}
+
+		// Clear any prior Blocked condition before proceeding.
+		if len(agentRun.Status.Conditions) > 0 {
+			if statusErr := r.updateStatusWithRetry(ctx, agentRun, func(ar *sympoziumv1alpha1.AgentRun) {
+				ar.Status.Conditions = setCondition(ar.Status.Conditions, metav1.Condition{
+					Type:               "Blocked",
+					Status:             metav1.ConditionFalse,
+					Reason:             "SessionAvailable",
+					LastTransitionTime: metav1.Now(),
+				})
+			}); statusErr != nil {
+				log.Error(statusErr, "Failed to clear Blocked condition")
+			}
+		}
+
+		// Ensure the WorkspaceSession + PVC exist.
+		pvcName, wsName, err := ensureWorkspaceSession(ctx, r.Client, r.Scheme, &runtimeInstance, agentRun.Spec.SessionKey)
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf("ensuring workspace session: %w", err)
+		}
+
+		// Stamp annotations so buildVolumes and buildContainers know to
+		// swap in the PVC and emit the recreation marker init container.
+		if agentRun.Annotations == nil {
+			agentRun.Annotations = map[string]string{}
+		}
+		changed := false
+		if agentRun.Annotations[WorkspacePVCAnnotation] != pvcName {
+			agentRun.Annotations[WorkspacePVCAnnotation] = pvcName
+			changed = true
+		}
+		if agentRun.Annotations[WorkspaceSessionAnnotation] != wsName {
+			agentRun.Annotations[WorkspaceSessionAnnotation] = wsName
+			changed = true
+		}
+		if changed {
+			if err := r.Update(ctx, agentRun); err != nil {
+				return ctrl.Result{}, fmt.Errorf("stamping workspace annotations: %w", err)
+			}
+			return ctrl.Result{Requeue: true}, nil
+		}
+
+		// Touch the session so the sweeper observes recent activity.
+		// Best-effort: a transient error here only affects idle
+		// reclamation timing, not run correctness.
+		if err := touchWorkspaceSession(ctx, r.Client, agentRun.Namespace, wsName, agentRun); err != nil {
+			log.Error(err, "Failed to touch workspace session (non-fatal)", "workspaceSession", wsName)
+		}
 	}
 
 	// Build and create the Job. buildJob delegates to buildAgentPodTemplate, which
@@ -772,6 +1092,20 @@ func (r *AgentRunReconciler) reconcilePending(ctx context.Context, log logr.Logg
 		ar.Status.JobName = job.Name
 		ar.Status.StartedAt = &now
 
+		// Record the exact harness artifact that is about to execute, so run
+		// detail and audit can show which digest ran rather than which tag was
+		// requested.
+		if d := taskmodes.HarnessImageDigest(agentRun.Spec.Task); d != "" {
+			ar.Status.HarnessImageDigest = d
+			ar.Status.HarnessRuntimeRef = harnessRuntimeRef
+			ar.Status.HarnessContractVersion = taskmodes.HarnessContractVersion
+			if inheritedHarnessRuntime {
+				ar.Status.HarnessRuntimeSource = "agent-default"
+			} else {
+				ar.Status.HarnessRuntimeSource = "run"
+			}
+		}
+
 		// Set the trace ID so operators can look up the full distributed trace.
 		if sc := span.SpanContext(); sc.HasTraceID() {
 			ar.Status.TraceID = sc.TraceID().String()
@@ -795,6 +1129,9 @@ func (r *AgentRunReconciler) reconcileRunning(ctx context.Context, log logr.Logg
 	defer span.End()
 
 	log.Info("Checking running AgentRun")
+	if agentRun.Status.CellnParent != nil || agentRun.Spec.ExecutionLifecycle == "enduring" {
+		return r.reconcileCellnParent(ctx, agentRun)
+	}
 
 	// Agent Sandbox mode — check Sandbox CR status instead of Job.
 	if agentRun.Status.SandboxName != "" || agentRun.Status.SandboxClaimName != "" {
@@ -826,13 +1163,11 @@ func (r *AgentRunReconciler) reconcileRunning(ctx context.Context, log logr.Logg
 				reader = r.Client
 			}
 			if getErr := reader.Get(ctx, client.ObjectKeyFromObject(agentRun), fresh); getErr == nil {
-				switch fresh.Status.Phase {
-				case sympoziumv1alpha1.AgentRunPhaseSucceeded,
-					sympoziumv1alpha1.AgentRunPhaseFailed,
-					sympoziumv1alpha1.AgentRunPhaseSkipped:
+				switch phase := fresh.Status.Phase; {
+				case phase.IsTerminal():
 					// Already terminal — don't override.
 					return ctrl.Result{}, nil
-				case sympoziumv1alpha1.AgentRunPhasePostRunning:
+				case phase == sympoziumv1alpha1.AgentRunPhasePostRunning:
 					// PostRun container is still executing — let the
 					// PostRunning reconcile path handle it.
 					return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
@@ -1005,6 +1340,33 @@ func (r *AgentRunReconciler) checkAgentContainer(ctx context.Context, log logr.L
 // Instead of deleting immediately, it keeps up to RunHistoryLimit completed
 // runs per instance and prunes only the oldest ones beyond that threshold.
 func (r *AgentRunReconciler) reconcileCompleted(ctx context.Context, log logr.Logger, agentRun *sympoziumv1alpha1.AgentRun) (ctrl.Result, error) {
+	if controllerutil.ContainsFinalizer(agentRun, agentRunFinalizer) {
+		if err := r.stopCellnParent(ctx, agentRun); err != nil {
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+		}
+	}
+	if agentRun.Status.CellnScoped != nil && controllerutil.ContainsFinalizer(agentRun, agentRunFinalizer) {
+		done, err := r.cleanupScoped(ctx, agentRun)
+		if err != nil {
+			_ = r.scopedProgress(ctx, agentRun, metav1.ConditionUnknown, "CleanupUnconfirmed", scopedOutcomeUnconfirmed)
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+		}
+		if !done {
+			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+		}
+	}
+	if agentRun.Status.CellnActionID != "" && controllerutil.ContainsFinalizer(agentRun, agentRunFinalizer) {
+		done, err := r.cancelCelln(ctx, agentRun)
+		if err != nil {
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+		}
+		if !done {
+			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+		}
+	}
+	if r.ScopedOnly {
+		return r.finishScopedOnly(ctx, agentRun)
+	}
 	// Clean up cluster-scoped RBAC created for skill sidecars.
 	r.cleanupSkillRBAC(ctx, log, agentRun)
 
@@ -1092,10 +1454,7 @@ func (r *AgentRunReconciler) reconcileAwaitingDelegate(ctx context.Context, log 
 			}
 			// Sync delegate status from the actual child.
 			agentRun.Status.Delegates[i].Phase = childRun.Status.Phase
-			switch childRun.Status.Phase {
-			case sympoziumv1alpha1.AgentRunPhaseSucceeded, sympoziumv1alpha1.AgentRunPhaseFailed, sympoziumv1alpha1.AgentRunPhaseSkipped:
-				// Terminal.
-			default:
+			if !childRun.Status.Phase.IsTerminal() {
 				allTerminal = false
 			}
 			if childRun.Status.Phase == sympoziumv1alpha1.AgentRunPhaseFailed {
@@ -1144,6 +1503,12 @@ func (r *AgentRunReconciler) reconcileAwaitingDelegate(ctx context.Context, log 
 func (r *AgentRunReconciler) triggerSequentialSuccessors(ctx context.Context, log logr.Logger, agentRun *sympoziumv1alpha1.AgentRun) error {
 	// Look up the source instance to get the persona name and ensemble.
 	if agentRun.Spec.AgentRef == "" {
+		return nil
+	}
+	// Child runs spawned by spawn_subagents batches must not independently
+	// execute sequential edges. The parent run collates batch results first,
+	// then it is the only run that should trigger downstream sequential stages.
+	if agentRun.Labels["sympozium.ai/subagent-batch-id"] != "" {
 		return nil
 	}
 	var sourceInst sympoziumv1alpha1.Agent
@@ -1242,6 +1607,7 @@ func (r *AgentRunReconciler) triggerSequentialSuccessors(ctx context.Context, lo
 				SystemPrompt:     memorySystemPrompt(&targetInst),
 				Volumes:          targetInst.Spec.Volumes,
 				VolumeMounts:     targetInst.Spec.VolumeMounts,
+				Tolerations:      targetInst.Spec.Agents.Default.Tolerations,
 				Env:              targetInst.Spec.Agents.Default.Env,
 				Timeout:          sequentialRunTimeout(rel, &targetInst),
 				ToolPolicy:       toolpolicy.ForAgent(ctx, r.Client, &targetInst),
@@ -1780,7 +2146,35 @@ func (r *AgentRunReconciler) pruneOldRuns(ctx context.Context, log logr.Logger, 
 // reconcileDelete handles AgentRun deletion.
 func (r *AgentRunReconciler) reconcileDelete(ctx context.Context, log logr.Logger, agentRun *sympoziumv1alpha1.AgentRun) (ctrl.Result, error) {
 	log.Info("Reconciling AgentRun deletion")
+	if err := r.stopCellnParent(ctx, agentRun); err != nil {
+		log.Error(err, "Celln parent deletion cleanup pending")
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
+	if agentRun.Status.CellnScoped != nil {
+		done, err := r.cleanupScoped(ctx, agentRun)
+		if err != nil {
+			log.Error(err, "Scoped Celln deletion cleanup uncertain")
+			_ = r.scopedProgress(ctx, agentRun, metav1.ConditionUnknown, "CleanupUnconfirmed", scopedOutcomeUnconfirmed)
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+		}
+		if !done {
+			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+		}
+	}
+	if agentRun.Status.CellnActionID != "" {
+		done, err := r.cancelCelln(ctx, agentRun)
+		if err != nil {
+			log.Error(err, "Celln deletion cleanup pending")
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+		}
+		if !done {
+			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+		}
+	}
 
+	if r.ScopedOnly {
+		return r.finishScopedOnly(ctx, agentRun)
+	}
 	// Clean up cluster-scoped RBAC resources created for skill sidecars.
 	r.cleanupSkillRBAC(ctx, log, agentRun)
 
@@ -1847,8 +2241,8 @@ func (r *AgentRunReconciler) reconcileDelete(ctx context.Context, log logr.Logge
 func (r *AgentRunReconciler) reconcilePendingServer(ctx context.Context, log logr.Logger, agentRun *sympoziumv1alpha1.AgentRun, sidecars []resolvedSidecar) (ctrl.Result, error) {
 	log.Info("Reconciling pending server-mode AgentRun")
 
-	// Ensure ServiceAccount exists.
-	if err := r.ensureAgentServiceAccount(ctx, agentRun.Namespace); err != nil {
+	// Ensure this server-mode run has the same isolated identity as task runs.
+	if err := r.ensureAgentServiceAccount(ctx, agentRun); err != nil {
 		return ctrl.Result{}, fmt.Errorf("ensuring agent service account: %w", err)
 	}
 
@@ -1964,10 +2358,12 @@ func (r *AgentRunReconciler) reconcilePendingServer(ctx context.Context, log log
 					Labels: labels,
 				},
 				Spec: corev1.PodSpec{
-					RestartPolicy:      corev1.RestartPolicyAlways,
-					ServiceAccountName: "sympozium-agent",
-					ImagePullSecrets:   agentRun.Spec.ImagePullSecrets,
-					NodeSelector:       agentRun.Spec.Model.NodeSelector,
+					RestartPolicy:                corev1.RestartPolicyAlways,
+					ServiceAccountName:           agentRunServiceAccountName(agentRun),
+					AutomountServiceAccountToken: boolPtr(false),
+					ImagePullSecrets:             agentRun.Spec.ImagePullSecrets,
+					NodeSelector:                 agentRun.Spec.Model.NodeSelector,
+					Tolerations:                  agentRun.Spec.Tolerations,
 					Containers: []corev1.Container{
 						{
 							Name:            "web-proxy",
@@ -2015,6 +2411,10 @@ func (r *AgentRunReconciler) reconcilePendingServer(ctx context.Context, log log
 				},
 			},
 		},
+	}
+	if len(serverSidecar.sidecar.RBAC) > 0 || len(serverSidecar.sidecar.ClusterRBAC) > 0 {
+		deploy.Spec.Template.Spec.Volumes = append(deploy.Spec.Template.Spec.Volumes, runAPIAccessVolume())
+		mountRunAPIAccess(&deploy.Spec.Template.Spec.Containers[0])
 	}
 
 	if err := controllerutil.SetControllerReference(agentRun, deploy, r.Scheme); err != nil {
@@ -2293,6 +2693,9 @@ func (r *AgentRunReconciler) validatePolicy(ctx context.Context, agentRun *sympo
 	}
 
 	if instance.Spec.PolicyRef == "" {
+		if taskmodes.HarnessImage(agentRun.Spec.Task) != "" {
+			return fmt.Errorf("task.mode %q requires an Agent with a SympoziumPolicy whose spec.harnessPolicy.enabled is true", taskmodes.Harness)
+		}
 		return nil // No policy, allow
 	}
 
@@ -2302,6 +2705,30 @@ func (r *AgentRunReconciler) validatePolicy(ctx context.Context, agentRun *sympo
 		Name:      instance.Spec.PolicyRef,
 	}, policy); err != nil {
 		return fmt.Errorf("policy %q not found: %w", instance.Spec.PolicyRef, err)
+	}
+
+	if taskmodes.HarnessImage(agentRun.Spec.Task) != "" &&
+		(policy.Spec.HarnessPolicy == nil || !policy.Spec.HarnessPolicy.Enabled) {
+		return fmt.Errorf("task.mode %q is disabled by policy; set spec.harnessPolicy.enabled: true to opt in", taskmodes.Harness)
+	}
+	if taskmodes.HarnessImage(agentRun.Spec.Task) != "" && !policy.Spec.HarnessPolicy.AllowUnmetered {
+		return fmt.Errorf("task.mode %q may not run unmetered under this policy; set spec.harnessPolicy.allowUnmetered: true only for an adapter whose accounting risk you accept", taskmodes.Harness)
+	}
+
+	// Validate the harness image against the registry allowlist.
+	//
+	// The admission webhook checks this too, and with a better error. It is a
+	// separate, optional deployment though, and for harness mode the image is
+	// not an accessory to the run — it *is* the agent process. A cluster
+	// running without the webhook would otherwise have no bound at all on
+	// which external harness executes, which is exactly what
+	// imagePolicy.allowedRegistries exists to provide. Same
+	// belt-and-braces as the task-mode capability check.
+	if img := taskmodes.HarnessImage(agentRun.Spec.Task); img != "" {
+		if !policy.Spec.ImagePolicy.Allows(img) {
+			return fmt.Errorf("harness image %q is not from an allowed registry (allowed: %v)",
+				img, policy.Spec.ImagePolicy.AllowedRegistries)
+		}
 	}
 
 	// Validate sub-agent depth
@@ -2334,32 +2761,135 @@ func (r *AgentRunReconciler) validatePolicy(ctx context.Context, agentRun *sympo
 	return nil
 }
 
-// ensureAgentServiceAccount creates the sympozium-agent ServiceAccount in the
-// given namespace if it does not already exist. This is needed because agent
-// Jobs reference this SA and run in the user's namespace, not sympozium-system.
-func (r *AgentRunReconciler) ensureAgentServiceAccount(ctx context.Context, namespace string) error {
-	sa := &corev1.ServiceAccount{}
-	err := r.Get(ctx, client.ObjectKey{Name: "sympozium-agent", Namespace: namespace}, sa)
+// agentRunServiceAccountName returns the identity used only by this AgentRun.
+// AgentRun names already satisfy Kubernetes DNS-subdomain requirements.
+func agentRunServiceAccountName(agentRun *sympoziumv1alpha1.AgentRun) string {
+	const maxDNSSubdomainLength = 253
+	name := "sympozium-run-" + agentRun.Name
+	if len(name) <= maxDNSSubdomainLength {
+		return name
+	}
+	sum := sha256.Sum256([]byte(agentRun.Name))
+	suffix := fmt.Sprintf("-%x", sum[:8])
+	return strings.TrimRight(name[:maxDNSSubdomainLength-len(suffix)], "-") + suffix
+}
+
+func agentRunNATSBridgeSecretName(agentRun *sympoziumv1alpha1.AgentRun) string {
+	return runNATSBridgeSecretPrefix + agentRun.Name
+}
+
+func natsBridgeCredentialEnv(agentRun *sympoziumv1alpha1.AgentRun) []corev1.EnvVar {
+	secret := agentRunNATSBridgeSecretName(agentRun)
+	return []corev1.EnvVar{
+		{Name: "NATS_USERNAME", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+			LocalObjectReference: corev1.LocalObjectReference{Name: secret}, Key: "username",
+		}}},
+		{Name: "NATS_PASSWORD", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+			LocalObjectReference: corev1.LocalObjectReference{Name: secret}, Key: "password",
+		}}},
+	}
+}
+
+// ensureNATSBridgeCredentials copies the restricted bridge credential into a
+// run-owned Secret. The credential is mounted only by ipc-bridge, never by the
+// adapter/harness container. Empty controller environment keeps external,
+// unauthenticated NATS installations backward compatible.
+func (r *AgentRunReconciler) ensureNATSBridgeCredentials(ctx context.Context, agentRun *sympoziumv1alpha1.AgentRun) error {
+	username, password := os.Getenv("NATS_BRIDGE_USERNAME"), os.Getenv("NATS_BRIDGE_PASSWORD")
+	if username == "" || password == "" {
+		return nil
+	}
+	name := agentRunNATSBridgeSecretName(agentRun)
+	existing := &corev1.Secret{}
+	err := r.Get(ctx, client.ObjectKey{Name: name, Namespace: agentRun.Namespace}, existing)
 	if err == nil {
-		return nil // already exists
+		return nil
 	}
 	if !errors.IsNotFound(err) {
-		return fmt.Errorf("checking for agent service account: %w", err)
+		return fmt.Errorf("checking bridge credential secret: %w", err)
 	}
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: agentRun.Namespace, Labels: map[string]string{
+			"sympozium.ai/agent-run": agentRun.Name,
+		}},
+		Type: corev1.SecretTypeOpaque,
+		Data: map[string][]byte{"username": []byte(username), "password": []byte(password)},
+	}
+	if err := controllerutil.SetControllerReference(agentRun, secret, r.Scheme); err != nil {
+		return fmt.Errorf("setting bridge credential owner: %w", err)
+	}
+	if err := r.Create(ctx, secret); err != nil && !errors.IsAlreadyExists(err) {
+		return fmt.Errorf("creating bridge credential secret: %w", err)
+	}
+	return nil
+}
+
+// ensureAgentServiceAccount creates a unique ServiceAccount owned by the run.
+// If the legacy namespace-level account exists, its annotations are copied so
+// existing cloud workload-identity configuration continues to apply. The
+// shared account itself is never selected by an AgentRun pod or RoleBinding.
+func (r *AgentRunReconciler) ensureAgentServiceAccount(ctx context.Context, agentRun *sympoziumv1alpha1.AgentRun) error {
+	name := agentRunServiceAccountName(agentRun)
+	sa := &corev1.ServiceAccount{}
+	err := r.Get(ctx, client.ObjectKey{Name: name, Namespace: agentRun.Namespace}, sa)
+	if err == nil {
+		return nil
+	}
+	if !errors.IsNotFound(err) {
+		return fmt.Errorf("checking for run service account: %w", err)
+	}
+
+	annotations := map[string]string{}
+	template := &corev1.ServiceAccount{}
+	if err := r.Get(ctx, client.ObjectKey{Name: legacyAgentServiceAccountName, Namespace: agentRun.Namespace}, template); errors.IsNotFound(err) {
+		automount := false
+		template = &corev1.ServiceAccount{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      legacyAgentServiceAccountName,
+				Namespace: agentRun.Namespace,
+				Labels: map[string]string{
+					"sympozium.ai/component":       "identity-template",
+					"app.kubernetes.io/managed-by": "sympozium-controller",
+				},
+			},
+			AutomountServiceAccountToken: &automount,
+		}
+		if err := r.Create(ctx, template); err != nil && !errors.IsAlreadyExists(err) {
+			return fmt.Errorf("creating service account annotation template: %w", err)
+		}
+		if err := r.Get(ctx, client.ObjectKey{Name: legacyAgentServiceAccountName, Namespace: agentRun.Namespace}, template); err != nil {
+			return fmt.Errorf("reading service account annotation template: %w", err)
+		}
+	} else if err != nil {
+		return fmt.Errorf("checking service account annotation template: %w", err)
+	}
+	if template != nil {
+		for key, value := range template.Annotations {
+			annotations[key] = value
+		}
+	}
+
+	automount := false
 	sa = &corev1.ServiceAccount{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      "sympozium-agent",
-			Namespace: namespace,
+			Name:        name,
+			Namespace:   agentRun.Namespace,
+			Annotations: annotations,
 			Labels: map[string]string{
-				"app.kubernetes.io/managed-by": "sympozium",
+				"sympozium.ai/agent-run":       agentRun.Name,
+				"app.kubernetes.io/managed-by": "sympozium-controller",
 			},
 		},
+		AutomountServiceAccountToken: &automount,
+	}
+	if err := controllerutil.SetControllerReference(agentRun, sa, r.Scheme); err != nil {
+		return fmt.Errorf("setting run service account owner: %w", err)
 	}
 	if err := r.Create(ctx, sa); err != nil {
 		if errors.IsAlreadyExists(err) {
 			return nil
 		}
-		return fmt.Errorf("creating agent service account: %w", err)
+		return fmt.Errorf("creating run service account: %w", err)
 	}
 	return nil
 }
@@ -2433,13 +2963,15 @@ func (r *AgentRunReconciler) buildAgentPodTemplate(
 			Labels: agentPodLabels(agentRun),
 		},
 		Spec: corev1.PodSpec{
-			RestartPolicy:      corev1.RestartPolicyNever,
-			ServiceAccountName: "sympozium-agent",
-			ImagePullSecrets:   agentRun.Spec.ImagePullSecrets,
-			HostNetwork:        hostNetwork,
-			HostPID:            hostPID,
-			DNSPolicy:          dnsPolicy,
-			NodeSelector:       agentRun.Spec.Model.NodeSelector,
+			RestartPolicy:                corev1.RestartPolicyNever,
+			ServiceAccountName:           agentRunServiceAccountName(agentRun),
+			AutomountServiceAccountToken: boolPtr(false),
+			ImagePullSecrets:             agentRun.Spec.ImagePullSecrets,
+			HostNetwork:                  hostNetwork,
+			HostPID:                      hostPID,
+			DNSPolicy:                    dnsPolicy,
+			NodeSelector:                 agentRun.Spec.Model.NodeSelector,
+			Tolerations:                  agentRun.Spec.Tolerations,
 			SecurityContext: &corev1.PodSecurityContext{
 				RunAsNonRoot:   &runAsNonRoot,
 				RunAsUser:      &runAsUser,
@@ -2455,6 +2987,7 @@ func (r *AgentRunReconciler) buildAgentPodTemplate(
 	// Shared pod mutators (shared memory, relationship context, subagents, …),
 	// registered in agentrun_pod_mutators.go.
 	r.applyPodMutators(ctx, agentRun, &tmpl.Spec)
+	configureRunAPIAccess(agentRun, sidecars, &tmpl.Spec)
 
 	return tmpl, nil
 }
@@ -2524,6 +3057,15 @@ func (r *AgentRunReconciler) buildContainers(
 	readOnly := true
 	noPrivEsc := false
 	var initContainers []corev1.Container
+
+	// When the AgentRun is mounting a session-scoped workspace PVC,
+	// prepend an init container that writes /workspace/.sympozium/state.json
+	// describing the current run. Harness wrappers (codex, claude-code)
+	// and the agent-runner read this marker to detect whether the
+	// workspace is fresh or carried over from a previous run.
+	if agentRun.Annotations[WorkspaceSessionAnnotation] != "" {
+		initContainers = append(initContainers, r.buildWorkspaceMarkerInit(agentRun))
+	}
 
 	agentEnv := []corev1.EnvVar{
 		{Name: "AGENT_RUN_ID", Value: agentRun.Name},
@@ -2639,6 +3181,9 @@ func (r *AgentRunReconciler) buildContainers(
 					{Name: "AGENT_NAMESPACE", Value: agentRun.Namespace},
 					{Name: "EVENT_BUS_URL", Value: "nats://nats.sympozium-system.svc:4222"},
 				}
+				if os.Getenv("NATS_BRIDGE_USERNAME") != "" && os.Getenv("NATS_BRIDGE_PASSWORD") != "" {
+					env = append(env, natsBridgeCredentialEnv(agentRun)...)
+				}
 				// The bridge validates agent-written channel-message attribution
 				// against this identity (see sanitizeOutboundMessage). Stamped at
 				// run creation for channel-sourced runs; empty otherwise, in
@@ -2738,10 +3283,16 @@ func (r *AgentRunReconciler) buildContainers(
 		memoryURL := fmt.Sprintf("http://%s-memory.%s.svc:8080", agentRun.Spec.AgentRef, agentRun.Namespace)
 		containers[0].Env = append(containers[0].Env,
 			corev1.EnvVar{Name: "MEMORY_SERVER_URL", Value: memoryURL},
-			// The writer token goes into the agent container only, never into
-			// skill sidecars, where execute_command runs model-chosen commands.
-			memoryWriterTokenEnv(memoryWriterTokenEnvName, agentRun.Spec.AgentRef+"-memory"),
 		)
+		// The writer token goes into the agent container only, never into
+		// skill sidecars, where execute_command runs model-chosen commands —
+		// and only when that container runs agent-runner. A task mode that
+		// replaces it (mode: harness) runs an operator-supplied binary that
+		// may run model-chosen commands itself.
+		if !taskModeReplacesAgentContainer(agentRun.Spec.Task) {
+			containers[0].Env = append(containers[0].Env,
+				memoryWriterTokenEnv(memoryWriterTokenEnvName, agentRun.Spec.AgentRef+"-memory"))
+		}
 
 		// Init container to wait for memory server readiness before agent starts.
 		// The controller already checks for ready replicas before creating the pod,
@@ -2845,6 +3396,15 @@ func (r *AgentRunReconciler) buildContainers(
 		})
 	}
 
+	// Reserved-name check before anything is built from these: a server called
+	// sympozium-* would shadow one Sympozium injects itself.
+	if err := validateMCPServerNames(mcpServers); err != nil {
+		return nil, nil, err
+	}
+	if taskModeReplacesAgentContainer(agentRun.Spec.Task) && len(mcpServers) > 0 {
+		return nil, nil, fmt.Errorf("task.mode %q cannot use Agent.spec.mcpServers: remote MCP credentials are never exposed to external adapters; use mediated SkillPack tools or remove the remote MCP servers", agentRun.Spec.Task.GetMode())
+	}
+
 	// Add MCP bridge sidecar if MCP servers are configured.
 	if len(mcpServers) > 0 {
 		mcpEnv := []corev1.EnvVar{
@@ -2859,7 +3419,9 @@ func (r *AgentRunReconciler) buildContainers(
 		if observability != nil && observability.Enabled {
 			mcpEnv = append(mcpEnv, buildObservabilityEnv(agentRun, observability)...)
 		}
-		// Inject auth secrets as env vars for each MCP server.
+		// Inject auth secrets only into the trusted mcp-bridge sidecar. External
+		// adapter containers are rejected above when remote MCP is configured.
+		var mcpAuthEnv []corev1.EnvVar
 		for _, srv := range mcpServers {
 			if srv.AuthSecret == "" {
 				continue
@@ -2869,7 +3431,7 @@ func (r *AgentRunReconciler) buildContainers(
 			if key == "" {
 				key = "token"
 			}
-			mcpEnv = append(mcpEnv, corev1.EnvVar{
+			mcpAuthEnv = append(mcpAuthEnv, corev1.EnvVar{
 				Name: envName,
 				ValueFrom: &corev1.EnvVarSource{
 					SecretKeyRef: &corev1.SecretKeySelector{
@@ -2880,6 +3442,7 @@ func (r *AgentRunReconciler) buildContainers(
 				},
 			})
 		}
+		mcpEnv = append(mcpEnv, mcpAuthEnv...)
 
 		// Init container for MCP tool discovery (runs before agent starts)
 		initContainers = append(initContainers, corev1.Container{
@@ -2939,6 +3502,22 @@ func (r *AgentRunReconciler) buildContainers(
 		})
 	}
 
+	// The skill tool server: a replaced agent container cannot write exec
+	// requests (its /ipc mount is narrowed to input and output), so this is how
+	// its SkillPack tools come back — Sympozium-owned code that holds
+	// spec.toolPolicy and is the only thing in the pod turning a harness
+	// request into an exec request. See internal/controller/agentrun_skilltools.go.
+	if RunNeedsSkillToolServer(agentRun, sidecars) {
+		// A native sidecar, so it lives in initContainers — see
+		// buildSkillToolsContainer for why the ordering matters.
+		initContainers = append(initContainers, r.buildSkillToolsContainer(agentRun))
+		// A run with no operator-configured MCP servers still needs the
+		// registry, because the skill tool server is in it.
+		if len(mcpServers) == 0 {
+			mountHarnessMCPRegistry(&containers[0])
+		}
+	}
+
 	// Always enable tools — the IPC bridge is always present so
 	// send_channel_message, read_file, and list_directory work without
 	// sidecars.  execute_command gracefully times out if no skill sidecar
@@ -2963,7 +3542,12 @@ func (r *AgentRunReconciler) buildContainers(
 	// Expose the list of attached skill-sidecar targets to the agent runner
 	// so it can advise the LLM (and validate) on the optional `target` arg
 	// of the execute_command tool. Comma-separated, in spec order.
-	if len(sidecars) > 0 {
+	//
+	// Not for a replaced agent container: it advises agent-runner's
+	// execute_command, which a harness does not have. A harness reaches skill
+	// tools through the skill tool server, which routes each call to the target
+	// recorded in the manifest entry — it never picks one.
+	if len(sidecars) > 0 && !taskModeReplacesAgentContainer(agentRun.Spec.Task) {
 		names := make([]string, 0, len(sidecars))
 		for _, sc := range sidecars {
 			names = append(names, sc.skillPackName)
@@ -2977,7 +3561,14 @@ func (r *AgentRunReconciler) buildContainers(
 	// point the agent runner at it. The manifest is derived from the SkillPack
 	// CRD, so the agent consumes tool definitions it cannot modify. Dispatch
 	// still flows through the gated exec IPC targeting the owning sidecar.
-	if sidecarsHaveTools(sidecars) {
+	//
+	// A replaced agent container is deliberately excluded. It has no dispatch
+	// path for these tools — it cannot write exec requests — so the manifest
+	// would only disclose the full tool list, policy-denied names included, and
+	// invite an adapter to consume a manifest it must not act on. The skill
+	// tool server reads it instead, and applies spec.toolPolicy before anything
+	// reaches the harness.
+	if sidecarsHaveTools(sidecars) && !taskModeReplacesAgentContainer(agentRun.Spec.Task) {
 		containers[0].VolumeMounts = append(containers[0].VolumeMounts, corev1.VolumeMount{
 			Name:      "sidecar-tools",
 			MountPath: "/config/sidecar-tools",
@@ -3243,6 +3834,13 @@ func (r *AgentRunReconciler) buildContainers(
 			}
 			initContainers = append(initContainers, hookContainer)
 		}
+	}
+
+	// Let an object-form task mode replace the agent container outright
+	// (mode: harness runs an external harness image as the pod's primary
+	// process). Last, so the override wins over every central assignment.
+	if err := r.applyAgentContainerOverride(agentRun.Spec.Task, &containers[0]); err != nil {
+		return nil, nil, err
 	}
 
 	return containers, initContainers, nil
@@ -3580,10 +4178,26 @@ func (r *AgentRunReconciler) buildVolumes(agentRun *sympoziumv1alpha1.AgentRun, 
 	tmpSizeLimit := resource.MustParse("256Mi")
 	memoryMedium := corev1.StorageMediumMemory
 
-	// Use a PVC for /workspace when postRun lifecycle hooks are defined,
-	// so the workspace can be shared between the main Job and the postRun Job.
+	// /workspace selection precedence:
+	//   1. Per-session PVC (annotation set by reconcilePending when the
+	//      parent Agent opts into Workspace.PerSessionPVC). Persists
+	//      across AgentRuns of the same session.
+	//   2. Per-run postRun PVC (legacy: created when lifecycle.postRun
+	//      hooks are defined). Persists across the main + postRun Jobs
+	//      of a single AgentRun.
+	//   3. Ephemeral emptyDir (default).
 	var workspaceVolume corev1.Volume
-	if agentRun.Spec.Lifecycle != nil && len(agentRun.Spec.Lifecycle.PostRun) > 0 {
+	switch {
+	case agentRun.Annotations[WorkspacePVCAnnotation] != "":
+		workspaceVolume = corev1.Volume{
+			Name: "workspace",
+			VolumeSource: corev1.VolumeSource{
+				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+					ClaimName: agentRun.Annotations[WorkspacePVCAnnotation],
+				},
+			},
+		}
+	case agentRun.Spec.Lifecycle != nil && len(agentRun.Spec.Lifecycle.PostRun) > 0:
 		workspaceVolume = corev1.Volume{
 			Name: "workspace",
 			VolumeSource: corev1.VolumeSource{
@@ -3592,7 +4206,7 @@ func (r *AgentRunReconciler) buildVolumes(agentRun *sympoziumv1alpha1.AgentRun, 
 				},
 			},
 		}
-	} else {
+	default:
 		workspaceVolume = corev1.Volume{
 			Name: "workspace",
 			VolumeSource: corev1.VolumeSource{
@@ -3623,7 +4237,6 @@ func (r *AgentRunReconciler) buildVolumes(agentRun *sympoziumv1alpha1.AgentRun, 
 			},
 		},
 	}
-
 	// Build skills projected volume from skill references
 	var sources []corev1.VolumeProjection
 	for _, skill := range agentRun.Spec.Skills {
@@ -3668,6 +4281,12 @@ func (r *AgentRunReconciler) buildVolumes(agentRun *sympoziumv1alpha1.AgentRun, 
 		})
 	}
 
+	// Add any volume an object-form task mode's agent container override
+	// needs — e.g. harness mode's writable HOME emptyDir, which is how a
+	// harness that assumes it can write to $HOME is accommodated without
+	// relaxing readOnlyRootFilesystem.
+	volumes = append(volumes, taskModeAgentVolumes(agentRun.Spec.Task)...)
+
 	// Add memory ConfigMap volume if legacy memory is enabled.
 	if memoryEnabled {
 		cmName := fmt.Sprintf("%s-memory", agentRun.Spec.AgentRef)
@@ -3686,8 +4305,10 @@ func (r *AgentRunReconciler) buildVolumes(agentRun *sympoziumv1alpha1.AgentRun, 
 
 	// Note: memory PVC is mounted on the standalone memory Deployment, not agent pods.
 
-	// Add MCP config volume if MCP servers are configured.
-	if len(mcpServers) > 0 {
+	// Add MCP config volume if MCP servers are configured, or if the run needs
+	// the skill tool server — that server appears in the same registry, so the
+	// ConfigMap exists even with no operator-configured MCP servers.
+	if len(mcpServers) > 0 || RunNeedsSkillToolServer(agentRun, sidecars) {
 		cmName := fmt.Sprintf("%s-mcp-servers", agentRun.Name)
 		volumes = append(volumes, corev1.Volume{
 			Name: "mcp-config",
@@ -3829,13 +4450,15 @@ func (r *AgentRunReconciler) buildVolumes(agentRun *sympoziumv1alpha1.AgentRun, 
 // on every agent pod. User-supplied volumes/mounts with these names are
 // silently skipped to prevent accidental clobbering of core functionality.
 var reservedVolumeNames = map[string]struct{}{
-	"workspace":     {},
-	"ipc":           {},
-	"skills":        {},
-	"tmp":           {},
-	"memory":        {},
-	"mcp-config":    {},
-	"sidecar-tools": {},
+	"workspace":            {},
+	"ipc":                  {},
+	"skills":               {},
+	"tmp":                  {},
+	"memory":               {},
+	"mcp-config":           {},
+	"sidecar-tools":        {},
+	"harness-home":         {},
+	runAPIAccessVolumeName: {},
 }
 
 func isReservedVolumeName(name string) bool {
@@ -3892,8 +4515,96 @@ func hostAccessVolumeName(skillPackName string, index int) string {
 	return name
 }
 
+// runAPIAccessVolume reproduces the bounded Kubernetes API credential volume
+// normally injected by the service-account admission plugin, but keeps it
+// under controller control so it can be mounted only into declared trusted
+// sidecars. The token is pod-bound and uses Kubernetes' minimum commonly
+// supported lifetime (10 minutes).
+func runAPIAccessVolume() corev1.Volume {
+	expirationSeconds := int64(600)
+	optional := false
+	return corev1.Volume{
+		Name: runAPIAccessVolumeName,
+		VolumeSource: corev1.VolumeSource{
+			Projected: &corev1.ProjectedVolumeSource{
+				DefaultMode: int32Ptr(0o444),
+				Sources: []corev1.VolumeProjection{
+					{
+						ServiceAccountToken: &corev1.ServiceAccountTokenProjection{
+							Path:              "token",
+							ExpirationSeconds: &expirationSeconds,
+						},
+					},
+					{
+						ConfigMap: &corev1.ConfigMapProjection{
+							LocalObjectReference: corev1.LocalObjectReference{Name: "kube-root-ca.crt"},
+							Items:                []corev1.KeyToPath{{Key: "ca.crt", Path: "ca.crt"}},
+							Optional:             &optional,
+						},
+					},
+					{
+						DownwardAPI: &corev1.DownwardAPIProjection{
+							Items: []corev1.DownwardAPIVolumeFile{{
+								Path:     "namespace",
+								FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.namespace"},
+							}},
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
+func mountRunAPIAccess(container *corev1.Container) {
+	container.VolumeMounts = append(container.VolumeMounts, corev1.VolumeMount{
+		Name:      runAPIAccessVolumeName,
+		MountPath: runAPIAccessMountPath,
+		ReadOnly:  true,
+	})
+}
+
+// configureRunAPIAccess leaves automatic token mounting disabled for every
+// container, then explicitly projects a short-lived token only into SkillPack
+// sidecars and lifecycle hooks that declared Kubernetes RBAC. In particular,
+// the primary agent/harness and ipc-bridge never receive Kubernetes credentials.
+func configureRunAPIAccess(agentRun *sympoziumv1alpha1.AgentRun, sidecars []resolvedSidecar, podSpec *corev1.PodSpec) {
+	trustedContainers := map[string]struct{}{}
+	if agentRun.Spec.CanaryMode {
+		trustedContainers["agent"] = struct{}{}
+	}
+	for _, sidecar := range sidecars {
+		if len(sidecar.sidecar.RBAC) > 0 || len(sidecar.sidecar.ClusterRBAC) > 0 {
+			trustedContainers["skill-"+sidecar.skillPackName] = struct{}{}
+		}
+	}
+	trustedInitContainers := map[string]struct{}{}
+	if agentRun.Spec.Lifecycle != nil && len(agentRun.Spec.Lifecycle.RBAC) > 0 {
+		for _, hook := range agentRun.Spec.Lifecycle.PreRun {
+			trustedInitContainers["pre-"+hook.Name] = struct{}{}
+		}
+	}
+
+	if len(trustedContainers) == 0 && len(trustedInitContainers) == 0 {
+		return
+	}
+	podSpec.Volumes = append(podSpec.Volumes, runAPIAccessVolume())
+	for i := range podSpec.Containers {
+		if _, ok := trustedContainers[podSpec.Containers[i].Name]; ok {
+			mountRunAPIAccess(&podSpec.Containers[i])
+		}
+	}
+	for i := range podSpec.InitContainers {
+		if _, ok := trustedInitContainers[podSpec.InitContainers[i].Name]; ok {
+			mountRunAPIAccess(&podSpec.InitContainers[i])
+		}
+	}
+}
+
 // boolPtr returns a pointer to a bool.
 func boolPtr(b bool) *bool { return &b }
+
+func int32Ptr(i int32) *int32 { return &i }
 
 // agentRunHasMemorySkill returns true if the AgentRun references the "memory" SkillPack.
 func agentRunHasMemorySkill(agentRun *sympoziumv1alpha1.AgentRun) bool {
@@ -4560,7 +5271,7 @@ func (r *AgentRunReconciler) ensureSkillRBAC(ctx context.Context, log logr.Logge
 			if err := controllerutil.SetControllerReference(agentRun, role, r.Scheme); err != nil {
 				log.Error(err, "Failed to set owner on Role")
 			}
-			if err := r.Create(ctx, role); err != nil && !errors.IsAlreadyExists(err) {
+			if err := r.reconcileRole(ctx, role); err != nil {
 				return fmt.Errorf("creating skill Role %s: %w", roleName, err)
 			}
 
@@ -4582,7 +5293,7 @@ func (r *AgentRunReconciler) ensureSkillRBAC(ctx context.Context, log logr.Logge
 				Subjects: []rbacv1.Subject{
 					{
 						Kind:      "ServiceAccount",
-						Name:      "sympozium-agent",
+						Name:      agentRunServiceAccountName(agentRun),
 						Namespace: agentRun.Namespace,
 					},
 				},
@@ -4590,7 +5301,7 @@ func (r *AgentRunReconciler) ensureSkillRBAC(ctx context.Context, log logr.Logge
 			if err := controllerutil.SetControllerReference(agentRun, rb, r.Scheme); err != nil {
 				log.Error(err, "Failed to set owner on RoleBinding")
 			}
-			if err := r.Create(ctx, rb); err != nil && !errors.IsAlreadyExists(err) {
+			if err := r.reconcileRoleBinding(ctx, rb); err != nil {
 				return fmt.Errorf("creating skill RoleBinding %s: %w", roleName, err)
 			}
 			log.Info("Created skill RBAC (namespaced)", "role", roleName, "skill", sc.skillPackName)
@@ -4619,7 +5330,7 @@ func (r *AgentRunReconciler) ensureSkillRBAC(ctx context.Context, log logr.Logge
 				},
 				Rules: rules,
 			}
-			if err := r.Create(ctx, cr); err != nil && !errors.IsAlreadyExists(err) {
+			if err := r.reconcileClusterRole(ctx, cr); err != nil {
 				return fmt.Errorf("creating skill ClusterRole %s: %w", crName, err)
 			}
 
@@ -4640,12 +5351,12 @@ func (r *AgentRunReconciler) ensureSkillRBAC(ctx context.Context, log logr.Logge
 				Subjects: []rbacv1.Subject{
 					{
 						Kind:      "ServiceAccount",
-						Name:      "sympozium-agent",
+						Name:      agentRunServiceAccountName(agentRun),
 						Namespace: agentRun.Namespace,
 					},
 				},
 			}
-			if err := r.Create(ctx, crb); err != nil && !errors.IsAlreadyExists(err) {
+			if err := r.reconcileClusterRoleBinding(ctx, crb); err != nil {
 				return fmt.Errorf("creating skill ClusterRoleBinding %s: %w", crName, err)
 			}
 			log.Info("Created skill RBAC (cluster)", "clusterRole", crName, "skill", sc.skillPackName)
@@ -4654,10 +5365,72 @@ func (r *AgentRunReconciler) ensureSkillRBAC(ctx context.Context, log logr.Logge
 	return nil
 }
 
+// validateHarnessIsolation rejects pod-level privilege combinations that an
+// external primary container would inherit or could reach through shared
+// volumes. These combinations remain unavailable until they have a mediated
+// boundary of their own.
+func validateHarnessIsolation(agentRun *sympoziumv1alpha1.AgentRun, sidecars []resolvedSidecar) error {
+	if taskmodes.HarnessImage(agentRun.Spec.Task) == "" {
+		return nil
+	}
+	if agentRun.Spec.Lifecycle != nil && len(agentRun.Spec.Lifecycle.RBAC) > 0 {
+		return fmt.Errorf("task.mode %q cannot be combined with lifecycle RBAC because hooks share run storage with the external runtime", taskmodes.Harness)
+	}
+	for _, sidecar := range sidecars {
+		if sidecar.sidecar.HostAccess != nil && sidecar.sidecar.HostAccess.Enabled {
+			return fmt.Errorf("task.mode %q cannot be combined with SkillPack %q host access, host networking, host PID, or privileged execution", taskmodes.Harness, sidecar.skillPackName)
+		}
+	}
+	return nil
+}
+
+// ensureCanaryRBAC grants the trusted built-in canary runner its fixed health
+// check permissions through the same per-run identity boundary as SkillPacks.
+// Harness mode rejects canaryMode, so this token can never land in an external
+// runtime container.
+func (r *AgentRunReconciler) ensureCanaryRBAC(ctx context.Context, agentRun *sympoziumv1alpha1.AgentRun) error {
+	if !agentRun.Spec.CanaryMode {
+		return nil
+	}
+
+	name := "sympozium-canary-" + agentRun.Name
+	labels := map[string]string{
+		"sympozium.ai/agent-run":  agentRun.Name,
+		"sympozium.ai/component":  "canary",
+		"sympozium.ai/managed-by": "sympozium",
+	}
+	role := &rbacv1.ClusterRole{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Labels: labels},
+		Rules: []rbacv1.PolicyRule{
+			{APIGroups: []string{""}, Resources: []string{"nodes"}, Verbs: []string{"get", "list"}},
+			{APIGroups: []string{"sympozium.ai"}, Resources: []string{"sympoziumschedules", "mcpservers"}, Verbs: []string{"get", "list"}},
+		},
+	}
+	if err := r.reconcileClusterRole(ctx, role); err != nil {
+		return fmt.Errorf("creating canary ClusterRole %s: %w", name, err)
+	}
+	binding := &rbacv1.ClusterRoleBinding{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Labels: labels},
+		RoleRef: rbacv1.RoleRef{
+			APIGroup: "rbac.authorization.k8s.io",
+			Kind:     "ClusterRole",
+			Name:     name,
+		},
+		Subjects: []rbacv1.Subject{{
+			Kind:      "ServiceAccount",
+			Name:      agentRunServiceAccountName(agentRun),
+			Namespace: agentRun.Namespace,
+		}},
+	}
+	if err := r.reconcileClusterRoleBinding(ctx, binding); err != nil {
+		return fmt.Errorf("creating canary ClusterRoleBinding %s: %w", name, err)
+	}
+	return nil
+}
+
 // ensureLifecycleRBAC creates namespace-scoped Role and RoleBinding for lifecycle
-// hook containers. This grants the "sympozium-agent" ServiceAccount the permissions
-// specified in lifecycle.rbac, so hook containers can interact with Kubernetes
-// resources (e.g., create/delete ConfigMaps).
+// hook containers. This grants only the current AgentRun's ServiceAccount the
+// requested permissions, preventing permission union across concurrent runs.
 func (r *AgentRunReconciler) ensureLifecycleRBAC(ctx context.Context, log logr.Logger, agentRun *sympoziumv1alpha1.AgentRun) error {
 	if agentRun.Spec.Lifecycle == nil || len(agentRun.Spec.Lifecycle.RBAC) == 0 {
 		return nil
@@ -4688,7 +5461,7 @@ func (r *AgentRunReconciler) ensureLifecycleRBAC(ctx context.Context, log logr.L
 	if err := controllerutil.SetControllerReference(agentRun, role, r.Scheme); err != nil {
 		log.Error(err, "Failed to set owner on lifecycle Role")
 	}
-	if err := r.Create(ctx, role); err != nil && !errors.IsAlreadyExists(err) {
+	if err := r.reconcileRole(ctx, role); err != nil {
 		return fmt.Errorf("creating lifecycle Role %s: %w", roleName, err)
 	}
 
@@ -4710,7 +5483,7 @@ func (r *AgentRunReconciler) ensureLifecycleRBAC(ctx context.Context, log logr.L
 		Subjects: []rbacv1.Subject{
 			{
 				Kind:      "ServiceAccount",
-				Name:      "sympozium-agent",
+				Name:      agentRunServiceAccountName(agentRun),
 				Namespace: agentRun.Namespace,
 			},
 		},
@@ -4718,7 +5491,7 @@ func (r *AgentRunReconciler) ensureLifecycleRBAC(ctx context.Context, log logr.L
 	if err := controllerutil.SetControllerReference(agentRun, rb, r.Scheme); err != nil {
 		log.Error(err, "Failed to set owner on lifecycle RoleBinding")
 	}
-	if err := r.Create(ctx, rb); err != nil && !errors.IsAlreadyExists(err) {
+	if err := r.reconcileRoleBinding(ctx, rb); err != nil {
 		return fmt.Errorf("creating lifecycle RoleBinding %s: %w", roleName, err)
 	}
 
@@ -4726,10 +5499,84 @@ func (r *AgentRunReconciler) ensureLifecycleRBAC(ctx context.Context, log logr.L
 	return nil
 }
 
+// The RBAC objects are deterministic and may already exist when a controller
+// restarts midway through a run. Reconcile mutable fields rather than treating
+// AlreadyExists as success: otherwise a RoleBinding created by an older
+// controller can keep pointing at the shared legacy ServiceAccount.
+func (r *AgentRunReconciler) reconcileRole(ctx context.Context, desired *rbacv1.Role) error {
+	existing := &rbacv1.Role{}
+	key := client.ObjectKeyFromObject(desired)
+	if err := r.Get(ctx, key, existing); errors.IsNotFound(err) {
+		return r.Create(ctx, desired)
+	} else if err != nil {
+		return err
+	}
+	existing.Labels = desired.Labels
+	existing.OwnerReferences = desired.OwnerReferences
+	existing.Rules = desired.Rules
+	return r.Update(ctx, existing)
+}
+
+func (r *AgentRunReconciler) reconcileRoleBinding(ctx context.Context, desired *rbacv1.RoleBinding) error {
+	existing := &rbacv1.RoleBinding{}
+	key := client.ObjectKeyFromObject(desired)
+	if err := r.Get(ctx, key, existing); errors.IsNotFound(err) {
+		return r.Create(ctx, desired)
+	} else if err != nil {
+		return err
+	}
+	if existing.RoleRef != desired.RoleRef {
+		return fmt.Errorf("RoleBinding %s/%s has immutable roleRef %#v, want %#v", existing.Namespace, existing.Name, existing.RoleRef, desired.RoleRef)
+	}
+	existing.Labels = desired.Labels
+	existing.OwnerReferences = desired.OwnerReferences
+	existing.Subjects = desired.Subjects
+	return r.Update(ctx, existing)
+}
+
+func (r *AgentRunReconciler) reconcileClusterRole(ctx context.Context, desired *rbacv1.ClusterRole) error {
+	existing := &rbacv1.ClusterRole{}
+	key := client.ObjectKeyFromObject(desired)
+	if err := r.Get(ctx, key, existing); errors.IsNotFound(err) {
+		return r.Create(ctx, desired)
+	} else if err != nil {
+		return err
+	}
+	existing.Labels = desired.Labels
+	existing.Rules = desired.Rules
+	return r.Update(ctx, existing)
+}
+
+func (r *AgentRunReconciler) reconcileClusterRoleBinding(ctx context.Context, desired *rbacv1.ClusterRoleBinding) error {
+	existing := &rbacv1.ClusterRoleBinding{}
+	key := client.ObjectKeyFromObject(desired)
+	if err := r.Get(ctx, key, existing); errors.IsNotFound(err) {
+		return r.Create(ctx, desired)
+	} else if err != nil {
+		return err
+	}
+	if existing.RoleRef != desired.RoleRef {
+		return fmt.Errorf("ClusterRoleBinding %s has immutable roleRef %#v, want %#v", existing.Name, existing.RoleRef, desired.RoleRef)
+	}
+	existing.Labels = desired.Labels
+	existing.Subjects = desired.Subjects
+	return r.Update(ctx, existing)
+}
+
 // cleanupSkillRBAC removes cluster-scoped RBAC resources created for an AgentRun.
 // Namespace-scoped resources (Role, RoleBinding) are cleaned up automatically
 // via owner references and garbage collection.
 func (r *AgentRunReconciler) cleanupSkillRBAC(ctx context.Context, log logr.Logger, agentRun *sympoziumv1alpha1.AgentRun) {
+	// Only the immutable Celln-only boundary recorded on the original spec
+	// generation proves that no earlier Job-side authority could exist.
+	// An action/request alone is insufficient for legacy backend-mutated runs.
+	// Avoid starting a cluster-wide informer just to clean up nonexistent Job
+	// authority: a scoped Celln controller intentionally lacks that permission.
+	// Preserve legacy/mixed workload cleanup whenever any pod-plane state exists.
+	status := agentRun.Status
+	if status.CellnOnly && status.JobName == "" && status.PodName == "" && status.SandboxName == "" && status.SandboxClaimName == "" && status.DeploymentName == "" && status.ServiceName == "" && status.PostRunJobName == "" {
+		return
+	}
 	// List ClusterRoles owned by this run
 	crList := &rbacv1.ClusterRoleList{}
 	if err := r.List(ctx, crList, client.MatchingLabels{
@@ -4759,7 +5606,7 @@ func (r *AgentRunReconciler) cleanupSkillRBAC(ctx context.Context, log logr.Logg
 
 // ensureMCPConfigMap creates or updates the ConfigMap with MCP server
 // configuration for the mcp-bridge sidecar.
-func (r *AgentRunReconciler) ensureMCPConfigMap(ctx context.Context, agentRun *sympoziumv1alpha1.AgentRun, mcpServers []sympoziumv1alpha1.MCPServerRef) error {
+func (r *AgentRunReconciler) ensureMCPConfigMap(ctx context.Context, agentRun *sympoziumv1alpha1.AgentRun, mcpServers []sympoziumv1alpha1.MCPServerRef, includeSkillTools bool) error {
 	// Scope ConfigMap to the AgentRun so each run gets its own config
 	// and cleanup is handled by garbage collection.
 	cmName := fmt.Sprintf("%s-mcp-servers", agentRun.Name)
@@ -4767,6 +5614,14 @@ func (r *AgentRunReconciler) ensureMCPConfigMap(ctx context.Context, agentRun *s
 	yamlContent, err := buildMCPServersYAML(mcpServers)
 	if err != nil {
 		return fmt.Errorf("building MCP servers YAML: %w", err)
+	}
+
+	// The same registry in JSON, for a harness-mode agent container: see
+	// buildMCPServersJSON. Both keys always exist, so the ConfigMap does not
+	// depend on which task mode the run happens to use.
+	jsonContent, err := buildMCPServersJSON(mcpServers, includeSkillTools)
+	if err != nil {
+		return fmt.Errorf("building MCP servers JSON: %w", err)
 	}
 
 	cm := &corev1.ConfigMap{
@@ -4781,6 +5636,7 @@ func (r *AgentRunReconciler) ensureMCPConfigMap(ctx context.Context, agentRun *s
 		},
 		Data: map[string]string{
 			"mcp-servers.yaml": yamlContent,
+			"mcp-servers.json": jsonContent,
 		},
 	}
 
@@ -4798,29 +5654,62 @@ func (r *AgentRunReconciler) ensureMCPConfigMap(ctx context.Context, agentRun *s
 }
 
 // mcpServerYAML is the YAML-safe representation of an MCP server config.
+// The json tags matter as much as the yaml ones: the same registry is
+// rendered both ways into the ConfigMap — YAML for the mcp-bridge sidecar,
+// JSON for an agent container a task mode replaced, whose shell adapter has
+// jq and no YAML parser. Keep the two tag sets in step or the harness sees
+// different field names than the bridge.
 type mcpServerYAML struct {
-	Name        string            `yaml:"name"`
-	URL         string            `yaml:"url"`
-	ToolsPrefix string            `yaml:"toolsPrefix"`
-	Timeout     int               `yaml:"timeout"`
-	Auth        *mcpAuthYAML      `yaml:"auth,omitempty"`
-	Headers     map[string]string `yaml:"headers,omitempty"`
-	ToolsAllow  []string          `yaml:"toolsAllow,omitempty"`
-	ToolsDeny   []string          `yaml:"toolsDeny,omitempty"`
+	Name        string            `yaml:"name" json:"name"`
+	URL         string            `yaml:"url" json:"url"`
+	ToolsPrefix string            `yaml:"toolsPrefix" json:"toolsPrefix"`
+	Timeout     int               `yaml:"timeout" json:"timeout"`
+	Auth        *mcpAuthYAML      `yaml:"auth,omitempty" json:"auth,omitempty"`
+	Headers     map[string]string `yaml:"headers,omitempty" json:"headers,omitempty"`
+	ToolsAllow  []string          `yaml:"toolsAllow,omitempty" json:"toolsAllow,omitempty"`
+	ToolsDeny   []string          `yaml:"toolsDeny,omitempty" json:"toolsDeny,omitempty"`
 }
 
 type mcpAuthYAML struct {
-	Type      string `yaml:"type"`
-	SecretKey string `yaml:"secretKey"`
+	Type      string `yaml:"type" json:"type"`
+	SecretKey string `yaml:"secretKey" json:"secretKey"`
 }
 
 type mcpServersConfigYAML struct {
-	Servers []mcpServerYAML `yaml:"servers"`
+	Servers []mcpServerYAML `yaml:"servers" json:"servers"`
 }
 
 // buildMCPServersYAML generates the YAML config for the mcp-bridge sidecar
 // using a proper YAML serializer to avoid injection attacks.
 func buildMCPServersYAML(mcpServers []sympoziumv1alpha1.MCPServerRef) (string, error) {
+	data, err := yaml.Marshal(buildMCPServersConfig(mcpServers))
+	if err != nil {
+		return "", fmt.Errorf("marshalling MCP servers config: %w", err)
+	}
+	return string(data), nil
+}
+
+// buildMCPServersJSON renders the same registry as JSON, for an agent
+// container a task mode replaced. Its adapter is a shell script with jq, so
+// JSON is the form it can read without a YAML parser in the image.
+func buildMCPServersJSON(mcpServers []sympoziumv1alpha1.MCPServerRef, includeSkillTools bool) (string, error) {
+	cfg := buildMCPServersConfig(mcpServers)
+	if includeSkillTools {
+		// The skill tool server, so a harness finds its SkillPack tools in the
+		// registry it already reads. JSON only — the mcp-bridge sidecar reads
+		// the YAML rendering and must not connect to a peer in its own pod.
+		cfg.Servers = append(cfg.Servers, skillToolsRegistryEntry())
+	}
+	data, err := json.Marshal(cfg)
+	if err != nil {
+		return "", fmt.Errorf("marshalling MCP servers config as JSON: %w", err)
+	}
+	return string(data), nil
+}
+
+// buildMCPServersConfig is the one place the registry is derived from the
+// resolved server refs, so the YAML and JSON renderings cannot drift.
+func buildMCPServersConfig(mcpServers []sympoziumv1alpha1.MCPServerRef) mcpServersConfigYAML {
 	cfg := mcpServersConfigYAML{
 		Servers: make([]mcpServerYAML, 0, len(mcpServers)),
 	}
@@ -4851,12 +5740,7 @@ func buildMCPServersYAML(mcpServers []sympoziumv1alpha1.MCPServerRef) (string, e
 
 		cfg.Servers = append(cfg.Servers, entry)
 	}
-
-	data, err := yaml.Marshal(cfg)
-	if err != nil {
-		return "", fmt.Errorf("marshalling MCP servers config: %w", err)
-	}
-	return string(data), nil
+	return cfg
 }
 
 // sidecarToolJSON is the wire representation of a native sidecar tool written
@@ -5104,6 +5988,62 @@ func (r *AgentRunReconciler) startPostRun(
 	return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 }
 
+const (
+	// defaultPostRunHookTimeout is the budget a postRun hook gets when it
+	// declares no timeout of its own. It matches the documented default on
+	// LifecycleHookContainer.Timeout.
+	defaultPostRunHookTimeout = 5 * time.Minute
+
+	// postRunMinTimeout floors the postRun budget at what it was before hook
+	// timeouts were honoured, so specs that declare none keep exactly the
+	// budget they have always had rather than silently losing half of it.
+	postRunMinTimeout = 10 * time.Minute
+
+	// postRunTimeoutGrace holds the controller-side backstop slightly behind
+	// the Job's own deadline so that, for a Job that actually started, the
+	// Job's ActiveDeadlineSeconds fires first and the failure arrives through
+	// the ordinary Failed path instead of the controller racing it to a delete.
+	postRunTimeoutGrace = 30 * time.Second
+)
+
+// postRunBudget returns how long the postRun Job may take in total. It is
+// applied twice: as the Job's ActiveDeadlineSeconds, and as a controller-side
+// backstop in reconcilePostRunning. Both measure from the Job's clock, never
+// the agent run's, so a gate gets its full budget however long the agent took.
+//
+// PostRun hooks run sequentially as init containers, so the budget is the sum
+// of their declared timeouts. Kubernetes has no per-init-container timeout, so
+// this bounds the Job as a whole: a hook that overruns eats into what is left
+// for the hooks after it rather than being killed individually.
+func postRunBudget(lifecycle *sympoziumv1alpha1.LifecycleHooks) time.Duration {
+	var total time.Duration
+	if lifecycle != nil {
+		for _, hook := range lifecycle.PostRun {
+			if hook.Timeout != nil && hook.Timeout.Duration > 0 {
+				total += hook.Timeout.Duration
+				continue
+			}
+			total += defaultPostRunHookTimeout
+		}
+	}
+	if total < postRunMinTimeout {
+		return postRunMinTimeout
+	}
+	return total
+}
+
+// postRunJobStart returns the instant a postRun Job's timeout is measured from.
+// Status.StartTime is what the Job controller uses for ActiveDeadlineSeconds,
+// so matching it keeps the two bounds consistent. CreationTimestamp is the
+// fallback for a Job that never starts (stuck on quota, or no Job controller in
+// envtest), so it still times out rather than holding the run forever.
+func postRunJobStart(job *batchv1.Job) time.Time {
+	if job.Status.StartTime != nil {
+		return job.Status.StartTime.Time
+	}
+	return job.CreationTimestamp.Time
+}
+
 // buildPostRunJob constructs a Job that runs the postRun lifecycle hook containers.
 // Each hook runs as a sequential init container, followed by a no-op final container.
 func (r *AgentRunReconciler) buildPostRunJob(
@@ -5125,7 +6065,7 @@ func (r *AgentRunReconciler) buildPostRunJob(
 	}
 
 	ttl := int32(300)
-	deadline := int64(600) // 10 min default for postRun
+	deadline := int64(postRunBudget(agentRun.Spec.Lifecycle).Seconds())
 	backoffLimit := int32(0)
 
 	readOnly := true
@@ -5237,6 +6177,12 @@ func (r *AgentRunReconciler) buildPostRunJob(
 			},
 		},
 	}
+	if len(agentRun.Spec.Lifecycle.RBAC) > 0 {
+		volumes = append(volumes, runAPIAccessVolume())
+		for i := range initContainers {
+			mountRunAPIAccess(&initContainers[i])
+		}
+	}
 
 	return &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
@@ -5253,9 +6199,10 @@ func (r *AgentRunReconciler) buildPostRunJob(
 					Labels: labels,
 				},
 				Spec: corev1.PodSpec{
-					RestartPolicy:      corev1.RestartPolicyNever,
-					ServiceAccountName: "sympozium-agent",
-					ImagePullSecrets:   agentRun.Spec.ImagePullSecrets,
+					RestartPolicy:                corev1.RestartPolicyNever,
+					ServiceAccountName:           agentRunServiceAccountName(agentRun),
+					AutomountServiceAccountToken: boolPtr(false),
+					ImagePullSecrets:             agentRun.Spec.ImagePullSecrets,
 					SecurityContext: &corev1.PodSecurityContext{
 						RunAsNonRoot: &runAsNonRoot,
 						RunAsUser:    &runAsUser,
@@ -5364,13 +6311,15 @@ func (r *AgentRunReconciler) reconcilePostRunning(ctx context.Context, log logr.
 		}
 	}
 
-	// PostRun Job still running -- check timeout.
-	if agentRun.Status.StartedAt != nil {
-		elapsed := time.Since(agentRun.Status.StartedAt.Time)
-		// PostRun gets 10 minutes by default.
-		postRunTimeout := 10 * time.Minute
-		if elapsed > postRunTimeout {
-			log.Info("PostRun Job timed out", "elapsed", elapsed)
+	// PostRun Job still running -- check timeout. The clock is the postRun Job's
+	// own: anchoring to Status.StartedAt spent the budget before postRun began,
+	// so any run longer than the budget had its hooks killed on the first
+	// PostRunning reconcile and could never receive a gate verdict.
+	if anchor := postRunJobStart(&job); !anchor.IsZero() {
+		elapsed := time.Since(anchor)
+		budget := postRunBudget(agentRun.Spec.Lifecycle)
+		if elapsed > budget+postRunTimeoutGrace {
+			log.Info("PostRun Job timed out", "elapsed", elapsed, "budget", budget)
 			_ = r.Delete(ctx, &job, client.PropagationPolicy(metav1.DeletePropagationForeground))
 			if gated {
 				return r.resolveGate(ctx, log, agentRun, agentSucceeded, true)
@@ -5539,6 +6488,53 @@ func (r *AgentRunReconciler) publishGatedCompletion(ctx context.Context, agentRu
 	}
 }
 
+// buildWorkspaceMarkerInit returns the init container that writes
+// /workspace/.sympozium/state.json before the agent container starts.
+// Harness wrappers and the agent-runner read this marker to detect
+// whether the workspace is fresh or carried over from a prior run.
+// The marker preserves the previous state as `previousRun` so wrappers
+// can surface "your workspace was reclaimed" / "this is turn N" UX.
+//
+// The logic runs as the `workspace-marker` subcommand of the agent-runner
+// binary rather than a shell script: the agent-runner image is distroless
+// and has no shell (/bin/sh does not exist).
+func (r *AgentRunReconciler) buildWorkspaceMarkerInit(agentRun *sympoziumv1alpha1.AgentRun) corev1.Container {
+	noPrivEsc := false
+	return corev1.Container{
+		Name:            "workspace-marker",
+		Image:           r.imageRef("agent-runner"),
+		ImagePullPolicy: corev1.PullIfNotPresent,
+		Command:         []string{"/agent-runner", "workspace-marker"},
+		Env: []corev1.EnvVar{
+			{Name: "AGENT_RUN_ID", Value: agentRun.Name},
+			{Name: "SESSION_KEY", Value: agentRun.Spec.SessionKey},
+			{Name: "AGENT_NAME", Value: agentRun.Spec.AgentRef},
+			{Name: "AGENT_NAMESPACE", Value: agentRun.Namespace},
+			{Name: "WORKSPACE_SESSION", Value: agentRun.Annotations[WorkspaceSessionAnnotation]},
+			{Name: "WORKSPACE_PVC", Value: agentRun.Annotations[WorkspacePVCAnnotation]},
+		},
+		SecurityContext: &corev1.SecurityContext{
+			AllowPrivilegeEscalation: &noPrivEsc,
+			Capabilities: &corev1.Capabilities{
+				Drop: []corev1.Capability{"ALL"},
+			},
+		},
+		VolumeMounts: []corev1.VolumeMount{
+			{Name: "workspace", MountPath: "/workspace"},
+		},
+		Resources: corev1.ResourceRequirements{
+			Requests: corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse("10m"),
+				corev1.ResourceMemory: resource.MustParse("16Mi"),
+			},
+			Limits: corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse("100m"),
+				corev1.ResourceMemory: resource.MustParse("64Mi"),
+			},
+		},
+	}
+}
+
 // ensureWorkspacePVC creates a PersistentVolumeClaim for the workspace volume
 // when postRun lifecycle hooks are defined. This allows the workspace to persist
 // between the main agent Job and the postRun Job.
@@ -5595,10 +6591,20 @@ func (r *AgentRunReconciler) cleanupWorkspacePVC(ctx context.Context, log logr.L
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *AgentRunReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if r.ParentOnly || r.ScopedOnly {
+		return ctrl.NewControllerManagedBy(mgr).For(&sympoziumv1alpha1.AgentRun{}).Complete(r)
+	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&sympoziumv1alpha1.AgentRun{}).
 		Owns(&batchv1.Job{}).
 		Owns(&appsv1.Deployment{}).
 		Owns(&corev1.Service{}).
 		Complete(r)
+}
+
+func parentOnlyRun(run *sympoziumv1alpha1.AgentRun) bool {
+	if run.Status.CellnParent != nil {
+		return true
+	}
+	return run.Spec.Backend == "celln" && run.Spec.ExecutionLifecycle == "enduring" && run.Status.JobName == "" && run.Status.DeploymentName == "" && run.Status.CellnRequest == "" && run.Status.CellnActionID == "" && run.Status.CellnIssuance == nil
 }

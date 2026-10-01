@@ -30,8 +30,23 @@ spec:
             - --token-file=/var/run/secrets/sympozium-ui-token/token
           {{- if .Values.apiserver.webUI.enabled }}
             - --serve-ui
+          {{- else }}
+            - --serve-ui=false
           {{- end }}
           env:
+          {{- if .Values.celln.permissionPreviewConfigMap }}
+            - name: CELLN_PERMISSION_PREVIEW_CONFIG
+              value: /etc/sympozium/celln-preview/config.json
+          {{- end }}
+          {{- if and .Values.nats.enabled .Values.nats.auth.enabled }}
+            - name: NATS_USERNAME
+              value: sympozium-control
+            - name: NATS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "sympozium.natsAuthSecret" . }}
+                  key: control-password
+          {{- end }}
           {{- if .Values.apiserver.webUI.token }}
             - name: SYMPOZIUM_UI_TOKEN
               value: {{ .Values.apiserver.webUI.token | quote }}
@@ -51,14 +66,30 @@ spec:
             - name: SYMPOZIUM_COLLECTOR_METRICS_URL
               value: "http://sympozium-otel-collector.{{ include "sympozium.namespace" . }}.svc.cluster.local:{{ .Values.observability.collector.service.metricsPort }}/metrics"
           {{- if .Values.celln.enabled }}
+            - name: CELLN_ENABLED
+              value: "true"
+            - name: CELLN_ENDURING_ENABLED
+              value: {{ .Values.celln.dispatcher.enduring.enabled | quote }}
+            {{- if .Values.celln.caConfigMap }}
+            - name: SSL_CERT_FILE
+              value: /etc/sympozium/celln-router-ca/ca-bundle.crt
+            {{- end }}
             - name: CELLN_ROUTER_URL
               value: {{ .Values.celln.routerUrl | quote }}
+            - name: CELLN_ALLOW_INSECURE_HTTP
+              value: {{ .Values.celln.allowInsecureHttp | quote }}
+            - name: CELLN_CAPABILITY_TOKEN_FILE
+              value: /etc/celln/capability/token
           {{- end }}
           {{- if .Values.pricing.enabled }}
             - name: SYMPOZIUM_PRICING_CONFIGMAP
               value: "sympozium-model-pricing"
             - name: SYMPOZIUM_PRICING_NAMESPACE
               value: {{ include "sympozium.namespace" . | quote }}
+          {{- end }}
+          {{- if .Values.energyCollector.enabled }}
+            - name: SYMPOZIUM_ENERGY_COLLECTOR_NAMESPACES
+              value: {{ join "," .Values.energyCollector.discovery.namespaces | quote }}
           {{- end }}
           {{- if .Values.observability.enabled }}
             - name: OTEL_EXPORTER_OTLP_ENDPOINT
@@ -99,11 +130,30 @@ spec:
           securityContext:
             {{- toYaml .Values.containerSecurityContext | nindent 12 }}
           {{- /* Gate must match apiserver-ui-secret.yaml */}}
-          {{- if and .Values.apiserver.webUI.enabled (not .Values.apiserver.webUI.token) }}
+          {{- if or .Values.celln.permissionPreviewConfigMap .Values.celln.enabled (and .Values.apiserver.webUI.enabled (not .Values.apiserver.webUI.token)) }}
           volumeMounts:
+          {{- if .Values.celln.permissionPreviewConfigMap }}
+            - name: celln-permission-preview
+              mountPath: /etc/sympozium/celln-preview
+              readOnly: true
+          {{- end }}
+          {{- if .Values.celln.enabled }}
+            {{- if .Values.celln.caConfigMap }}
+            - name: celln-router-ca
+              mountPath: /etc/sympozium/celln-router-ca
+              readOnly: true
+            {{- end }}
+            {{- if .Values.celln.capabilityTokenSecret }}
+            - name: celln-capability-token
+              mountPath: /etc/celln/capability
+              readOnly: true
+            {{- end }}
+          {{- end }}
+          {{- if and .Values.apiserver.webUI.enabled (not .Values.apiserver.webUI.token) }}
             - name: sympozium-ui-token
               mountPath: /var/run/secrets/sympozium-ui-token
               readOnly: true
+          {{- end }}
           {{- end }}
       {{- with .Values.apiserver.nodeSelector }}
       nodeSelector:
@@ -121,8 +171,30 @@ spec:
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- if not .Values.apiserver.webUI.token }}
+      {{- if or .Values.celln.permissionPreviewConfigMap .Values.celln.enabled (not .Values.apiserver.webUI.token) }}
       volumes:
+      {{- if .Values.celln.permissionPreviewConfigMap }}
+        - name: celln-permission-preview
+          configMap:
+            name: {{ .Values.celln.permissionPreviewConfigMap | quote }}
+            items:
+              - key: config.json
+                path: config.json
+      {{- end }}
+      {{- if .Values.celln.enabled }}
+        {{- if .Values.celln.caConfigMap }}
+        - name: celln-router-ca
+          configMap:
+            name: {{ .Values.celln.caConfigMap | quote }}
+        {{- end }}
+        {{- if .Values.celln.capabilityTokenSecret }}
+        - name: celln-capability-token
+          secret:
+            secretName: {{ .Values.celln.capabilityTokenSecret | quote }}
+            defaultMode: 0444
+        {{- end }}
+      {{- end }}
+      {{- if not .Values.apiserver.webUI.token }}
         - name: sympozium-ui-token
           secret:
             secretName: {{ include "sympozium.fullname" . }}-ui-token
@@ -131,6 +203,7 @@ spec:
             # volume mounts are owned by root. 0400 would only be readable
             # by root and the apiserver would 401 every request.
             defaultMode: 0444
+      {{- end }}
       {{- end }}
 ---
 apiVersion: v1

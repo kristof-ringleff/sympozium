@@ -37,7 +37,54 @@ See [`charts/sympozium/values.yaml`](https://github.com/sympozium-ai/sympozium/b
 
 ### Celln (hermetic execution)
 
-Off by default (`celln.enabled: false`) — opt in with `--set celln.enabled=true`, or via the CLI's `sympozium install --enable-hermetic-workloads`. It deploys a **privileged**, `hostPID` DaemonSet with a read-write mount of the host root filesystem to set up KVM host-side, so treat it as a deliberate opt-in rather than a routine flag. See [Celln Backend](../concepts/celln-backend.md) before enabling it.
+Enabled by default (`celln.enabled: true`) so a standard installation deploys
+the in-cluster (pod-based) dispatcher, the router and controller/API wiring.
+The dispatcher carries no node selector and may schedule on any node (it still
+mounts the node's `/dev/kvm`, so the node it lands on must provide KVM).
+A bare-metal host dispatcher (systemd, via the `celln-installer`
+DaemonSet) is available with `celln.installer.enabled=true` but is loopback-only
+and mutually exclusive with the in-cluster dispatcher; the installer schedules
+only on nodes explicitly labelled `celln.dev/kvm=true`, so label KVM-capable
+hosts deliberately before enabling it. Disable all Celln
+resources with `--set celln.enabled=false`. See [Celln Backend](../concepts/celln-backend.md).
+
+`celln.fleet.*` replaces the single dispatcher with one owner per labeled KVM
+node: a `celln-node` DaemonSet prepares each node from a digest-pinned,
+operator-signed starter package and serves enduring parents from it, the
+router discovers owners through a headless Service, and the controller keeps
+its parent journal on a claim instead of a node. It is driven end to end by
+`sympozium install --celln-fleet`; see
+[Celln Fleet Installation](../guides/celln-fleet-installation.md).
+
+### AgentHarness examples
+
+The chart installs only the maintained, experimental **persistent** Pi and
+Hermes adapter catalog entries by default, alongside the built-in Ensemble
+catalog. They appear in
+**Agents → Harnesses** when the UI is set to the chart namespace (normally
+`sympozium-system`). Each is pinned to an immutable digest and carries its
+conformance reference.
+
+The chart also creates a `harness-examples` policy that permits only these two
+images. It does **not** create or modify an Agent, so no external harness runs
+until an operator explicitly selects both that policy and a runtime on an
+Agent. The session adapters persist their own conversation state on a
+per-session PVC and are currently unmetered; they do not support MCP/SkillPack
+tools, native tool filtering, personas, or subagents. One-shot Pi and Hermes
+runtimes remain available in values as explicit opt-in examples and are hidden
+from the default interactive catalog.
+
+Disable the catalog, or select only one adapter, with values such as:
+
+```yaml
+harnessExamples:
+  enabled: false
+  # Or retain the persistent catalog but install Pi only:
+  piSession:
+    enabled: true
+  hermesSession:
+    enabled: false
+```
 
 ## Observability
 

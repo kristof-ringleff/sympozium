@@ -342,3 +342,50 @@ func TestPersistFailureMemory_SendsWriterToken(t *testing.T) {
 			got[0].Method, got[0].URL.Path, got[0].Header.Get("Authorization"))
 	}
 }
+
+// ── Harness mode: the agent container is not agent-runner ───────────────────
+//
+// In mode: harness the agent container runs an operator-supplied harness
+// image instead of agent-runner, and harnesses commonly run model-chosen shell
+// commands. The writer token must not be in its env, or the model could read
+// it and write to or forget from memory under any agent's name.
+
+func TestBuildContainers_NoWriterTokenInHarnessMode(t *testing.T) {
+	r := &AgentRunReconciler{}
+	run := harnessModeRun(nil)
+	run.Spec.Skills = []sympoziumv1alpha1.SkillRef{{SkillPackRef: "memory"}}
+
+	containers, initContainers, err := r.buildContainers(run, false, nil, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("buildContainers: %v", err)
+	}
+	agent := containerByName(containers, agentContainerName)
+	if agent == nil || agent.Image != harnessTestImage {
+		t.Fatalf("expected the agent container to run the harness image, got %+v", agent)
+	}
+	for _, c := range append(containers, initContainers...) {
+		assertNoMemoryTokens(t, c, "")
+	}
+}
+
+func TestInjectSharedMemory_NoWriterTokenInHarnessMode(t *testing.T) {
+	pack := &sympoziumv1alpha1.Ensemble{
+		ObjectMeta: metav1.ObjectMeta{Name: "crew", Namespace: "default"},
+		Spec: sympoziumv1alpha1.EnsembleSpec{
+			SharedMemory: &sympoziumv1alpha1.SharedMemorySpec{Enabled: true},
+		},
+	}
+	writer := &sympoziumv1alpha1.Agent{ObjectMeta: metav1.ObjectMeta{
+		Name: "crew-writer", Namespace: "default", Labels: map[string]string{"sympozium.ai/agent-config": "writer"},
+	}}
+	r := newAgentRunTestReconciler(t, pack, writer)
+
+	run := harnessModeRun(nil)
+	run.Labels = map[string]string{"sympozium.ai/ensemble": "crew"}
+	run.Spec.AgentRef = "crew-writer" // read-write: would get the token as agent-runner
+	podSpec := corev1.PodSpec{Containers: []corev1.Container{{Name: agentContainerName, Image: harnessTestImage}}}
+
+	r.injectSharedMemory(context.Background(), run, &podSpec)
+
+	assertNoMemoryTokens(t, podSpec.Containers[0], "")
+}

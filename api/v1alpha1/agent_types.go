@@ -33,6 +33,14 @@ type AgentSpec struct {
 	// +optional
 	PolicyRef string `json:"policyRef,omitempty"`
 
+	// RuntimeRef references an administrator-approved AgentRuntime that
+	// replaces agent-runner as the primary process for this Agent's ordinary
+	// string-form runs. Those runs are dispatched through harness mode with this
+	// runtime and their original task as the prompt. An explicit object-form
+	// harness task may still select an image or runtime itself.
+	// +optional
+	RuntimeRef string `json:"runtimeRef,omitempty"`
+
 	// AuthRefs references secrets containing AI provider credentials.
 	// +optional
 	AuthRefs []SecretRef `json:"authRefs,omitempty"`
@@ -80,6 +88,22 @@ type AgentSpec struct {
 	// inside the agent's filesystem.
 	// +optional
 	VolumeMounts []corev1.VolumeMount `json:"volumeMounts,omitempty"`
+
+	// Workspace configures the /workspace volume for agent pods spawned
+	// by this Agent. When PerSessionPVC is enabled, each unique
+	// SessionKey gets a dedicated PVC that persists across AgentRuns —
+	// required for harnesses (codex, claude-code) whose session state
+	// lives under $HOME, and useful for long-lived conversations that
+	// need filesystem continuity. When nil or PerSessionPVC is false,
+	// /workspace remains an ephemeral emptyDir as before.
+	// +optional
+	Workspace *WorkspaceSpec `json:"workspace,omitempty"`
+
+	// Execution stores default run execution choices (environment, lifecycle,
+	// Celln catalogue tools). Omitted Agents keep historical Kubernetes Job
+	// behaviour. Changes here do not mutate already-live native Celln parents.
+	// +optional
+	Execution *AgentExecutionDefaults `json:"execution,omitempty"`
 }
 
 // MCPServerRef references a remote MCP server for tool integration.
@@ -418,6 +442,13 @@ type AgentConfig struct {
 	// Used for node-pinned inference (e.g., Ollama installed on specific GPU nodes).
 	// +optional
 	NodeSelector map[string]string `json:"nodeSelector,omitempty"`
+
+	// Tolerations allow agent pods to schedule onto tainted nodes.
+	// Propagated to AgentRunSpec.Tolerations when runs are created.
+	// Use together with NodeSelector to pin agents to dedicated node
+	// pools (e.g. a GPU pool tainted with `nvidia.com/gpu=present:NoSchedule`).
+	// +optional
+	Tolerations []corev1.Toleration `json:"tolerations,omitempty"`
 
 	// Lifecycle defines pre and post run hooks for agent runs.
 	// Propagated to AgentRunSpec.Lifecycle when runs are created.
