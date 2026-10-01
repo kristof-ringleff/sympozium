@@ -96,6 +96,7 @@ nav:
     - Skills, Tools & Execution: concepts/skills-tools-and-execution.md
     - Security: concepts/security.md
     - Persistent Memory: concepts/persistent-memory.md
+    - Persistent Workspaces: concepts/workspaces.md
     - Scheduled Tasks: concepts/scheduled-tasks.md
     - Observability: concepts/observability.md
   - Sidecars:

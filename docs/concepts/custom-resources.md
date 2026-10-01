@@ -70,6 +70,30 @@ spec:
   policyRef: default-policy
 ```
 
+### Placing agent pods
+
+`spec.agents.default.nodeSelector` and `spec.agents.default.tolerations` pin
+an Agent's pods to a node pool, for example a GPU pool tainted
+`nvidia.com/gpu=present:NoSchedule` that runs a local model. The controller
+copies the tolerations onto every AgentRun it creates for the Agent
+(schedules, channels, delegations, the API), and a run may also set
+`spec.tolerations` itself. They apply to Job, Deployment (serving) and
+Sandbox pods.
+
+```yaml
+spec:
+  agents:
+    default:
+      model: qwen3
+      nodeSelector:
+        pool: gpu
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Equal
+          value: present
+          effect: NoSchedule
+```
+
 ---
 
 ## AgentRun
