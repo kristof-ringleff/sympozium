@@ -1,6 +1,9 @@
 # Custom Resources
 
-Sympozium models every agentic concept as a Kubernetes Custom Resource:
+Sympozium models every agentic concept as a Kubernetes Custom Resource. All
+are in the `sympozium.ai/v1alpha1` API group.
+
+### Core
 
 | CRD | Kubernetes Analogy | Purpose |
 |-----|--------------------|---------|
@@ -15,6 +18,29 @@ Sympozium models every agentic concept as a Kubernetes Custom Resource:
 | `SympoziumConfig` | Cluster configuration | Platform-wide singleton — gateway, canary, and pricing settings |
 | `ModelConnection` | ExternalName Service | Namespaced, reusable model route — provider, protocol, endpoint, models, and an optional Secret or host credential profile |
 
+### Execution and sessions
+
+| CRD | Kubernetes Analogy | Purpose |
+|-----|--------------------|---------|
+| `AgentRuntime` | RuntimeClass | Administrator-approved, digest-pinned harness that replaces `agent-runner` (one-shot or session-capable); on Celln, a wrapper referencing a `CellnRuntimeProfile`. Agents select one with `spec.runtimeRef` |
+| `HarnessSession` | Deployment + Service | A persistent, Agent-owned AgentHarness process (Pi, Hermes) behind **Agents → Chat**, with state on a per-session PVC |
+| `AgentRunTurn` (`arturn`) | — | One follow-up message and its result within an enduring Celln run; a durable record, not another running agent |
+| `WorkspaceSession` (`ws`) | PersistentVolumeClaim | A persistent `/workspace` for one (Agent, `sessionKey`) pair; owns its PVC and is owned by the Agent |
+
+### Celln catalogue and policy
+
+| CRD | Scope | Purpose |
+|-----|-------|---------|
+| `CellnRuntimeProfile` | Cluster | Immutable, operator-published runtime revision: executable hashes, lifecycles, ceilings and the native parent/worker material for the fleet |
+| `CellnExecutionPolicy` | Cluster | Which namespaces may run which profiles, tools and model routes, with lease/turn/request/token ceilings |
+| `ClusterCellnTool` | Cluster | Shared, immutable tool revision lent to cells (brokered tools and commands borrowed from pinned images; `spec.sourceImage`) |
+| `CellnTool` | Namespaced | Legacy namespaced tool catalogue metadata, published by `sympozium celln-tool approve` |
+| `CellnToolSubmission` | Namespaced | Untrusted request to publish a tool; creating it approves nothing |
+
+The [Celln fleet installer](../guides/celln-fleet-installation.md) creates
+the cluster-scoped objects once per scope and per-namespace wrappers
+(`AgentRuntime`, `Agent`, `ModelConnection`) on first use.
+
 ---
 
 ## Agent
@@ -26,7 +52,8 @@ The core resource representing an agent identity. Each instance has:
 - Channel connections (Telegram, Slack, etc.)
 - Memory settings (enabled/disabled, max size)
 - A policy reference
-- Optional node selector for pinning agent pods to specific nodes (e.g. GPU nodes running Ollama)
+- Optional node selector and tolerations for placing agent pods on specific nodes (e.g. GPU nodes running Ollama)
+- An optional harness runtime (`spec.runtimeRef`) and execution defaults (`spec.execution`: backend, lifecycle, model connection, Celln tool selection)
 
 ```yaml
 apiVersion: sympozium.ai/v1alpha1
@@ -70,7 +97,9 @@ spec:
 
 Phase transitions: `Pending` → `Running` → `Succeeded` (or `Failed`). When [lifecycle hooks](lifecycle-hooks.md) with `postRun` are defined: `Pending` → `Running` → `PostRunning` → `Succeeded` (or `Failed`).
 
-Setting `spec.backend: celln` routes the run to a hardware-isolated microVM instead of a Job — no ensembles, delegation, or shared memory, and the run's own `model:` field is ignored in favor of whatever AI provider is configured on the KVM host. See [Celln Backend](celln-backend.md).
+Setting `spec.backend: celln` routes the run to a hardware-isolated Celln microVM instead of a Job, and `spec.executionLifecycle` chooses `one-shot` or `enduring` (a leased parent cell that takes follow-up `AgentRunTurn`s). Celln runs use the model route of the Agent's Celln backend (`spec.model.connectionRef`), not a key in the run, and do not support SkillPacks, MCP, ensembles, delegation or shared memory. See [Celln Backend](celln-backend.md).
+
+Other fields worth knowing: `spec.task.mode: harness` or an `AgentRuntime` replaces `agent-runner` with an approved harness ([Harness Mode](../modes/harness.md)); `spec.mode: server` runs a long-lived Deployment ([Serving Mode](../guides/serving-mode.md)); `spec.tolerations` places the pod on tainted nodes; `spec.cleanup` is `delete` or `keep`.
 
 ---
 
@@ -112,3 +141,47 @@ A namespaced, reusable model route. An Agent selects one with
 revision before admitting a run or persistent session, so a conversation is
 never silently redirected to another provider. See
 [Model connections for persistent harnesses](../guides/model-connections.md).
+
+---
+
+## AgentRuntime and HarnessSession
+
+An `AgentRuntime` is the admin-owned description of an external harness:
+a digest-pinned image, its adapter contract and capabilities, and a support
+owner. An Agent references it with `spec.runtimeRef`; runs inherit it. A
+session-capable runtime gives the Agent a persistent **Chat**, served by a
+`HarnessSession` (a Deployment and private Service with a per-session PVC).
+See [AgentHarness](../guides/agentharness.md) and
+[Harness Mode](../modes/harness.md).
+
+---
+
+## AgentRunTurn
+
+Follow-up messages to an enduring Celln run. The API server creates them
+(`POST /api/v1/runs/{name}/turns`) with the run's controller
+`ownerReference`; a turn without one is refused. Each turn records its
+message, phase and result. See [Celln Backend](celln-backend.md#lifecycles).
+
+---
+
+## WorkspaceSession
+
+A persistent `/workspace` for one (Agent, `sessionKey`) pair, owning its PVC.
+Enable it on an Agent with `spec.workspace.perSessionPVC: true` (optional
+`size`, default `1Gi`; `storageClassName`; `idleTTL`, default `720h`);
+otherwise `/workspace` is an ephemeral emptyDir. Runs with the same session
+key share the workspace and are serialised, because the PVC is
+ReadWriteOnce. Deleting the session or its Agent deletes the PVC, and an idle
+session is reclaimed after `idleTTL`. Manage them with `sympozium workspace list|show|delete|exec`
+(see the [CLI reference](../reference/cli.md#workspaces)).
+
+---
+
+## Celln catalogue and policy
+
+`CellnRuntimeProfile`, `CellnExecutionPolicy` and `ClusterCellnTool` are the
+cluster-scoped, immutable authority the Celln fleet admits runs against: the
+controller resolves a run's namespace, runtime, tools and model route into one
+decision and re-checks it before every turn. They are created by the fleet
+installer; see [Celln Fleet Installation](../guides/celln-fleet-installation.md#authorising-namespaces).

@@ -1,6 +1,6 @@
 # Framework workspace: real-provider product walkthrough
 
-This supersedes the earlier fixture-only CLI/UI review epoch. See [the workspace walkthrough](../guides/celln-workspace-framework.md). It is a bounded MVP product workspace, not completion of epic #495 or production acceptance.
+This supersedes the earlier fixture-only CLI/UI review epoch. It is a bounded MVP product workspace, not completion of epic #495 or production acceptance.
 
 ## Installed images
 
