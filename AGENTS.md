@@ -6,7 +6,9 @@ This file helps AI coding agents (Copilot, Cursor, Cline, etc.) understand the S
 
 ## Project Overview
 
-Sympozium is a **Kubernetes-native agent orchestration platform** written in Go. Every AI agent runs as an ephemeral Kubernetes pod (Job), with policy enforcement via CRDs, admission webhooks, and RBAC. Communication flows through NATS JetStream and a filesystem-based IPC bridge.
+Sympozium is a **Kubernetes-native agent orchestration platform** written in Go. An AI agent runs either as an ephemeral Kubernetes pod (Job — the default `job` backend) or in a hardware-isolated Celln KVM microVM (`backend: celln`, one-shot or enduring), with policy enforcement via CRDs, admission webhooks, and RBAC. Pod-path communication flows through NATS JetStream and a filesystem-based IPC bridge.
+
+`CLAUDE.md` lists the conventions that most often go wrong (naming, secrets, pod security, generated files).
 
 - **Language:** Go 1.25+
 - **Module:** `github.com/sympozium-ai/sympozium`
@@ -17,44 +19,52 @@ Sympozium is a **Kubernetes-native agent orchestration platform** written in Go.
 ## Repository Layout
 
 ```
-api/v1alpha1/           # CRD type definitions (Agent, AgentRun, SympoziumPolicy, SkillPack, SympoziumSchedule, Ensemble, Model, MCPServer, SympoziumConfig, ModelConnection)
+api/v1alpha1/           # CRD type definitions (see Key CRDs below)
 cmd/
   agent-runner/         # Agent container — LLM loop + tool execution
-  apiserver/            # HTTP + WebSocket API server
+  apiserver/            # HTTP + WebSocket API server (+ embedded web UI)
   controller/           # Controller manager (all reconcilers + routers)
+  webhook/              # Admission webhook server (validation only)
   ipc-bridge/           # IPC bridge sidecar (fsnotify → NATS)
+  memory-server/        # Per-Agent memory server (SQLite + FTS5)
+  mcp-bridge/           # MCP bridge sidecar
   web-proxy/            # Web proxy (OpenAI-compat API + MCP gateway)
-  node-probe/           # Node probe DaemonSet (discovers inference providers on nodes)
-  sympozium/             # CLI + TUI (Bubble Tea)
-  webhook/              # Admission webhook server
-channels/
-  telegram/             # Channel pod — Telegram bot
-  slack/                # Channel pod — Slack (Socket Mode + Events API)
-  discord/              # Channel pod — Discord bot
-  whatsapp/             # Channel pod — WhatsApp
+  node-probe/           # Node probe DaemonSet (inference discovery, celln.dev/kvm labels)
+  model-gateway/        # Celln model gateway (opt-in)
+  celln-*/              # Celln parent proxy, scoped controller, review/evidence tools
+  sympozium/            # CLI + TUI (Bubble Tea), incl. `install` and the Celln fleet installer
+channels/               # Channel pods — telegram, slack, discord, whatsapp
+charts/
+  sympozium/            # Control-plane chart (files/skills, files/agent-configs are the built-ins)
+  sympozium-crds/       # CRD-only chart (synced by `make manifests`)
+  ergoz/                # Vendored ergoz chart installed by `sympozium install`
 config/
   crd/bases/            # Generated CRD YAML manifests
-  manager/              # Controller manager deployment
-  personas/             # Built-in Ensemble YAML definitions
-  rbac/                 # RBAC roles
-  samples/              # Sample CR YAML files
+  agent-configs/        # Built-in Ensemble YAML definitions
   skills/               # Built-in SkillPack YAML definitions
   policies/             # Built-in SympoziumPolicy presets
-  webhook/              # Webhook configuration
+  samples/              # Sample CR YAML files
+  celln/release.json    # Pinned Celln release
+  ergoz/release.json    # Pinned ergoz release
+  host/                 # systemd units for host-side Celln components
+hack/                   # Build helpers (e.g. build-celln-starter.sh)
 images/                 # Dockerfiles for all components
 internal/
   apiserver/            # API server implementation
-  channel/              # Channel types
-  controller/           # Reconcilers (AgentRun, Agent, SympoziumPolicy, SympoziumSchedule, SkillPack, Ensemble) + routers (Channel, Schedule)
+  controller/           # Reconcilers (Agent, AgentRun, AgentRunTurn, AgentRuntime, HarnessSession, WorkspaceSession, Ensemble, SkillPack, SympoziumPolicy, SympoziumSchedule, SympoziumConfig, MCPServer, Model) + routers (channel, schedule, spawn)
+  orchestrator/         # Pod builder + spawner for agent Jobs
+  celln/, cellnparent/, cellnplatform/, cellnauthority/, cellninstall/, …  # Celln clients, admission, install
+  modelconnection/      # ModelConnection resolution
+  collector/            # Energy collector discovery (ergoz)
   eventbus/             # NATS JetStream client + topic constants
   ipc/                  # IPC bridge (fsnotify watcher, protocol, file handlers)
-  orchestrator/         # Pod builder + spawner for agent Jobs
   session/              # Session store
   webhook/              # Policy enforcer
   webproxy/             # Web proxy handlers (OpenAI, MCP, rate limiting)
 migrations/             # PostgreSQL schema migrations
-test/integration/       # Integration test scripts (shell)
-docs/                   # Design & contributor documentation
+test/integration/       # Integration journeys (shell + Go)
+web/                    # Web dashboard (React + Vite), Cypress specs in web/cypress
+docs/                   # User and design documentation (mkdocs)
 ```
 
 ---
@@ -73,13 +83,21 @@ docs/                   # Design & contributor documentation
 | `MCPServer` | Managed MCP server lifecycle — stdio or HTTP transport, tool discovery, allow/deny filtering |
 | `SympoziumConfig` | Platform-wide singleton — gateway, canary, and pricing settings |
 | `ModelConnection` | Reusable namespaced model route for persistent harnesses and native Celln runs |
+| `AgentRuntime` | Admin-approved, digest-pinned harness replacing `agent-runner` (or a Celln wrapper runtime) |
+| `HarnessSession` | Persistent Agent-owned harness process (Deployment + PVC) for chat |
+| `AgentRunTurn` | A follow-up message/result within an enduring Celln run |
+| `WorkspaceSession` | Persistent `/workspace` PVC for one (Agent, sessionKey) |
+| `CellnRuntimeProfile`, `CellnExecutionPolicy`, `ClusterCellnTool` | Cluster-scoped Celln runtime, policy and tool catalogue |
+| `CellnTool`, `CellnToolSubmission` | Legacy namespaced Celln tool catalogue and untrusted submissions |
 
 Type definitions live in `api/v1alpha1/`. After modifying types, regenerate with:
 
 ```bash
 make generate    # deepcopy + CRD manifests
-make manifests   # CRD YAML only
+make manifests   # CRD YAML + sync both chart copies
 ```
+
+Never hand-edit `config/crd/bases/`, the chart CRD copies or `zz_generated.deepcopy.go`.
 
 ---
 
@@ -96,25 +114,20 @@ make manifests   # CRD YAML only
 ### Create a Kind Cluster & Install Sympozium
 
 ```bash
-# Create cluster
 kind create cluster --name kind
 
-# Install CRDs
-make install
+# Build all images and load them into Kind
+make docker-build TAG=dev
+make kind-load TAG=dev
 
-# Build all images
-make docker-build TAG=v0.1.0
-
-# Load images into Kind (all components)
-for img in controller apiserver ipc-bridge webhook agent-runner web-proxy \
-           channel-telegram channel-slack channel-discord channel-whatsapp \
-           skill-k8s-ops skill-sre-observability skill-llmfit; do
-  kind load docker-image ghcr.io/sympozium-ai/sympozium/$img:v0.1.0 --name kind
-done
-
-# Deploy the control plane
-kubectl apply -k config/
+# Install CRDs + control plane from the local chart
+make install TAG=dev
 ```
+
+`sympozium install` (the released path) does the same from published images
+and also sets up the Celln fleet and ergoz. For Celln on Kind, the host needs
+`/dev/kvm` and each Kind node a kernel image:
+`docker cp /boot/vmlinuz-$(uname -r) kind-control-plane:/boot/`.
 
 ### Build & Test Cycle
 
@@ -128,8 +141,8 @@ make build
 make test
 
 # Build specific image + reload into Kind
-make docker-build-agent-runner TAG=v0.1.0
-kind load docker-image ghcr.io/sympozium-ai/sympozium/agent-runner:v0.1.0 --name kind
+make docker-build-agent-runner TAG=dev
+make kind-load-agent-runner TAG=dev
 
 # Restart the controller to pick up new images
 kubectl rollout restart deployment sympozium-controller-manager -n sympozium-system
@@ -139,17 +152,21 @@ kubectl rollout restart deployment sympozium-controller-manager -n sympozium-sys
 
 ```bash
 make build              # Build all binaries
-make test               # Run unit tests with race detector
+make test               # Run unit tests with race detector (the bar)
 make test-short         # Run short tests only
+make test-system        # envtest controller tests (no cluster)
 make test-integration   # Run all integration tests (requires Kind + API key)
 (cd web && npm run test:stubbed)  # Console Cypress specs that stub every API call (no cluster; needs `npx vite` running; CI runs these on web/** PRs)
 make vet                # go vet
 make fmt                # gofmt
 make tidy               # go mod tidy
 make docker-build       # Build all Docker images
-make docker-build-<name> TAG=v0.1.0   # Build a specific image
+make docker-build-<name> TAG=dev   # Build a specific image
+make kind-reload        # Build all, load into Kind, restart the controller
 make generate           # Regenerate deepcopy + CRD manifests
-make manifests          # Regenerate CRD YAML only
+make manifests          # Regenerate CRD YAML and sync chart copies
+make helm-sync-check    # CI drift check for chart copies
+make ux-tests           # Cypress UX tests
 make clean              # Remove build artifacts
 ```
 
@@ -183,10 +200,15 @@ TEST_MODEL=gpt-5.2 TEST_TIMEOUT=180 ./test/integration/test-write-file.sh
 | `test-telegram-channel.sh` | Telegram channel deployment + message flow |
 | `test-slack-channel.sh` | Slack channel deployment (Socket Mode) |
 | `test-web-proxy-api.sh` | Web proxy API — healthz, auth, models, chat completions (blocking + streaming), MCP SSE |
+| `test-persistent-harness-session.sh` | Persistent AgentHarness session lifecycle |
+| `test-celln-fleet.sh` | Celln fleet on multi-node Kind: backends, one-shot + enduring runs, tools, tenancy, node loss and continuation |
+| `test-celln-oneliner.sh` | Bare `sympozium install` brings up the fleet |
+
+`test/integration/` holds many more (API smoke, ensembles, memory, MCP, sandbox, Celln contracts); `make integration-tests` runs the API suite.
 
 ### Writing New Tests
 
-See `docs/writing-integration-tests.md` for the full guide and template. Tests follow this pattern:
+See `docs/guides/writing-integration-tests.md` for the full guide and template. Tests follow this pattern:
 
 1. Create an `Agent` + `AgentRun` with a deterministic task
 2. Poll `status.phase` until `Succeeded` or `Failed`
@@ -199,7 +221,7 @@ Add new tests to the `test-integration` target in the `Makefile`.
 
 ## Agent Tools
 
-The agent-runner has 8 built-in tools defined in `cmd/agent-runner/tools.go`:
+The agent-runner has 8 always-on tools defined in `cmd/agent-runner/tools.go` (plus `delegate_to_persona`, `spawn_subagents`, the memory tools and MCP tools when enabled). Celln runs do not use these; cells borrow `ClusterCellnTool`s instead.
 
 | Tool | Category | Description |
 |------|----------|-------------|
@@ -212,7 +234,7 @@ The agent-runner has 8 built-in tools defined in `cmd/agent-runner/tools.go`:
 | `fetch_url` | Native | HTTP GET a URL and return the body |
 | `schedule_task` | IPC (bridge) | Create/update/suspend/resume/delete SympoziumSchedule CRDs |
 
-See `docs/writing-tools.md` for the full guide on adding new tools.
+See `docs/guides/writing-tools.md` for the full guide on adding new tools.
 
 ---
 
@@ -237,11 +259,11 @@ Key topics in `internal/eventbus/types.go`:
 
 ### Memory
 
-Each Agent has a ConfigMap (`<name>-memory`) mounted at `/memory/MEMORY.md`. The controller extracts memory markers (`__SYMPOZIUM_MEMORY__...__SYMPOZIUM_MEMORY_END__`) from agent output and patches the ConfigMap.
+With the `memory` SkillPack, the controller runs a per-Agent memory server (`<agent>-memory` Deployment + Service, SQLite + FTS5 on the `<agent>-memory-db` PVC); agent containers reach it via `MEMORY_SERVER_URL`. Ensembles add a shared `<pack>-shared-memory` server (`WORKFLOW_MEMORY_SERVER_URL`). The legacy ConfigMap (`<name>-memory`, mounted at `/memory/MEMORY.md`, updated from `__SYMPOZIUM_MEMORY__` markers) remains a fallback.
 
 ### Skills
 
-SkillPacks are CRDs containing Markdown instructions + optional sidecar definitions. When enabled on an Agent, skills are mounted at `/skills/` and sidecars are injected into agent pods. See `docs/writing-skills.md`.
+SkillPacks are CRDs containing Markdown instructions + optional sidecar definitions. When enabled on an Agent, skills are mounted at `/skills/` and sidecars are injected into agent pods. See `docs/guides/writing-skills.md`.
 
 ---
 
@@ -249,15 +271,20 @@ SkillPacks are CRDs containing Markdown instructions + optional sidecar definiti
 
 | Document | Location | Content |
 |----------|----------|---------|
-| Design document | `docs/sympozium-design.md` | Full architecture, CRD schemas, data flow, security model |
-| Writing tools | `docs/writing-tools.md` | How to add new agent tools |
-| Writing skills | `docs/writing-skills.md` | How to create SkillPack CRDs |
-| Writing integration tests | `docs/writing-integration-tests.md` | Test patterns and templates |
-| Web endpoint skill | `docs/skill-web-endpoint.md` | How to expose agents as HTTP APIs (OpenAI-compat + MCP) |
-| Serving mode | `docs/serving-mode.md` | How serving mode works for long-lived agent deployments |
-| Sample CRs | `config/samples/` | Example Agent, AgentRun, SympoziumPolicy, SympoziumSchedule, SkillPack |
+| Architecture | `docs/architecture.md` | Components, execution planes, data flow |
+| Custom resources | `docs/concepts/custom-resources.md` | Every CRD and how they relate |
+| Celln | `docs/concepts/celln-backend.md`, `docs/guides/celln-fleet-installation.md` | Hardware-isolated execution and the fleet |
+| Harness mode | `docs/modes/harness.md`, `docs/guides/agentharness.md` | External harnesses and persistent sessions |
+| Writing tools | `docs/guides/writing-tools.md` | How to add new agent tools |
+| Writing skills | `docs/guides/writing-skills.md` | How to create SkillPack CRDs |
+| Writing integration tests | `docs/guides/writing-integration-tests.md` | Test patterns and templates |
+| Writing UX tests | `docs/guides/writing-ux-tests.md` | Cypress specs |
+| Web endpoint skill | `docs/skills/web-endpoint.md` | How to expose agents as HTTP APIs (OpenAI-compat + MCP) |
+| Serving mode | `docs/guides/serving-mode.md` | How serving mode works for long-lived agent deployments |
+| Historical design | `docs/design.md` | Original February 2026 design draft |
+| Sample CRs | `config/samples/` | Example Agent, AgentRun, AgentRuntime, HarnessSession, policy, schedule, SkillPack, Celln catalogue |
 | CRD definitions | `api/v1alpha1/` | Go type definitions for all CRDs |
-| Built-in Ensembles | `config/personas/` | Pre-configured agent bundles (platform-team, devops-pipeline-example) |
+| Built-in Ensembles | `config/agent-configs/` (chart copy `charts/sympozium/files/agent-configs/`) | Pre-configured agent bundles |
 
 ---
 
@@ -269,7 +296,7 @@ SkillPacks are CRDs containing Markdown instructions + optional sidecar definiti
 3. If it needs a controller handler, add a router in `internal/controller/`
 4. Rebuild `agent-runner` (and `ipc-bridge`/`controller` if changed)
 5. Write an integration test in `test/integration/`
-6. Document in `docs/writing-tools.md`
+6. Document in `docs/guides/writing-tools.md`
 
 ### Adding a new channel
 1. Create `channels/<name>/main.go`
@@ -279,14 +306,14 @@ SkillPacks are CRDs containing Markdown instructions + optional sidecar definiti
 
 ### Modifying a CRD
 1. Edit type in `api/v1alpha1/<name>_types.go`
-2. Run `make generate` to regenerate deepcopy and CRD YAML
+2. Run `make generate` to regenerate deepcopy and CRD YAML (and sync the chart copies)
 3. Run `make install` to apply updated CRDs to cluster
 4. Update the reconciler in `internal/controller/`
 
 ### Adding an Ensemble
-1. Create a YAML file in `config/personas/<name>.yaml`
-2. Define personas with system prompts, skills, schedules, and memory seeds
-3. Apply: `kubectl apply -f config/personas/<name>.yaml`
+1. Create a YAML file in `config/agent-configs/<name>.yaml` (the chart ships its own hand-maintained copy under `charts/sympozium/files/agent-configs/`; no target syncs them, so update both)
+2. Define `agentConfigs` with system prompts, skills, schedules, and memory seeds
+3. Apply: `kubectl apply -f config/agent-configs/<name>.yaml`
 4. Activate via the TUI Ensembles tab or by patching `spec.authRefs` with kubectl
 
 ### Rebuilding after changes
@@ -294,11 +321,9 @@ SkillPacks are CRDs containing Markdown instructions + optional sidecar definiti
 # Compile check
 go build ./...
 
-# Rebuild affected images
-make docker-build-<component> TAG=v0.1.0
-
-# Load into Kind
-kind load docker-image ghcr.io/sympozium-ai/sympozium/<component>:v0.1.0 --name kind
+# Rebuild affected images and load into Kind
+make docker-build-<component> TAG=dev
+make kind-load-<component> TAG=dev
 
 # Restart controller if controller/ipc-bridge/agent-runner changed
 kubectl rollout restart deployment sympozium-controller-manager -n sympozium-system

@@ -49,4 +49,4 @@ spec:
     minMemory: 64Mi
     minCPU: 50m
   # No sidecar — the memory server runs as a standalone Deployment+Service
-  # per instance, managed by the SympoziumInstance controller.
+  # per instance, managed by the Agent controller.

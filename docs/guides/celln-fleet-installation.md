@@ -628,8 +628,8 @@ conversation that runs out can be carried on with **Restart elsewhere**.
 
 The installer publishes the reviewed starter configuration **once per scope**
 as cluster-scoped objects — `CellnRuntimeProfile` `celln-native-<scope>`
-(carrying the native parent/worker material), three `ClusterCellnTool`s
-`celln-<scope>-<tool>`, and a `CellnExecutionPolicy` `celln-fleet-<scope>`
+(carrying the native parent/worker material), one `ClusterCellnTool`
+`celln-<scope>-<tool>` per tool in the package, and a `CellnExecutionPolicy` `celln-fleet-<scope>`
 with a `host-profile` model route and the reviewed ceilings.
 
 **By default every namespace is authorised** except the system exclusions
@@ -718,8 +718,10 @@ pinned Celln release serves `/v1/cells`.
   owner and confirms teardown; those runs report `ContextLost`. Once the
   address has left the fleet the gateway answers `original parent backend
   removed` for its identities, which the controller also treats as context
-  loss (and as established teardown when the run is deleted); nothing is
-  re-placed.
+  loss (and as established teardown when the run is deleted). The parent
+  itself is not moved; the controller continues the conversation as a new
+  run on another node (see
+  [Conversations survive their node](#conversations-survive-their-node)).
 - **Rolling updates** replace one node's dispatcher at a time with the same
   drain semantics. A dispatcher restart loses live parents on that node.
 - **New package or scope:** see below. One scope carries exactly one package
@@ -881,8 +883,10 @@ new run"); the incarnation is never retried and the run deletes cleanly.
 
 ## Limits
 
-Single active turn per parent, no parent migration or checkpoint recovery,
-no live lease extension, and the model credential Secret mounted into every
-dispatcher is an interim boundary until the model gateway attaches to native
-parents (#464 "Path to production"). One model backend per scope; persona and
-tool set are fixed by the starter package (#535).
+Single active turn per parent, no live parent migration (a lost parent is
+[continued](#conversations-survive-their-node) as a new run from its recorded
+exchanges, not restored), and no live lease extension. Fleet backends'
+credentials live in a Secret mounted into every dispatcher; an Agent that
+needs its own key, kept off the nodes, uses
+[mediated model access](celln-mediated-model-access.md) instead. All backends
+of a scope share the package's persona and tool set (#535).

@@ -9,7 +9,7 @@ graph TB
     ADMIN(["Operator / SRE"]) -- "TUI · Web UI · kubectl" --> CP
 
     subgraph CP["Control Plane"]
-        CM["Controller Manager<br/><small>Agent · AgentRun<br/>Ensemble · SkillPack · Model<br/>SympoziumPolicy · MCPServer</small>"]
+        CM["Controller Manager<br/><small>Agent · AgentRun · AgentRunTurn<br/>Ensemble · SkillPack · Model<br/>SympoziumPolicy · MCPServer<br/>AgentRuntime · HarnessSession<br/>WorkspaceSession · SympoziumConfig</small>"]
         API["API Server<br/><small>HTTP + WebSocket</small>"]
         WH["Admission Webhook<br/><small>Policy enforcement</small>"]
         NATS[("NATS JetStream<br/><small>Event bus</small>")]
@@ -68,8 +68,8 @@ graph LR
     end
 
     subgraph MEM["Persistent Memory"]
-        MSCAR["Memory Sidecar<br/><small>SQLite + FTS5</small>"]
-        PVC[("PersistentVolume<br/><small>per-instance</small>")]
+        MSCAR["Memory Server<br/><small>SQLite + FTS5</small>"]
+        PVC[("PersistentVolume<br/><small>per-Agent</small>")]
     end
 
     subgraph SMEM["Shared Workflow Memory"]
@@ -109,6 +109,54 @@ graph LR
     style LCH stroke:#e67e22,stroke-width:2px
 ```
 
+### Execution Planes
+
+An `AgentRun` executes on one of two planes, chosen by `spec.backend`
+(or the Agent's `spec.execution.backend`):
+
+```mermaid
+graph TB
+    CM["Controller Manager"]
+
+    subgraph K8S["backend: job (default)"]
+        JOB["Job / Sandbox CR<br/><small>agent-runner or an approved<br/>AgentRuntime harness</small>"]
+        HS["HarnessSession<br/><small>Deployment + PVC<br/>persistent chat</small>"]
+    end
+
+    subgraph CELLN["backend: celln"]
+        ROUTER["celln-router<br/><small>gateway, parent ↔ owner ledger</small>"]
+        subgraph NODES["celln-node DaemonSet · every celln.dev/kvm=true node"]
+            OWN["Owner / dispatcher<br/><small>package from a signed starter</small>"]
+            PARENT["Parent cell<br/><small>leased, live context</small>"]
+            CHILD["Child cell per turn<br/><small>borrowed tools</small>"]
+            OWN --> PARENT --> CHILD
+        end
+        ROUTER --> OWN
+    end
+
+    CM -- "creates" --> JOB
+    CM -- "creates" --> HS
+    CM -- "provisions parents<br/>POST /v1/parents/provision" --> ROUTER
+    POL[("CellnExecutionPolicy<br/>CellnRuntimeProfile<br/>ClusterCellnTool")] -. "admits" .-> CM
+    KEYS[("celln-fleet-model-credentials<br/><small>one key per backend</small>")] -. "mounted into" .-> OWN
+
+    style K8S stroke:#53354a,stroke-width:2px
+    style CELLN stroke:#0ea5e9,stroke-width:2px
+```
+
+- **Kubernetes (`job`)** — the pod path below. `task.mode: harness` or an
+  Agent's `AgentRuntime` replaces `agent-runner` with an approved,
+  digest-pinned harness; a session-capable runtime gives the Agent a
+  persistent `HarnessSession`. See [Harness Mode](modes/harness.md).
+- **Celln (`celln`)** — KVM microVMs on every node the node probe labels
+  `celln.dev/kvm=true`. One-shot runs are single-turn parents; enduring runs
+  keep a leased parent and take follow-up `AgentRunTurn`s. The controller
+  resolves policy, runtime profile, tools and model route into one decision,
+  provisions the parent through the router on the node with the most spare
+  capacity, and continues a conversation on another node if its parent is
+  lost. Model keys stay in the node dispatchers. See
+  [Celln Backend](concepts/celln-backend.md).
+
 ### Channels & Web Endpoints
 
 ```mermaid
@@ -124,7 +172,7 @@ graph LR
     end
 
     subgraph WE["Web Endpoints"]
-        GW["Envoy Gateway<br/><small>HTTPRoute per instance</small>"]
+        GW["Envoy Gateway<br/><small>HTTPRoute per Agent</small>"]
         WP["Web Proxy<br/><small>OpenAI-compat + MCP</small>"]
         GW -- "routes" --> WP
     end
@@ -135,10 +183,10 @@ graph LR
     CM -- "creates Deployment<br/>+ Service + HTTPRoute" --> WE
 
     subgraph NP["Node Probe · DaemonSet"]
-        NPD["Node Probe<br/><small>discovers Ollama, vLLM,<br/>LM Studio on nodes</small>"]
+        NPD["Node Probe<br/><small>discovers Ollama, vLLM,<br/>LM Studio on nodes;<br/>labels KVM nodes</small>"]
     end
 
-    NPD -- "annotates nodes<br/>sympozium.ai/inference-*" --> ETCD[("etcd")]
+    NPD -- "annotates nodes<br/>sympozium.ai/inference-*<br/>labels celln.dev/kvm=true" --> ETCD[("etcd")]
 
     style CH stroke:#0f3460,stroke-width:2px
     style WE stroke:#f5a623,stroke-width:2px
@@ -233,13 +281,15 @@ Agents in an Ensemble can delegate tasks to other personas using the `delegate_t
 
 1. **A message arrives** via a channel pod (Telegram, Slack, etc.) and is published to the NATS event bus.
 2. **The controller creates an AgentRun CR**, which reconciles into an ephemeral K8s Job — optional preRun lifecycle init containers, then an agent container + IPC bridge sidecar + optional sandbox + skill sidecars (with auto-provisioned RBAC). PostRun lifecycle hooks execute in a follow-up Job after the agent completes.
-3. **The agent container** calls the configured LLM provider (OpenAI, Anthropic, Azure, Ollama, LM Studio, Unsloth, or any OpenAI-compatible endpoint), with skills mounted as files, persistent memory provided by the memory sidecar (SQLite + FTS5 on a PersistentVolume), and tool sidecars providing runtime capabilities like `kubectl`. A legacy ConfigMap-based memory path is preserved as a fallback.
+3. **The agent container** calls the configured LLM provider (OpenAI, Anthropic, Azure, Ollama, LM Studio, Unsloth, or any OpenAI-compatible endpoint), with skills mounted as files, persistent memory provided by the per-Agent memory server (SQLite + FTS5 on a PersistentVolume), and tool sidecars providing runtime capabilities like `kubectl`. A legacy ConfigMap-based memory path is preserved as a fallback.
 4. **Results flow back** through the IPC bridge → NATS → channel pod → user. The controller extracts structured results and memory updates from pod logs.
-5. **Web endpoints** expose agents as HTTP APIs. When an instance has the `web-endpoint` skill, the controller creates a long-lived Deployment (serving mode) with a web-proxy sidecar. The proxy accepts OpenAI-compatible (`/v1/chat/completions`) and MCP (`/sse`, `/message`) requests, creating per-request AgentRun Jobs. An Envoy Gateway with per-instance HTTPRoutes provides external access with TLS.
+5. **Web endpoints** expose agents as HTTP APIs. When an Agent has the `web-endpoint` skill, the controller creates a long-lived Deployment (serving mode) with a web-proxy sidecar. The proxy accepts OpenAI-compatible (`/v1/chat/completions`) and MCP (`/sse`, `/message`) requests, creating per-request AgentRun Jobs. An Envoy Gateway with per-Agent HTTPRoutes provides external access with TLS.
 6. **MCP server integration** — `MCPServer` CRDs define external tool providers using the Model Context Protocol. The controller deploys managed servers (from container images) or connects to external ones, probes them for available tools, and records discovered tools in the resource status. Agent pods access MCP tools through the `mcp-bridge` skill sidecar, which translates between the agent's tool interface and MCP's SSE/stdio transport. Tool names are prefixed to avoid collisions when multiple MCP servers are active. The web UI and CLI provide full CRUD management.
-7. **Node-based inference discovery** — for local inference providers (Ollama, vLLM, llama-cpp) installed directly on host nodes, an optional node-probe DaemonSet probes localhost ports and annotates each node with discovered providers and models (`sympozium.ai/inference-*`). The API server reads these annotations, and the web wizard lets users select a node to pin their agent pods to via `nodeSelector`.
-8. **Cluster-local model inference** — `Model` CRDs declare GGUF models as Kubernetes resources. The controller downloads weights to a PVC, deploys a llama-server (OpenAI-compatible), and exposes a ClusterIP Service. AgentRuns reference models by name via `spec.model.modelRef` — no API key needed. The web UI auto-wires Ready models as provider options during instance creation.
-9. **Everything is a Kubernetes resource** — instances, runs, policies, skills, models, and schedules are all CRDs. Lifecycle is managed by controllers. Access is gated by admission webhooks. Network isolation is enforced by NetworkPolicy. The TUI and web dashboard give you full visibility into the entire system.
+7. **Node-based inference discovery** — for local inference providers (Ollama, vLLM, llama-cpp, LM Studio) installed directly on host nodes, the node-probe DaemonSet probes localhost ports and annotates each node with discovered providers and models (`sympozium.ai/inference-*`). The API server reads these annotations, and the web wizard lets users select a node to pin their agent pods to via `nodeSelector`. The same probe labels nodes with `/dev/kvm` and a kernel under `/boot` as `celln.dev/kvm=true` for Celln.
+8. **Cluster-local model inference** — `Model` CRDs declare GGUF models as Kubernetes resources. The controller downloads weights to a PVC, deploys a llama-server (OpenAI-compatible), and exposes a ClusterIP Service. AgentRuns reference models by name via `spec.model.modelRef` — no API key needed. The web UI auto-wires Ready models as provider options during Agent creation.
+9. **Hardware-isolated execution** — runs with `backend: celln` skip the pod entirely and execute in Celln microVMs on KVM nodes, either once (one-shot) or as an enduring conversation of turns; see [Execution Planes](#execution-planes).
+10. **Accelerator power** — an energy collector (ergoz, installed by default into `ergoz-system`) is discovered by label and its readings served at `GET /api/v1/power` for the density and topology views.
+11. **Everything is a Kubernetes resource** — agents, runs, harnesses, policies, skills, models, and schedules are all CRDs. Lifecycle is managed by controllers. Access is gated by admission webhooks. Network isolation is enforced by NetworkPolicy. The TUI and web dashboard give you full visibility into the entire system.
 
 <p align="center">
   <img src="assets/animations/transmission.gif" alt="An agent reaches its skills, memory, and MCP tools only through gated channels — admission, RBAC, and network policy — while a bypass attempt is denied." width="720">
@@ -253,12 +303,12 @@ Agents in an Ensemble can delegate tasks to other personas using the `delegate_t
 
 | Concern | In-process frameworks | Sympozium (Kubernetes-native) |
 |---------|----------------------|----------------------------|
-| **Agent execution** | Shared memory, single process | Ephemeral **Pod** per invocation (K8s Job) |
+| **Agent execution** | Shared memory, single process | Ephemeral **Pod** per invocation (K8s Job), or a **KVM microVM** (Celln) for one-shot and enduring runs |
 | **Orchestration** | In-process registry + lane queue | **CRD-based** registry with controller reconciliation |
 | **Sandbox isolation** | Long-lived Docker sidecar | Pod **SecurityContext** + PodSecurity admission |
 | **IPC** | In-process EventEmitter | Filesystem sidecar + **NATS JetStream** |
 | **Tool/feature gating** | In-process pipeline | **Admission webhooks** + `SympoziumPolicy` CRD |
-| **Persistent memory** | Files on disk | **SQLite + FTS5** on PersistentVolume via memory sidecar (ConfigMap legacy fallback) |
+| **Persistent memory** | Files on disk | **SQLite + FTS5** on PersistentVolume via a per-Agent memory server (ConfigMap legacy fallback) |
 | **Scheduled tasks** | Cron jobs / external scripts | **SympoziumSchedule CRD** with cron controller |
 | **State** | SQLite + flat files | **etcd** (CRDs) + PostgreSQL + object storage |
 | **Multi-tenancy** | Single-instance file lock | **Namespaced CRDs**, RBAC, NetworkPolicy |
@@ -278,14 +328,15 @@ Agents in an Ensemble can delegate tasks to other personas using the `delegate_t
 | **NATS JetStream** | StatefulSet | Durable pub/sub with replay — channels and control plane communicate without direct coupling |
 | **NetworkPolicy isolation** | NetworkPolicy | Agent pods get deny-all egress; only the IPC bridge connects to the event bus — agents cannot reach the internet or other pods |
 | **Policy-as-CRD** | Admission Webhook | `SympoziumPolicy` resources gate tools, sandboxes, and features — enforced at admission time, not at runtime |
-| **Memory-as-SQLite** | PersistentVolume + sidecar | Persistent agent memory uses SQLite with FTS5 full-text search on a PVC — supports semantic search via `memory_search`, tagging via `memory_store`, and is upgradeable to vector search. Legacy ConfigMap fallback preserved for migration |
+| **Memory-as-SQLite** | PersistentVolume + Deployment per Agent | Persistent agent memory uses SQLite with FTS5 full-text search on a PVC — supports semantic search via `memory_search`, tagging via `memory_store`, and is upgradeable to vector search. Legacy ConfigMap fallback preserved for migration |
 | **Shared Workflow Memory** | PVC + Deployment + Service per Ensemble | Pack-level shared memory pool enables cross-persona knowledge sharing. Same `skill-memory` binary, separate PVC. Per-persona access control (read-write / read-only) enforced client-side. Auto-tagged with source persona for attribution |
 | **Schedule-as-CRD** | CronJob analogy | `SympoziumSchedule` resources define recurring tasks with cron expressions — the controller creates AgentRuns, not the user |
 | **Skills-as-ConfigMap** | ConfigMap volume | SkillPacks generate ConfigMaps mounted into agent pods — portable, versionable, namespace-scoped |
 | **Skill sidecars with auto-RBAC** | Role / ClusterRole | SkillPacks can declare sidecar containers with RBAC rules — the controller injects the container and provisions ephemeral, least-privilege RBAC per run |
 | **Ensembles** | Operator Bundle | Pre-configured agent bundles — the controller stamps out Agents, Schedules, and memory ConfigMaps. Activating a pack is a single TUI action |
 | **MCP servers as CRD** | Deployment + Service | `MCPServer` resources declare external tool providers — the controller manages deployment lifecycle, probes for tools, and the bridge sidecar translates MCP protocol to agent tool calls. Prefixed tool names prevent collisions across providers |
-| **Node probe DaemonSet** | DaemonSet | Discovers host-installed inference providers (Ollama, vLLM) by probing localhost ports — annotates nodes so the control plane can offer model selection and node pinning without manual configuration |
+| **Node probe DaemonSet** | DaemonSet | Discovers host-installed inference providers (Ollama, vLLM, llama-cpp, LM Studio) by probing localhost ports — annotates nodes so the control plane can offer model selection and node pinning without manual configuration — and labels KVM-capable nodes for Celln |
+| **Celln fleet** | DaemonSet + Deployment | One Celln owner per labelled KVM node, a router that binds each parent to its owner, and cluster-scoped, immutable policy/profile/tool objects — hardware isolation with no per-node or per-namespace ceremony |
 | **llmfit DaemonSet** | DaemonSet | Runs on every node, continuously reporting hardware specs (RAM, CPU, GPU VRAM) and model density scores. The controller and API server poll each pod to build a FitnessCache that powers instant model placement, the Model Density UI, Prometheus metrics, GPU-aware scheduling, and density API endpoints |
 
 ---
@@ -299,41 +350,43 @@ sympozium/
 │   ├── agent-runner/       # LLM agent runner (runs inside agent pods)
 │   ├── controller/         # Controller manager (reconciles all CRDs)
 │   ├── apiserver/          # HTTP + WebSocket API server (+ embedded web UI)
-│   ├── ipc-bridge/         # IPC bridge sidecar (fsnotify → NATS)
-│   ├── memory-server/      # Memory sidecar (SQLite + FTS5 persistent memory)
-│   ├── web-proxy/          # Web proxy (OpenAI-compat API + MCP gateway)
 │   ├── webhook/            # Admission webhook (policy enforcement)
-│   ├── node-probe/         # Node probe DaemonSet (inference provider discovery)
+│   ├── ipc-bridge/         # IPC bridge sidecar (fsnotify → NATS)
+│   ├── memory-server/      # Memory server (SQLite + FTS5 persistent memory)
+│   ├── mcp-bridge/         # MCP bridge sidecar
+│   ├── web-proxy/          # Web proxy (OpenAI-compat API + MCP gateway)
+│   ├── node-probe/         # Node probe DaemonSet (inference discovery, KVM labels)
+│   ├── model-gateway/      # Celln model gateway (opt-in, qualification)
+│   ├── celln-*/            # Celln parent proxy, scoped controller, review/evidence tools
 │   └── sympozium/          # CLI + interactive TUI
-├── images/
-│   ├── llmfit-daemon/      # llmfit DaemonSet (hardware density telemetry)
-├── web/                    # Web dashboard (React + TypeScript + Vite)
 ├── internal/               # Internal packages
-│   ├── controller/         # Kubernetes controllers (6 reconcilers)
+│   ├── controller/         # Kubernetes controllers and routers (channel, schedule, spawn)
 │   ├── orchestrator/       # Agent pod builder & spawner
 │   ├── apiserver/          # API server handlers
-│   ├── mcpbridge/          # MCP bridge sidecar (SSE/stdio adapter)
+│   ├── webhook/            # Policy enforcement webhooks
+│   ├── celln*/             # Celln clients, authority, platform, parent and install logic
+│   ├── modelconnection/    # ModelConnection resolution
+│   ├── collector/          # Energy collector discovery
+│   ├── mcpbridge/          # MCP bridge (SSE/stdio adapter)
 │   ├── eventbus/           # NATS JetStream event bus
 │   ├── ipc/                # IPC bridge (fsnotify + NATS)
-│   ├── webhook/            # Policy enforcement webhooks
 │   ├── webproxy/           # Web proxy handlers (OpenAI, MCP, rate limiting)
 │   ├── session/            # Session persistence (PostgreSQL)
 │   └── channel/            # Channel base types
-├── channels/               # Channel pod implementations
+├── channels/               # Channel pod implementations (Telegram, Slack, Discord, WhatsApp)
+├── web/                    # Web dashboard (React + TypeScript + Vite)
 ├── images/                 # Dockerfiles for all components
-├── config/                 # Kubernetes manifests
-│   ├── crd/bases/          # CRD YAML definitions
-│   ├── manager/            # Controller deployment
-│   ├── rbac/               # ClusterRole, bindings
-│   ├── webhook/            # Webhook configuration
-│   ├── network/            # NetworkPolicy for agent isolation
-│   ├── nats/               # NATS JetStream deployment
-│   ├── cert/               # TLS certificate resources
-│   ├── personas/           # Built-in Ensemble definitions
+├── charts/                 # Helm charts (sympozium, sympozium-crds, vendored ergoz)
+├── config/
+│   ├── crd/bases/          # Generated CRD YAML
+│   ├── agent-configs/      # Built-in Ensemble definitions
 │   ├── skills/             # Built-in SkillPack definitions
 │   ├── policies/           # Default SympoziumPolicy presets
-│   └── samples/            # Example CRs
+│   ├── samples/            # Example CRs
+│   ├── celln/, ergoz/      # Pinned Celln and ergoz releases
+│   └── host/               # systemd units for host-side Celln components
 ├── migrations/             # PostgreSQL schema migrations
+├── test/integration/       # Kind-based integration journeys
 ├── docs/                   # Documentation (this site)
 ├── Makefile
 └── README.md

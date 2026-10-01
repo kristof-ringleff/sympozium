@@ -27,19 +27,21 @@ borrowed Celln tools. The native starter rejects run-level SkillPacks and does
 not provide arbitrary MCP, shell, Python or Kubernetes administration. A skill
 may itself assume pod credentials or a sidecar; copying its text is not parity.
 
-The native starter offers explicitly selected, reviewed revisions of:
+The Celln fleet lends explicitly selected, reviewed revisions of two kinds of
+tool (see [the toolbox](../guides/celln-fleet-installation.md#the-toolbox)):
 
-- `workspace-read`, `workspace-list`, `workspace-search`: bounded logical
-  files belonging to the live run, read, listed and searched (exact substring).
-- `workspace-write`, `workspace-append`, `workspace-delete`: bounded,
-  revision-checked changes to those files.
-- `https-fetch`: bounded host-brokered HTTPS GET to approved destinations.
-- `https-post-json`: a JSON object posted, with no credential, to approved
-  destinations. The fleet installer's `--celln-fleet-https-host` list names
-  them (the reviewed default permits `example.com`).
+- **Brokered tools**, eight of them:
+  `workspace-read`, `workspace-list`, `workspace-search` (exact substring),
+  `workspace-write`, `workspace-append`, `workspace-delete` over bounded,
+  revision-checked files belonging to the live run; `https-fetch` (GET) and
+  `https-post-json` (a JSON object, no credential) to the scope's approved
+  hosts (`--celln-fleet-https-host`, default `example.com`).
+- **Borrowed commands** taken from digest-pinned images (busybox's grep, sed,
+  awk, sort, …, and jq), called with validated arguments and no shell. Each
+  `ClusterCellnTool` names its source image in `spec.sourceImage`.
 
 These are not arbitrary host filesystem access or unrestricted shell commands.
-The operator, runtime and agent grants must all permit access. A permission
+The policy, runtime and agent grants must all permit access. A permission
 preview explains grants; it neither issues authority nor proves execution
 readiness. Tool selection is fixed for a live native parent.
 
@@ -47,10 +49,17 @@ readiness. Tool selection is fixed for a live native parent.
 
 Native Celln uses `AgentRun.spec.executionLifecycle: enduring`: one leased parent
 cell and a disposable child (sub-cell) per turn. A child is a separate cell,
-not an AI sub-agent or nested VM. Context is currently approximately 2 KiB.
-Run-owned files and live context disappear with the parent; checkpoint/resume
-after parent or host loss is not supported. Controller/API restarts do not
-themselves destroy the host parent. Saved history is not a restorable VM.
+not an AI sub-agent or nested VM. Live context is bounded by the starter package (`spec.limits.taskBytes`, about 16 KiB on a current package).
+Run-owned files and live context belong to the parent; controller/API restarts
+do not destroy it.
+
+When a parent is lost with its node (or its owner is replaced), the run
+reports `ContextLost` and the controller creates a **continuation**: a new run
+seeded with the conversation's committed exchanges, placed on any node with
+capacity (`spec.conversation`, `status.cellnParent.continuedBy`; **Restart
+elsewhere** in the UI). This carries the conversation forward, not the VM:
+workspace files, tool output and failed turns are not restored. See
+[Conversations survive their node](celln-backend.md#conversations-survive-their-node).
 
 Existing OCI `HarnessSession` chat is different. Supported adapters may retain
 state on a PVC and implement stop/resume; that does not transfer to Celln.
@@ -62,11 +71,12 @@ no model or harness at all.
 Choose a runtime compatible with the backend. Native YAML selects the runtime
 and tool revisions in `cellnSelection`, and lifecycle/ceilings in
 `executionLifecycle` and `enduring`. The operator template must match the
-persona, model, tools and limits. See
-[native installation](../guides/celln-native-installation.md).
+persona, model, tools and limits. On the fleet, each namespace gets these
+wrappers on first use; see
+[Celln Fleet Installation](../guides/celln-fleet-installation.md).
 
 The run form blocks native selection for an Agent with SkillPacks. The API and
 admission webhook also reject SkillPacks and Agent MCP connections explicitly;
-use the dedicated installed native starter Agent. Incompatible selections must
-not silently drop skills or switch backends. Full installed
-acceptance is still being qualified; this is not a capability-parity claim.
+use a backend's wrapper Agent (`celln-agent`, `celln-agent-<backend>`).
+Incompatible selections must not silently drop skills or switch backends; this
+is not a capability-parity claim.

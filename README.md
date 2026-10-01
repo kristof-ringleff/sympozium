@@ -201,7 +201,7 @@ make test        # run tests
 make test-system # run envtest system tests (no cluster needed)
 make lint        # run linter
 make manifests   # generate CRD manifests
-make run         # run controller locally (needs kubeconfig)
+make run-controller # run controller locally (needs kubeconfig)
 ```
 
 ## License
