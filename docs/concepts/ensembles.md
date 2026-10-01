@@ -225,7 +225,7 @@ Each persona can be granted `read-write` or `read-only` access via `accessRules`
 - **read-write**: Can search, list, and store entries
 - **read-only**: Can search and list, but cannot store, update or forget (those tools are not registered)
 
-Access control is enforced client-side in the agent runner — sufficient because the memory server is in-cluster behind a ClusterIP with no untrusted clients.
+The shared memory server enforces write access itself. Writes need its writer token, and only read-write personas' agent-runner containers receive it; read-only personas, skill sidecars and other pods do not. Reads are not authenticated. See [Persistent Memory — Write access](persistent-memory.md#write-access).
 
 ## Synthetic Membrane
 

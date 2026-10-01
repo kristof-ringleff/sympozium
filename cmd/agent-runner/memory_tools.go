@@ -43,6 +43,20 @@ func isMemoryTool(name string) bool {
 // Set from MEMORY_SERVER_URL env var at startup.
 var memoryServerURL string
 
+// memoryWriterToken authenticates writes to the memory server. Set from
+// MEMORY_WRITER_TOKEN at startup. The controller injects it into this
+// container only, never into skill sidecars. It must never be logged or
+// written under /ipc, which sidecars and read_file can read.
+var memoryWriterToken string
+
+// setMemoryAuth adds the writer token to a request for a memory server. It is
+// sent on reads as well as writes; the server only checks it on writes.
+func setMemoryAuth(req *http.Request, token string) {
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+}
+
 // memoryHTTPClient is a shared HTTP client with reasonable timeouts. The
 // otelhttp transport injects the W3C traceparent header into every request and
 // emits a client span per call, so memory reads/writes appear as spans nested
@@ -316,6 +330,7 @@ func memoryPost(ctx context.Context, path string, body any) (*http.Response, err
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	setMemoryAuth(req, memoryWriterToken)
 	return memoryHTTPClient.Do(req)
 }
 
@@ -333,6 +348,7 @@ func memoryGet(ctx context.Context, path string, args map[string]any) (*http.Res
 	if err != nil {
 		return nil, err
 	}
+	setMemoryAuth(req, memoryWriterToken)
 	return memoryHTTPClient.Do(req)
 }
 
@@ -427,6 +443,7 @@ func queryMemoryContext(parent context.Context, task string, maxResults int) str
 		return ""
 	}
 	req.Header.Set("Content-Type", "application/json")
+	setMemoryAuth(req, memoryWriterToken)
 
 	resp, err := memoryHTTPClient.Do(req)
 	if err != nil {
@@ -534,6 +551,7 @@ func initMemoryTools() []ToolDef {
 	}
 	// Strip trailing slash.
 	memoryServerURL = strings.TrimRight(memoryServerURL, "/")
+	memoryWriterToken = os.Getenv("MEMORY_WRITER_TOKEN")
 
 	log.Printf("Memory server configured: %s", memoryServerURL)
 	return memoryToolDefs()
@@ -572,6 +590,11 @@ func isWorkflowMemoryTool(name string) bool {
 
 // workflowMemoryServerURL is the HTTP endpoint of the shared pack-level memory server.
 var workflowMemoryServerURL string
+
+// workflowMemoryWriterToken authenticates writes to the shared memory server.
+// Set from WORKFLOW_MEMORY_WRITER_TOKEN at startup; the controller only
+// injects it for read-write personas. Same handling rules as memoryWriterToken.
+var workflowMemoryWriterToken string
 
 // workflowMemoryAccess is the access mode for this persona ("read-write" or "read-only").
 var workflowMemoryAccess string
@@ -874,6 +897,7 @@ func workflowMemoryPost(ctx context.Context, path string, body any) (*http.Respo
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	setMemoryAuth(req, workflowMemoryWriterToken)
 	return memoryHTTPClient.Do(req)
 }
 
@@ -904,6 +928,7 @@ func workflowMemoryGet(ctx context.Context, path string, args map[string]any) (*
 	if err != nil {
 		return nil, err
 	}
+	setMemoryAuth(req, workflowMemoryWriterToken)
 	return memoryHTTPClient.Do(req)
 }
 
@@ -942,6 +967,7 @@ func queryWorkflowMemoryContext(parent context.Context, task string, maxResults 
 		return ""
 	}
 	req.Header.Set("Content-Type", "application/json")
+	setMemoryAuth(req, workflowMemoryWriterToken)
 
 	resp, err := memoryHTTPClient.Do(req)
 	if err != nil {
@@ -1004,6 +1030,7 @@ func initWorkflowMemoryTools() []ToolDef {
 		return nil
 	}
 	workflowMemoryServerURL = strings.TrimRight(workflowMemoryServerURL, "/")
+	workflowMemoryWriterToken = os.Getenv("WORKFLOW_MEMORY_WRITER_TOKEN")
 	workflowMemoryAccess = os.Getenv("WORKFLOW_MEMORY_ACCESS")
 	if workflowMemoryAccess == "" {
 		workflowMemoryAccess = "read-write"

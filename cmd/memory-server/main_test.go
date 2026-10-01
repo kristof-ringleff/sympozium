@@ -6,9 +6,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
+	"slices"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -28,20 +33,8 @@ func openTestDB(t *testing.T) *sql.DB {
 
 func seedTestDB(t *testing.T, db *sql.DB) {
 	t.Helper()
-	if err := initSchema(db); err != nil {
-		t.Fatalf("initSchema: %v", err)
-	}
-	if err := migrateMembraneColumns(db); err != nil {
-		t.Fatalf("migrateMembraneColumns: %v", err)
-	}
-	if err := migrateEvidenceColumn(db); err != nil {
-		t.Fatalf("migrateEvidenceColumn: %v", err)
-	}
-	if err := migrateVersionedSchema(db); err != nil {
-		t.Fatalf("migrateVersionedSchema: %v", err)
-	}
-	if err := ensureSearchIndex(db); err != nil {
-		t.Fatalf("ensureSearchIndex: %v", err)
+	if err := migrateSchema(db); err != nil {
+		t.Fatalf("migrateSchema: %v", err)
 	}
 }
 
@@ -1884,4 +1877,724 @@ func TestAppendVersion_RefreshesCreatedAt(t *testing.T) {
 	if hits, _ := searchMemories(db, "deploy", 5, "", nil, nil, "24h", ""); len(hits) != 1 {
 		t.Errorf("updated entry should pass max_age, got %d hits", len(hits))
 	}
+}
+
+// ── Upgrade path: behaviour, scale and rollback backup ──────────────────────
+
+// insertLegacyMembraneRows adds rows to the legacy fixture that use every
+// column the older migrations added: non-default visibility, source_agent and
+// evidence, a parent link, and recent as well as old timestamps. The ids
+// continue from legacySchemaSQL: 4, 5, 6 and 7.
+func insertLegacyMembraneRows(t *testing.T, db *sql.DB) {
+	t.Helper()
+	now := time.Now().UTC().Format(time.RFC3339)
+	for _, r := range []struct {
+		content, tags, visibility, source, evidence, created string
+		parent, seq                                          int64
+	}{
+		{"alpha public incident", "incident,db", "public", "alpha", `{"kind":"tool_result","tool_call":"kubectl get pods"}`, now, 0, 10},
+		{"alpha private incident", "incident", "private", "alpha", `{"kind":"agent_opinion"}`, now, 0, 11},
+		{"beta trusted incident", "incident", "trusted", "beta", `{"kind":"external_source","source":"https://status.example"}`, now, 4, 12},
+		{"gamma old incident", "incident", "public", "gamma", "", "2020-01-01T00:00:00Z", 0, 13},
+	} {
+		if _, err := db.Exec(`
+			INSERT INTO memories (content, tags, visibility, source_agent, evidence, parent_id, seq, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`, r.content, r.tags, r.visibility, r.source, r.evidence, r.parent, r.seq, r.created, r.created); err != nil {
+			t.Fatalf("insert legacy row %q: %v", r.content, err)
+		}
+	}
+}
+
+// sortedIDs returns the entry ids in ascending order, for comparing result
+// sets whose order is rank-dependent.
+func sortedIDs(entries []memoryEntry) []int64 {
+	ids := make([]int64, len(entries))
+	for i, e := range entries {
+		ids[i] = e.ID
+	}
+	slices.Sort(ids)
+	return ids
+}
+
+// TestMigrateVersionedSchema_PreservesBehaviour migrates a legacy store whose
+// rows carry visibility, source_agent and evidence, then checks that search,
+// list, provenance, time decay and stats behave as they did before.
+func TestMigrateVersionedSchema_PreservesBehaviour(t *testing.T) {
+	db := openTestDB(t)
+	if _, err := db.Exec(legacySchemaSQL); err != nil {
+		t.Fatalf("create legacy schema: %v", err)
+	}
+	insertLegacyMembraneRows(t, db)
+	seedTestDB(t, db)
+
+	search := func(caller string, peers []string, maxAge, minKind string) []int64 {
+		t.Helper()
+		hits, err := searchMemories(db, "incident", 20, caller, peers, nil, maxAge, minKind)
+		if err != nil {
+			t.Fatalf("search: %v", err)
+		}
+		return sortedIDs(hits)
+	}
+	list := func(tags, caller, source string) []int64 {
+		t.Helper()
+		entries, err := listMemories(db, tags, 20, caller, nil, "", "", source)
+		if err != nil {
+			t.Fatalf("list: %v", err)
+		}
+		return sortedIDs(entries)
+	}
+
+	for name, tc := range map[string]struct {
+		got, want []int64
+	}{
+		// Visibility: public, trusted from trust peers, and the caller's own.
+		"search, no membrane":           {search("", nil, "", ""), []int64{4, 5, 6, 7}},
+		"search as alpha":               {search("alpha", nil, "", ""), []int64{4, 5, 7}},
+		"search as alpha trusting beta": {search("alpha", []string{"beta"}, "", ""), []int64{4, 5, 6, 7}},
+		"search as beta":                {search("beta", nil, "", ""), []int64{4, 6, 7}},
+		"search with max_age 24h":       {search("alpha", []string{"beta"}, "24h", ""), []int64{4, 5, 6}},
+		"search with min_kind":          {search("alpha", []string{"beta"}, "", "external_source"), []int64{4, 6, 7}},
+		"list by tag":                   {list("db", "", ""), []int64{4}},
+		"list by source_agent":          {list("", "", "alpha"), []int64{4, 5}},
+		"list as alpha":                 {list("", "alpha", ""), []int64{1, 3, 4, 5, 7}},
+		"list as beta":                  {list("", "beta", ""), []int64{1, 3, 4, 6, 7}},
+	} {
+		if !slices.Equal(tc.got, tc.want) {
+			t.Errorf("%s: ids = %v, want %v", name, tc.got, tc.want)
+		}
+	}
+
+	// Provenance chains keep their parent links, root first.
+	for id, want := range map[int64][]int64{6: {4, 6}, 3: {1, 3}} {
+		chain, err := getProvenanceChain(db, id)
+		if err != nil {
+			t.Fatalf("provenance %d: %v", id, err)
+		}
+		if got := listIDs(t, chain); !slices.Equal(got, want) {
+			t.Errorf("provenance %d = %v, want %v", id, got, want)
+		}
+	}
+
+	// Evidence, visibility and source_agent survive the copy.
+	e, _, _ := getMemoryByID(db, 4)
+	if e.Evidence == nil || e.Evidence.Kind != "tool_result" || e.Evidence.ToolCall != "kubectl get pods" || e.SourceAgent != "alpha" {
+		t.Errorf("migrated entry 4 = %+v, want alpha's tool_result evidence", e)
+	}
+	if e, _, _ := getMemoryByID(db, 6); e.Visibility != "trusted" || e.ParentID != 4 || e.Evidence == nil || e.Evidence.Source != "https://status.example" {
+		t.Errorf("migrated entry 6 = %+v, want trusted, parent 4, external_source evidence", e)
+	}
+
+	// Stats count one row per (source_agent, visibility) as before.
+	w := httptest.NewRecorder()
+	statsHandler(db)(w, httptest.NewRequest("GET", "/stats", nil))
+	var resp struct {
+		Content struct {
+			ByAgentVisibility []struct {
+				SourceAgent string `json:"source_agent"`
+				Visibility  string `json:"visibility"`
+				Count       int    `json:"count"`
+			} `json:"by_agent_visibility"`
+		} `json:"content"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("parse stats: %v", err)
+	}
+	gotStats := map[string]int{}
+	for _, s := range resp.Content.ByAgentVisibility {
+		gotStats[s.SourceAgent+"/"+s.Visibility] = s.Count
+	}
+	wantStats := map[string]int{"/public": 2, "alpha/public": 1, "alpha/private": 1, "beta/trusted": 1, "gamma/public": 1}
+	if fmt.Sprint(gotStats) != fmt.Sprint(wantStats) {
+		t.Errorf("stats = %v, want %v", gotStats, wantStats)
+	}
+	assertFTSIntegrity(t, db)
+}
+
+// snapshotRows returns every row of memories with the columns a legacy row
+// has, ordered by id, so a store can be compared before and after migration.
+func snapshotRows(t *testing.T, db *sql.DB) []string {
+	t.Helper()
+	rows, err := db.Query(`
+		SELECT id, content, tags, visibility, source_agent, parent_id, seq, evidence, created_at, updated_at
+		FROM memories ORDER BY id
+	`)
+	if err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var id, parent, seq int64
+		var content, tags, vis, source, evidence, created, updated string
+		if err := rows.Scan(&id, &content, &tags, &vis, &source, &parent, &seq, &evidence, &created, &updated); err != nil {
+			t.Fatalf("snapshot scan: %v", err)
+		}
+		out = append(out, fmt.Sprintf("%d|%s|%s|%s|%s|%d|%d|%s|%s|%s", id, content, tags, vis, source, parent, seq, evidence, created, updated))
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("snapshot rows: %v", err)
+	}
+	return out
+}
+
+// TestMigrateVersionedSchema_ManyRows migrates a legacy store with thousands
+// of rows and id gaps, and checks that every row and column is copied and the
+// search index covers every row, so a partial copy cannot pass quietly.
+func TestMigrateVersionedSchema_ManyRows(t *testing.T) {
+	db := openTestDB(t)
+	if _, err := db.Exec(legacySchemaSQL); err != nil {
+		t.Fatalf("create legacy schema: %v", err)
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	visibilities := []string{"public", "trusted", "private"}
+	for i := 0; i < 2000; i++ {
+		evidence := ""
+		if i%2 == 0 {
+			evidence = fmt.Sprintf(`{"kind":"tool_result","tool_call":"probe %d"}`, i)
+		}
+		ts := time.Date(2026, 1, 1, 0, 0, i, 0, time.UTC).Format(time.RFC3339)
+		if _, err := tx.Exec(`
+			INSERT INTO memories (content, tags, visibility, source_agent, parent_id, seq, evidence, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`, fmt.Sprintf("bulk widget note %d", i), fmt.Sprintf("bulk,t%d", i%5), visibilities[i%3],
+			fmt.Sprintf("agent-%d", i%4), int64(i%10), int64(i+100), evidence, ts, ts); err != nil {
+			t.Fatalf("insert row %d: %v", i, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	if _, err := db.Exec(`DELETE FROM memories WHERE id % 7 = 0`); err != nil {
+		t.Fatalf("delete rows: %v", err)
+	}
+
+	before := snapshotRows(t, db)
+	var bulk int
+	db.QueryRow(`SELECT COUNT(*) FROM memories WHERE content LIKE 'bulk widget note %'`).Scan(&bulk)
+
+	seedTestDB(t, db)
+
+	after := snapshotRows(t, db)
+	if len(after) != len(before) {
+		t.Fatalf("row count %d after migration, want %d", len(after), len(before))
+	}
+	for i := range before {
+		if after[i] != before[i] {
+			t.Fatalf("row %d changed in migration:\nbefore %s\nafter  %s", i, before[i], after[i])
+		}
+	}
+	if got := len(ftsVersionIDs(t, db, "widget")); got != bulk {
+		t.Errorf("search index holds %d bulk rows, want %d", got, bulk)
+	}
+	assertFTSIntegrity(t, db)
+}
+
+// createLegacyDBFile writes the legacy fixture to a database file and returns
+// its rows.
+func createLegacyDBFile(t *testing.T, path string) []string {
+	t.Helper()
+	legacy, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open legacy db: %v", err)
+	}
+	defer legacy.Close()
+	if _, err := legacy.Exec(legacySchemaSQL); err != nil {
+		t.Fatalf("create legacy schema: %v", err)
+	}
+	insertLegacyMembraneRows(t, legacy)
+	return snapshotRows(t, legacy)
+}
+
+// ── Upgrade by copy: the old database is never written ──────────────────────
+
+func readFile(t *testing.T, path string) []byte {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	return b
+}
+
+// dirFiles returns the file names in dir, sorted.
+func dirFiles(t *testing.T, dir string) []string {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read dir: %v", err)
+	}
+	var names []string
+	for _, e := range entries {
+		names = append(names, e.Name())
+	}
+	slices.Sort(names)
+	return names
+}
+
+// captureLog sends the standard logger to a buffer for the rest of the test.
+func captureLog(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	var buf bytes.Buffer
+	old := log.Writer()
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(old) })
+	return &buf
+}
+
+// legacyCount counts rows in the legacy database at path whose content
+// matches like, opening it the way an older memory server does.
+func legacyCount(t *testing.T, path, like string) int {
+	t.Helper()
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open legacy db: %v", err)
+	}
+	defer db.Close()
+	var n int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM memories WHERE content LIKE ?`, like).Scan(&n); err != nil {
+		t.Fatalf("count legacy rows: %v", err)
+	}
+	return n
+}
+
+func TestVersionedDBPath(t *testing.T) {
+	for in, want := range map[string]string{
+		"/data/memory.db": "/data/memory.v2.db",
+		"/data/memory":    "/data/memory.v2",
+		"mem.sqlite":      "mem.v2.sqlite",
+	} {
+		if got := versionedDBPath(in); got != want {
+			t.Errorf("versionedDBPath(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// TestOpenDB_CopiesLegacyAndLeavesItUntouched is the rollback guarantee: the
+// upgrade works on a migrated copy, and the old database stays byte for byte
+// what an older memory server needs, so `helm rollback` needs no restore.
+func TestOpenDB_CopiesLegacyAndLeavesItUntouched(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "memory.db")
+	before := createLegacyDBFile(t, path)
+	legacyBytes := readFile(t, path)
+
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+	if got := snapshotRows(t, db); !slices.Equal(got, before) {
+		t.Fatalf("copied rows differ from the legacy rows:\ngot  %v\nwant %v", got, before)
+	}
+	storeDefault(t, db, "written after the upgrade", nil)
+	db.Close()
+
+	if !bytes.Equal(readFile(t, path), legacyBytes) {
+		t.Error("the upgrade changed the legacy database file")
+	}
+	if files := dirFiles(t, dir); !slices.Equal(files, []string{"memory.db", "memory.v2.db"}) {
+		t.Errorf("files after upgrade = %v, want [memory.db memory.v2.db]", files)
+	}
+
+	// After a rollback, the older server works on the legacy file as before:
+	// it inserts without an id and its own triggers index the row.
+	legacy, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open legacy db: %v", err)
+	}
+	defer legacy.Close()
+	if _, err := legacy.Exec(`
+		INSERT INTO memories (content, tags, created_at, updated_at)
+		VALUES ('stored after rollback', '', '2026-10-01T00:00:00Z', '2026-10-01T00:00:00Z')
+	`); err != nil {
+		t.Fatalf("legacy insert after rollback: %v", err)
+	}
+	for term, want := range map[string]int{"rollback": 1, "incident": 4, "upgrade": 0} {
+		var n int
+		legacy.QueryRow(`SELECT COUNT(*) FROM memories_fts WHERE memories_fts MATCH ?`, term).Scan(&n)
+		if n != want {
+			t.Errorf("legacy search %q after rollback = %d hits, want %d", term, n, want)
+		}
+	}
+}
+
+// TestOpenDB_CopyIncludesUncheckpointedWAL covers an older server that was
+// killed: some of its writes are still only in memory.db-wal. The copy must
+// include them, and must still leave the legacy files unchanged.
+func TestOpenDB_CopyIncludesUncheckpointedWAL(t *testing.T) {
+	live := filepath.Join(t.TempDir(), "memory.db")
+	w, err := sql.Open("sqlite", live+"?_pragma=journal_mode(wal)")
+	if err != nil {
+		t.Fatalf("open live db: %v", err)
+	}
+	for _, stmt := range []string{legacySchemaSQL, `PRAGMA wal_autocheckpoint = 0`,
+		`INSERT INTO memories (content, tags, created_at, updated_at) VALUES ('only in the wal', '', 'x', 'x')`} {
+		if _, err := w.Exec(stmt); err != nil {
+			t.Fatalf("prepare live db: %v", err)
+		}
+	}
+	// Copy the files while the connection is open: that is what a killed
+	// server leaves on the volume.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "memory.db")
+	for _, suffix := range []string{"", "-wal", "-shm"} {
+		if err := os.WriteFile(path+suffix, readFile(t, live+suffix), 0o600); err != nil {
+			t.Fatalf("copy %s: %v", suffix, err)
+		}
+	}
+	w.Close()
+	walBytes := readFile(t, path+"-wal")
+
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+	defer db.Close()
+	if hits, _ := searchMemories(db, "wal", 5, "", nil, nil, "", ""); len(hits) != 1 {
+		t.Errorf("copy has %d rows from the WAL, want 1", len(hits))
+	}
+	if !bytes.Equal(readFile(t, path+"-wal"), walBytes) {
+		t.Error("the upgrade changed the legacy WAL file")
+	}
+}
+
+// TestOpenDB_KeepsExistingVersionedDB checks that a restart uses the
+// versioned database as it is, and never copies the legacy one again.
+func TestOpenDB_KeepsExistingVersionedDB(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "memory.db")
+	createLegacyDBFile(t, path)
+
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+	storeDefault(t, db, "written by the new server", nil)
+	db.Close()
+
+	db, err = openDB(path)
+	if err != nil {
+		t.Fatalf("second openDB: %v", err)
+	}
+	defer db.Close()
+	if hits, _ := searchMemories(db, "server", 5, "", nil, nil, "", ""); len(hits) != 1 {
+		t.Errorf("the restart lost a write made after the upgrade (hits = %d)", len(hits))
+	}
+	var copies int
+	db.QueryRow(`SELECT COUNT(*) FROM copied_from`).Scan(&copies)
+	if copies != 1 {
+		t.Errorf("copied_from has %d rows, want 1", copies)
+	}
+}
+
+// TestOpenDB_DiscardsPartialCopy covers a start that was interrupted while
+// copying: the leftover .tmp file is thrown away and the copy starts over.
+func TestOpenDB_DiscardsPartialCopy(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "memory.db")
+	before := createLegacyDBFile(t, path)
+	for _, name := range []string{"memory.v2.db.tmp", "memory.v2.db.tmp-journal"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("half a copy"), 0o600); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+	defer db.Close()
+	if got := snapshotRows(t, db); !slices.Equal(got, before) {
+		t.Errorf("rows after restarting the copy differ from the legacy rows")
+	}
+	for _, name := range dirFiles(t, dir) {
+		if strings.Contains(name, ".tmp") {
+			t.Errorf("partial copy %s was not removed", name)
+		}
+	}
+}
+
+// TestOpenDB_FailedCopyLeavesNoVersionedDB checks that a copy that fails
+// (here: the legacy file is not a database) leaves neither memory.v2.db nor a
+// .tmp file, and does not touch the legacy file.
+func TestOpenDB_FailedCopyLeavesNoVersionedDB(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "memory.db")
+	garbage := bytes.Repeat([]byte("not a sqlite database "), 300)
+	if err := os.WriteFile(path, garbage, 0o600); err != nil {
+		t.Fatalf("write legacy file: %v", err)
+	}
+
+	if db, err := openDB(path); err == nil {
+		db.Close()
+		t.Fatal("openDB succeeded on a corrupt legacy database")
+	}
+	if files := dirFiles(t, dir); !slices.Equal(files, []string{"memory.db"}) {
+		t.Errorf("files after a failed copy = %v, want only [memory.db]", files)
+	}
+	if !bytes.Equal(readFile(t, path), garbage) {
+		t.Error("a failed copy changed the legacy file")
+	}
+}
+
+// TestOpenDB_WarnsWhenLegacyChangedAfterCopy covers upgrading again after a
+// rollback: the older server wrote to memory.db in between. The new server
+// keeps its own data, does not merge, and says so in its log.
+func TestOpenDB_WarnsWhenLegacyChangedAfterCopy(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "memory.db")
+	createLegacyDBFile(t, path)
+
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+	db.Close()
+
+	logs := captureLog(t)
+	db, err = openDB(path)
+	if err != nil {
+		t.Fatalf("restart: %v", err)
+	}
+	db.Close()
+	if strings.Contains(logs.String(), "WARNING") {
+		t.Fatalf("warned although memory.db did not change:\n%s", logs)
+	}
+
+	// Rollback: the older server stores an entry in memory.db.
+	legacy, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open legacy db: %v", err)
+	}
+	if _, err := legacy.Exec(`
+		INSERT INTO memories (content, tags, created_at, updated_at)
+		VALUES ('stored during the rollback', '', '2026-10-02T00:00:00Z', '2026-10-02T00:00:00Z')
+	`); err != nil {
+		t.Fatalf("legacy insert: %v", err)
+	}
+	legacy.Close()
+
+	// Upgrade again.
+	logs.Reset()
+	db, err = openDB(path)
+	if err != nil {
+		t.Fatalf("upgrade again: %v", err)
+	}
+	defer db.Close()
+	if !strings.Contains(logs.String(), "has changed since it was copied") {
+		t.Errorf("no warning about writes made during the rollback; log:\n%s", logs)
+	}
+	if hits, _ := searchMemories(db, "rollback", 5, "", nil, nil, "", ""); len(hits) != 0 {
+		t.Error("the versioned database picked up a write made during the rollback")
+	}
+	if n := legacyCount(t, path, "stored during the rollback"); n != 1 {
+		t.Errorf("legacy database lost the rollback write (count = %d)", n)
+	}
+}
+
+// TestOpenDB_LegacyRemovedAfterUpgrade covers deleting memory.db once the
+// upgrade is confirmed: the server keeps working and does not recreate it.
+func TestOpenDB_LegacyRemovedAfterUpgrade(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "memory.db")
+	createLegacyDBFile(t, path)
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+	db.Close()
+	if err := os.Remove(path); err != nil {
+		t.Fatalf("remove legacy db: %v", err)
+	}
+
+	logs := captureLog(t)
+	db, err = openDB(path)
+	if err != nil {
+		t.Fatalf("openDB after removing memory.db: %v", err)
+	}
+	defer db.Close()
+	if hits, _ := searchMemories(db, "incident", 5, "", nil, nil, "", ""); len(hits) != 4 {
+		t.Errorf("search after removing memory.db = %d hits, want 4", len(hits))
+	}
+	if files := dirFiles(t, dir); slices.Contains(files, "memory.db") {
+		t.Error("openDB recreated memory.db")
+	}
+	if strings.Contains(logs.String(), "WARNING") {
+		t.Errorf("warned after memory.db was removed on purpose:\n%s", logs)
+	}
+}
+
+// TestOpenDB_IgnoresStaleWALOfDeletedVersionedDB covers starting over after a
+// rollback: memory.v2.db was deleted, but a killed server left memory.v2.db-wal
+// behind. SQLite would replay that WAL into the new file of the same name, so
+// it must be removed before the new copy takes its place.
+func TestOpenDB_IgnoresStaleWALOfDeletedVersionedDB(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "memory.db")
+	before := createLegacyDBFile(t, path)
+	v2 := filepath.Join(dir, "memory.v2.db")
+
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+	storeDefault(t, db, "stale write from the deleted database", nil)
+	// Save the WAL while the connection is open, as a killed server leaves it.
+	staleWAL := readFile(t, v2+"-wal")
+	db.Close()
+
+	if err := os.Remove(v2); err != nil {
+		t.Fatalf("delete memory.v2.db: %v", err)
+	}
+	if err := os.WriteFile(v2+"-wal", staleWAL, 0o600); err != nil {
+		t.Fatalf("restore stale wal: %v", err)
+	}
+
+	db, err = openDB(path)
+	if err != nil {
+		t.Fatalf("openDB after deleting memory.v2.db: %v", err)
+	}
+	defer db.Close()
+	if got := snapshotRows(t, db); !slices.Equal(got, before) {
+		t.Errorf("new copy differs from memory.db (stale WAL replayed?):\ngot  %v\nwant %v", got, before)
+	}
+	assertFTSIntegrity(t, db)
+}
+
+func TestOpenDB_FreshInstall(t *testing.T) {
+	dir := t.TempDir()
+	db, err := openDB(filepath.Join(dir, "memory.db"))
+	if err != nil {
+		t.Fatalf("openDB: %v", err)
+	}
+	defer db.Close()
+	storeDefault(t, db, "first note", nil)
+
+	files := dirFiles(t, dir)
+	if !slices.Contains(files, "memory.v2.db") || slices.Contains(files, "memory.db") {
+		t.Errorf("files on a fresh install = %v, want memory.v2.db and no memory.db", files)
+	}
+	var copies int
+	db.QueryRow(`SELECT COUNT(*) FROM copied_from`).Scan(&copies)
+	if copies != 0 {
+		t.Errorf("fresh database records %d copy sources, want 0", copies)
+	}
+}
+
+// ── Writer and admin tokens ──────────────────────────────────────────────────
+
+// serveWithToken sends one request through the real router with an optional
+// bearer token and returns the status code.
+func serveWithToken(t *testing.T, mux *http.ServeMux, method, path, body, token string) int {
+	t.Helper()
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(method, path, bytes.NewBufferString(body))
+	if token != "" {
+		r.Header.Set("Authorization", "Bearer "+token)
+	}
+	mux.ServeHTTP(w, r)
+	return w.Code
+}
+
+// TestNewMux_EachRouteTakesExactlyOneToken pins the token split: writes take
+// only the writer token, the admin endpoints take only the admin token, and
+// reads stay open. Agent-runner pods hold the writer token, so it must never
+// open /delete or /history.
+func TestNewMux_EachRouteTakesExactlyOneToken(t *testing.T) {
+	const admin, writer = "admin-secret", "writer-secret"
+	db := setupTestDB(t)
+	mux := newMux(db, admin, writer)
+	id := itoa(storeDefault(t, db, "kafka lag on payments", nil))
+
+	writes := []struct{ path, body string }{
+		{"/store", `{"content":"new fact"}`},
+		{"/update", `{"id":` + id + `,"content":"corrected fact"}`},
+	}
+	for _, wr := range writes {
+		for _, bad := range []string{"", "wrong", admin} {
+			if code := serveWithToken(t, mux, "POST", wr.path, wr.body, bad); code != http.StatusUnauthorized {
+				t.Errorf("POST %s with token %q: status = %d, want 401", wr.path, bad, code)
+			}
+		}
+		if code := serveWithToken(t, mux, "POST", wr.path, wr.body, writer); code != http.StatusOK {
+			t.Errorf("POST %s with writer token: status = %d, want 200", wr.path, code)
+		}
+	}
+
+	// Rejected forgets must leave the entry in place.
+	for _, bad := range []string{"", admin} {
+		if code := serveWithToken(t, mux, "POST", "/forget", `{"id":`+id+`}`, bad); code != http.StatusUnauthorized {
+			t.Errorf("POST /forget with token %q: status = %d, want 401", bad, code)
+		}
+	}
+	if e, _, _ := getMemoryByID(db, mustAtoi(t, id)); e.Forgotten {
+		t.Fatal("a rejected forget changed the entry")
+	}
+	if code := serveWithToken(t, mux, "POST", "/forget", `{"id":`+id+`}`, writer); code != http.StatusOK {
+		t.Errorf("POST /forget with writer token: status = %d, want 200", code)
+	}
+
+	for _, path := range []string{"/history?id=" + id, "/delete?id=" + id} {
+		method := "GET"
+		if strings.HasPrefix(path, "/delete") {
+			method = "DELETE"
+		}
+		if code := serveWithToken(t, mux, method, path, "", writer); code != http.StatusUnauthorized {
+			t.Errorf("%s %s with writer token: status = %d, want 401", method, path, code)
+		}
+	}
+	if code := serveWithToken(t, mux, "GET", "/history?id="+id, "", admin); code != http.StatusOK {
+		t.Errorf("GET /history with admin token: status = %d, want 200", code)
+	}
+
+	// Reads stay open (the apiserver reads /list and /provenance for the UI).
+	reads := []struct{ method, path, body string }{
+		{"POST", "/search", `{"query":"kafka"}`},
+		{"GET", "/list", ""},
+		{"GET", "/stats", ""},
+		{"GET", "/provenance?id=" + id, ""},
+		{"GET", "/health", ""},
+	}
+	for _, rd := range reads {
+		if code := serveWithToken(t, mux, rd.method, rd.path, rd.body, ""); code != http.StatusOK {
+			t.Errorf("%s %s without a token: status = %d, want 200", rd.method, rd.path, code)
+		}
+	}
+}
+
+// TestNewMux_WritesOpenWithoutWriterToken covers a memory-server run outside
+// the controller, which sets no writer token.
+func TestNewMux_WritesOpenWithoutWriterToken(t *testing.T) {
+	db := setupTestDB(t)
+	mux := newMux(db, "", "")
+	if code := serveWithToken(t, mux, "POST", "/store", `{"content":"fact"}`, ""); code != http.StatusOK {
+		t.Errorf("POST /store without a writer token configured: status = %d, want 200", code)
+	}
+}
+
+func TestCheckTokens(t *testing.T) {
+	for _, tc := range []struct {
+		admin, writer string
+		wantErr       bool
+	}{
+		{"", "", false},
+		{"admin", "", false},
+		{"", "writer", false},
+		{"admin", "writer", false},
+		{"same", "same", true},
+	} {
+		if err := checkTokens(tc.admin, tc.writer); (err != nil) != tc.wantErr {
+			t.Errorf("checkTokens(%q, %q) = %v, want error %v", tc.admin, tc.writer, err, tc.wantErr)
+		}
+	}
+}
+
+func mustAtoi(t *testing.T, s string) int64 {
+	t.Helper()
+	n, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		t.Fatalf("parse %q: %v", s, err)
+	}
+	return n
 }

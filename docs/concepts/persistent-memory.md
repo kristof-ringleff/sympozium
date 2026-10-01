@@ -15,7 +15,7 @@ Agents interact with memory through these tools exposed via file-based JSON IPC 
 ## How It Works
 
 1. The `memory` SkillPack adds a **memory sidecar** (`cmd/memory-server/`) to the agent pod.
-2. A **PersistentVolumeClaim** is created per instance to hold `memory.db` — the SQLite database.
+2. A **PersistentVolumeClaim** is created per instance to hold `memory.v2.db` — the SQLite database. (Releases before update/forget used `memory.db`; see [Upgrading and rolling back](#upgrading-and-rolling-back).)
 3. The agent and memory sidecar share an `/ipc` volume. The agent writes JSON tool requests; the sidecar responds with results.
 4. SQLite FTS5 indexes all stored content for fast full-text search.
 5. Because the PVC outlives individual pods, memories persist across runs.
@@ -96,11 +96,31 @@ Rules the memory server enforces:
 
 - A forgotten memory cannot be updated or forgotten again (`409 Conflict`). Store a new entry instead.
 - An update keeps the memory's `visibility` and `parent_id`. Omitted `tags` and `evidence` are kept too. Sending `"evidence": null` or `{}` clears the evidence.
-- An update sets `created_at` to the time of the update. The memory has been confirmed as of now, so time decay (`maxAge`) counts from the update.
-- In shared workflow memory, a persona can only update or forget entries it stored itself. The agent-runner always sets the source agent to the persona name; the model cannot choose it. Entries stored before this release without a membrane have no source agent, so no persona can change them; use the admin endpoints below.
+- An update sets `created_at` to the time of the update. The memory has been confirmed as of now, so time decay (`maxAge`) counts from the update. This is on purpose, and it applies to every update, including a one-word typo fix: if an entry is worth correcting, it is still in use, so it is refreshed. When you tune `maxAge`, count from an entry's last update, not from when it was first stored. `GET /history` still shows when the first version was stored.
+- In shared workflow memory, a persona can only update or forget entries it stored itself. The agent-runner always sets the source agent to the persona name, and only agent-runner containers hold the writer token (see [Write access](#write-access)), so neither the model nor another pod can choose it. Entries stored before this release without a membrane have no source agent, so no persona can change them; use the admin endpoints below.
 - `parent_id` refers to a memory id, so provenance shows the current version of each parent and leaves out forgotten ones.
 
 The server endpoints are `POST /update` (`{"id", "content", "tags?", "evidence?"}`) and `POST /forget` (`{"id"}`).
+
+### Write access
+
+Writes (`POST /store`, `/update`, `/forget`) need the memory server's **writer token** as a bearer token. Without it the server answers `401`.
+
+- **One token per memory server.** The controller creates a random token in a Secret named after the memory server: `<agent>-memory-writer-token`, or `<ensemble>-shared-memory-writer-token` for shared workflow memory. The Agent or Ensemble owns the Secret, so it is deleted with it.
+- **Only two containers hold it:** the memory-server container, and the agent-runner container of a run that uses that memory server. Skill sidecars never get it, and it is never written under `/ipc`. Sidecars are where `execute_command` runs model-chosen commands, so a prompt-injected model cannot call the memory server directly to store, update or forget entries. And because only the agent-runner can write, the `source_agent` it sets can be trusted.
+- **Read-only personas do not get the shared memory token**, so the shared memory server itself rejects their writes.
+- **The controller also writes.** It stores a memory for each failed run, and reads the token from the Secret to do so.
+- **Separate from the admin token.** The admin token for `/delete` and `/history` is only ever given to memory-server containers. The writer token does not open those endpoints, and the memory server refuses to start if the two tokens are equal.
+- **Reads are not authenticated.** `/search`, `/list`, `/stats` and `/provenance` answer any pod that can reach the Service; the API server reads `/list` and `/provenance` for the UI. A caller can name any agent as `caller_agent` and see that agent's private entries. If that matters in your cluster, restrict ingress to the memory Services with a NetworkPolicy.
+- **Rotating the token:** delete the Secret. The controller creates a new one; restart the memory server, and new runs pick it up.
+
+To write by hand, for example from a port-forward:
+
+```bash
+TOKEN=$(kubectl get secret <agent>-memory-writer-token -o jsonpath='{.data.token}' | base64 --decode)
+curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"content": "...", "tags": ["manual"]}' http://localhost:8080/store
+```
 
 ### Auditing history
 
@@ -112,6 +132,92 @@ curl -H "Authorization: Bearer $TOKEN" "http://localhost:8080/history?id=42"
 ```
 
 To remove content for good, use `DELETE /delete?id=N` (every version of memory `N`) or `DELETE /delete?id=N&seq=S` (one version). Deleting the current version makes the previous version current again, and searchable.
+
+### Upgrading and rolling back
+
+The first time a memory server from this release starts, it **copies** its database and works only on the copy:
+
+- The old database, `/data/memory.db`, is never written to. The server copies it to `/data/memory.v2.db`, migrates the copy to the versioned layout described above, and from then on uses only `memory.v2.db`. Memory ids stay the same.
+- The copy includes writes that an older server left in its write-ahead log (`memory.db-wal`) when it was killed rather than shut down cleanly.
+- The copy is crash-safe. It is built as `memory.v2.db.tmp` and renamed to `memory.v2.db` only when it is complete; a `.tmp` file left by an interrupted start is thrown away. If the copy fails (for example, the volume is full), the server exits and `memory.db` is unchanged.
+- The copy needs free space on the PVC about the size of the database.
+- Each memory database is upgraded on its own: one per agent (PVC `<agent>-memory-db`) and one per ensemble with shared memory (PVC `<ensemble>-shared-memory-db`). A new install only ever creates `memory.v2.db`.
+- `MEMORY_DB_PATH` still names `memory.db`; the server derives `memory.v2.db` from it. Do not point it at `memory.v2.db`: after a rollback, the older server would then open the migrated file.
+
+The upgrade also adds the [writer token](#write-access) to every memory server, so each one restarts once. Runs that were already going during the upgrade have no token, so their memory writes fail with `401` until they finish; new runs get the token.
+
+#### Rolling back
+
+`helm rollback` is enough; there is nothing to restore. The older memory server opens `memory.db`, which is exactly as it was at the upgrade. Memory written after the upgrade is only in `memory.v2.db`, so the older server does not see it.
+
+#### Upgrading again after a rollback
+
+`memory.v2.db` is still on the volume, so the upgraded server uses it again as it is. It never merges `memory.db` into it or copies over it. Anything the older server stored during the rollback is only in `memory.db`; the upgraded server notices that `memory.db` has changed since the copy and logs a `WARNING` naming both files. Choose one:
+
+- **Keep `memory.v2.db`** (what happens if you do nothing): the writes made during the rollback are not carried over.
+- **Start over from `memory.db`**: before upgrading again, delete `memory.v2.db` and its side files (see below). The upgraded server then copies `memory.db` afresh, and the writes made in `memory.v2.db` before the rollback are lost.
+
+#### Removing the old database
+
+Once you no longer need to roll back, delete `memory.db` and its side files to free the space (see below). It is worth doing for another reason too: `memory.db` still holds entries that agents later forgot or that an admin removed with `DELETE /delete`. The upgraded server does not recreate it.
+
+#### Deleting files on a memory volume
+
+The memory-server image has no shell, so use a helper pod that mounts the PVC. Neither deletion above touches a file the running memory server has open, so it can keep running. The PVC is ReadWriteOnce, though, so the helper pod must run on the same node:
+
+```bash
+# Private memory:
+kubectl -n <namespace> get pod -l sympozium.ai/component=memory,sympozium.ai/instance=<agent> -o jsonpath='{.items[0].spec.nodeName}'
+# Shared workflow memory:
+kubectl -n <namespace> get pod -l sympozium.ai/component=shared-memory,sympozium.ai/ensemble=<ensemble> -o jsonpath='{.items[0].spec.nodeName}'
+```
+
+Save this as `memory-files.yaml`, and set `nodeName`, `claimName` and the files to delete:
+
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: memory-files
+spec:
+  restartPolicy: Never
+  nodeName: <node>   # the node the memory server runs on (ReadWriteOnce volume)
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65532   # the memory server's user, so file ownership is kept
+    runAsGroup: 65532
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: files
+      image: busybox:1.36
+      command: ["sh", "-c"]
+      args:
+        # Remove the old database once you no longer need to roll back:
+        - rm -fv /data/memory.db /data/memory.db-wal /data/memory.db-shm && ls -l /data
+        # Or, to start over from memory.db after a rollback:
+        # - rm -fv /data/memory.v2.db /data/memory.v2.db-wal /data/memory.v2.db-shm && ls -l /data
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities:
+          drop: ["ALL"]
+      volumeMounts:
+        - name: db
+          mountPath: /data
+  volumes:
+    - name: db
+      persistentVolumeClaim:
+        claimName: <agent>-memory-db   # or <ensemble>-shared-memory-db
+```
+
+```bash
+kubectl -n <namespace> apply -f memory-files.yaml
+kubectl -n <namespace> logs -f memory-files
+kubectl -n <namespace> delete pod memory-files
+```
+
+Always delete a database together with its `-wal` and `-shm` files. The server also removes leftover side files before it creates a new `memory.v2.db`, so a stale write-ahead log from a deleted database is never replayed into the new one.
 
 ## Enabling Memory
 
@@ -166,7 +272,7 @@ The memory SkillPack is defined at `config/skills/memory.yaml`. It follows the s
 
 | Aspect | Detail |
 |--------|--------|
-| **Storage** | One PVC per instance, named `<instance>-memory` |
+| **Storage** | One PVC per instance, named `<instance>-memory-db` (shared workflow memory: `<ensemble>-shared-memory-db`) |
 | **Database** | SQLite 3 with FTS5 extension |
 | **Lifecycle** | PVC persists until the Agent is deleted (or manually removed) |
 | **Backup** | Standard PV backup tools apply (Velero, volume snapshots, etc.) |
@@ -183,7 +289,7 @@ View an agent's stored memories through the TUI:
 Or query the database directly by exec-ing into the memory sidecar during a run:
 
 ```bash
-kubectl exec <pod> -c memory-server -- sqlite3 /data/memory.db "SELECT content, tags FROM memories ORDER BY created_at DESC LIMIT 10;"
+kubectl exec <pod> -c memory-server -- sqlite3 /data/memory.v2.db "SELECT content, tags FROM memories ORDER BY created_at DESC LIMIT 10;"
 ```
 
 A direct query like this shows every row, including replaced versions and forget versions (`NULL` content). See [Auditing history](#auditing-history).
@@ -298,7 +404,7 @@ Key capabilities:
 | **Trust groups** | Named groups of personas that can see each other's "trusted" entries |
 | **Token budget** | Caps total token consumption across all runs; halts or warns on breach |
 | **Circuit breaker** | Opens after N consecutive delegation failures, blocking further spawns |
-| **Time decay** | Excludes old entries from search results via configurable TTL |
+| **Time decay** | Excludes old entries from search results via configurable TTL. Age counts from an entry's last update (see [Correcting and Forgetting](#correcting-and-forgetting)). |
 | **Provenance** | Every entry tracks its source agent and derivation chain via `parent_id`. The chain shows the current version of each entry and leaves out forgotten ones. |
 
 When the membrane is configured, agent pods receive additional env vars (`WORKFLOW_MEMBRANE_VISIBILITY`, `WORKFLOW_MEMBRANE_TRUST_PEERS`, `WORKFLOW_MEMBRANE_ACCEPT_TAGS`, `WORKFLOW_MEMBRANE_MAX_AGE`) that the agent runner uses to filter store and search calls automatically.
@@ -321,7 +427,7 @@ Or exec into the shared memory pod:
 
 ```bash
 kubectl exec deploy/research-delegation-example-shared-memory -c memory-server -- \
-  sqlite3 /data/memory.db "SELECT content, tags FROM memories ORDER BY created_at DESC LIMIT 10;"
+  sqlite3 /data/memory.v2.db "SELECT content, tags FROM memories ORDER BY created_at DESC LIMIT 10;"
 ```
 
 ## Migration from ConfigMap Memory (Legacy)

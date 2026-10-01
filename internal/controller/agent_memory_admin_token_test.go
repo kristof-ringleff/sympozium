@@ -14,7 +14,7 @@ import (
 	sympoziumv1alpha1 "github.com/sympozium-ai/sympozium/api/v1alpha1"
 )
 
-// ── syncMemoryAdminTokenEnv ──────────────────────────────────────────────────
+// ── syncMemoryServerEnv ──────────────────────────────────────────────────
 //
 // reconcileMemoryDeployment is create-only for the bulk of the Deployment spec,
 // so an existing memory Deployment would never pick up the admin-delete token
@@ -62,8 +62,8 @@ func TestSyncMemoryAdminTokenEnv_AddsWhenEnabled(t *testing.T) {
 	})
 	_, cl := newInstanceTestReconciler(t, deploy)
 
-	if err := syncMemoryAdminTokenEnv(context.Background(), cl, logr.Discard(), deploy); err != nil {
-		t.Fatalf("syncMemoryAdminTokenEnv: %v", err)
+	if err := syncMemoryServerEnv(context.Background(), cl, logr.Discard(), deploy); err != nil {
+		t.Fatalf("syncMemoryServerEnv: %v", err)
 	}
 
 	env, ok := tokenEnvOf(t, cl, "agent-memory", "default")
@@ -99,8 +99,8 @@ func TestSyncMemoryAdminTokenEnv_RemovesWhenDisabled(t *testing.T) {
 	})
 	_, cl := newInstanceTestReconciler(t, deploy)
 
-	if err := syncMemoryAdminTokenEnv(context.Background(), cl, logr.Discard(), deploy); err != nil {
-		t.Fatalf("syncMemoryAdminTokenEnv: %v", err)
+	if err := syncMemoryServerEnv(context.Background(), cl, logr.Discard(), deploy); err != nil {
+		t.Fatalf("syncMemoryServerEnv: %v", err)
 	}
 
 	if _, ok := tokenEnvOf(t, cl, "agent-memory", "default"); ok {
@@ -112,8 +112,10 @@ func TestSyncMemoryAdminTokenEnv_RemovesWhenDisabled(t *testing.T) {
 	if err := cl.Get(context.Background(), types.NamespacedName{Name: "agent-memory", Namespace: "default"}, &got); err != nil {
 		t.Fatalf("get deployment: %v", err)
 	}
+	// MEMORY_WRITER_TOKEN is always reconciled in, so expect exactly that next
+	// to the untouched MEMORY_DB_PATH.
 	c := memoryServerContainer(&got.Spec.Template.Spec)
-	if len(c.Env) != 1 || c.Env[0].Name != "MEMORY_DB_PATH" {
+	if len(c.Env) != 2 || c.Env[0].Name != "MEMORY_DB_PATH" || c.Env[1].Name != memoryWriterTokenEnvName {
 		t.Errorf("removal clobbered unrelated env: %+v", c.Env)
 	}
 }
@@ -131,8 +133,8 @@ func TestSyncMemoryAdminTokenEnv_RepointsToNewSecret(t *testing.T) {
 	})
 	_, cl := newInstanceTestReconciler(t, deploy)
 
-	if err := syncMemoryAdminTokenEnv(context.Background(), cl, logr.Discard(), deploy); err != nil {
-		t.Fatalf("syncMemoryAdminTokenEnv: %v", err)
+	if err := syncMemoryServerEnv(context.Background(), cl, logr.Discard(), deploy); err != nil {
+		t.Fatalf("syncMemoryServerEnv: %v", err)
 	}
 
 	env, ok := tokenEnvOf(t, cl, "agent-memory", "default")
@@ -147,7 +149,8 @@ func TestSyncMemoryAdminTokenEnv_RepointsToNewSecret(t *testing.T) {
 func TestSyncMemoryAdminTokenEnv_NoWriteWhenAlreadyCorrect(t *testing.T) {
 	t.Setenv("MEMORY_ADMIN_TOKEN_SECRET", "sympozium-memory-admin-token")
 
-	deploy := memoryDeploy("agent-memory", "default", memoryAdminTokenEnv())
+	deploy := memoryDeploy("agent-memory", "default", append(memoryAdminTokenEnv(),
+		memoryWriterTokenEnv(memoryWriterTokenEnvName, "agent-memory")))
 	_, cl := newInstanceTestReconciler(t, deploy)
 
 	var before appsv1.Deployment
@@ -155,8 +158,8 @@ func TestSyncMemoryAdminTokenEnv_NoWriteWhenAlreadyCorrect(t *testing.T) {
 		t.Fatalf("get deployment: %v", err)
 	}
 
-	if err := syncMemoryAdminTokenEnv(context.Background(), cl, logr.Discard(), deploy); err != nil {
-		t.Fatalf("syncMemoryAdminTokenEnv: %v", err)
+	if err := syncMemoryServerEnv(context.Background(), cl, logr.Discard(), deploy); err != nil {
+		t.Fatalf("syncMemoryServerEnv: %v", err)
 	}
 
 	var after appsv1.Deployment
@@ -179,8 +182,8 @@ func TestSyncMemoryAdminTokenEnv_MatchesContainerByName(t *testing.T) {
 	deploy := memoryDeploy("agent-memory", "default", nil, sidecar)
 	_, cl := newInstanceTestReconciler(t, deploy)
 
-	if err := syncMemoryAdminTokenEnv(context.Background(), cl, logr.Discard(), deploy); err != nil {
-		t.Fatalf("syncMemoryAdminTokenEnv: %v", err)
+	if err := syncMemoryServerEnv(context.Background(), cl, logr.Discard(), deploy); err != nil {
+		t.Fatalf("syncMemoryServerEnv: %v", err)
 	}
 
 	var got appsv1.Deployment
@@ -212,7 +215,7 @@ func TestSyncMemoryAdminTokenEnv_NoMemoryServerContainer(t *testing.T) {
 	}
 	_, cl := newInstanceTestReconciler(t, deploy)
 
-	if err := syncMemoryAdminTokenEnv(context.Background(), cl, logr.Discard(), deploy); err != nil {
+	if err := syncMemoryServerEnv(context.Background(), cl, logr.Discard(), deploy); err != nil {
 		t.Fatalf("expected a no-op, got error: %v", err)
 	}
 }

@@ -980,3 +980,82 @@ func TestExecuteMemoryTool_StoreSendsOnlyToolFields(t *testing.T) {
 		t.Errorf("body = %v, want %v", bodies[0], want)
 	}
 }
+
+// authCaptureServer records "METHOD PATH -> Authorization" for every request.
+func authCaptureServer(t *testing.T, seen *[]string) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		*seen = append(*seen, r.Method+" "+r.URL.Path+" -> "+r.Header.Get("Authorization"))
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{"success": true, "content": []any{}})
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// TestMemoryRequests_SendTheirServersWriterToken checks that every request to
+// a memory server carries that server's writer token, and never the other
+// server's: the private and shared tokens are separate secrets.
+func TestMemoryRequests_SendTheirServersWriterToken(t *testing.T) {
+	var privSeen, wfSeen []string
+	priv := authCaptureServer(t, &privSeen)
+	wf := authCaptureServer(t, &wfSeen)
+
+	oldURL, oldTok := memoryServerURL, memoryWriterToken
+	oldWfURL, oldWfTok, oldAccess, oldVis := workflowMemoryServerURL, workflowMemoryWriterToken, workflowMemoryAccess, membraneVisibility
+	defer func() {
+		memoryServerURL, memoryWriterToken = oldURL, oldTok
+		workflowMemoryServerURL, workflowMemoryWriterToken, workflowMemoryAccess, membraneVisibility = oldWfURL, oldWfTok, oldAccess, oldVis
+	}()
+	memoryServerURL, memoryWriterToken = priv.URL, "private-writer"
+	workflowMemoryServerURL, workflowMemoryWriterToken = wf.URL, "shared-writer"
+	workflowMemoryAccess, membraneVisibility = "read-write", ""
+	t.Setenv("INSTANCE_NAME", "researcher")
+
+	ctx := context.Background()
+	executeMemoryTool(ctx, ToolMemoryStore, `{"content":"a"}`)
+	executeMemoryTool(ctx, ToolMemoryUpdate, `{"id":1,"content":"b"}`)
+	executeMemoryTool(ctx, ToolMemoryForget, `{"id":1}`)
+	executeMemoryTool(ctx, ToolMemorySearch, `{"query":"a"}`)
+	executeMemoryTool(ctx, ToolMemoryList, `{}`)
+	queryMemoryContext(ctx, "task", 3)
+	executeWorkflowMemoryTool(ctx, ToolWorkflowMemoryStore, `{"content":"a"}`)
+	executeWorkflowMemoryTool(ctx, ToolWorkflowMemoryUpdate, `{"id":1,"content":"b"}`)
+	executeWorkflowMemoryTool(ctx, ToolWorkflowMemoryForget, `{"id":1}`)
+	executeWorkflowMemoryTool(ctx, ToolWorkflowMemorySearch, `{"query":"a"}`)
+	executeWorkflowMemoryTool(ctx, ToolWorkflowMemoryList, `{}`)
+	queryWorkflowMemoryContext(ctx, "task", 3)
+
+	for name, tc := range map[string]struct {
+		seen []string
+		want string
+	}{
+		"private memory": {privSeen, "Bearer private-writer"},
+		"shared memory":  {wfSeen, "Bearer shared-writer"},
+	} {
+		if len(tc.seen) != 6 {
+			t.Errorf("%s: %d requests, want 6: %v", name, len(tc.seen), tc.seen)
+		}
+		for _, s := range tc.seen {
+			if !strings.HasSuffix(s, " -> "+tc.want) {
+				t.Errorf("%s: %s, want %s", name, s, tc.want)
+			}
+		}
+	}
+}
+
+// TestMemoryRequests_NoAuthHeaderWithoutToken covers a runner with no writer
+// token (a read-only persona, or a memory server run outside the controller).
+func TestMemoryRequests_NoAuthHeaderWithoutToken(t *testing.T) {
+	var seen []string
+	srv := authCaptureServer(t, &seen)
+
+	oldURL, oldTok := memoryServerURL, memoryWriterToken
+	defer func() { memoryServerURL, memoryWriterToken = oldURL, oldTok }()
+	memoryServerURL, memoryWriterToken = srv.URL, ""
+
+	executeMemoryTool(context.Background(), ToolMemoryStore, `{"content":"a"}`)
+	if len(seen) != 1 || !strings.HasSuffix(seen[0], " -> ") {
+		t.Errorf("requests = %v, want one request with no Authorization header", seen)
+	}
+}

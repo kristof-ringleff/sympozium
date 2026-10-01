@@ -42,6 +42,8 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+// defaultDBPath is the configured database path (MEMORY_DB_PATH). It names
+// the database of older releases; the server works on versionedDBPath of it.
 const defaultDBPath = "/data/memory.db"
 
 // memObservability holds the OTel instruments for the memory sidecar. Agents
@@ -184,6 +186,19 @@ func main() {
 	// deployments are unaffected.
 	adminToken := os.Getenv("MEMORY_ADMIN_TOKEN")
 
+	// Writes (POST /store, /update, /forget) are gated on a separate writer
+	// token. The controller injects it into this pod and into the agent-runner
+	// container only, never into skill sidecars, so a model running commands in
+	// a sidecar cannot write or forget entries under another agent's name.
+	// When unset (memory-server run outside the controller), writes are open.
+	writerToken := os.Getenv("MEMORY_WRITER_TOKEN")
+	if err := checkTokens(adminToken, writerToken); err != nil {
+		log.Fatalf("%v", err)
+	}
+	if writerToken == "" {
+		log.Printf("[memory-server] MEMORY_WRITER_TOKEN not set: writes are not authenticated")
+	}
+
 	// Ensure database directory exists.
 	if err := os.MkdirAll(filepath.Dir(dbPath), 0o755); err != nil {
 		log.Fatalf("failed to create db directory: %v", err)
@@ -203,20 +218,7 @@ func main() {
 		_ = memObs.shutdown(shutdownCtx)
 	}()
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("POST /search", searchHandler(db))
-	mux.HandleFunc("POST /store", storeHandler(db))
-	mux.HandleFunc("POST /update", updateHandler(db))
-	mux.HandleFunc("POST /forget", forgetHandler(db))
-	mux.HandleFunc("GET /list", listHandler(db))
-	mux.HandleFunc("GET /stats", statsHandler(db))
-	mux.HandleFunc("GET /provenance", provenanceHandler(db))
-	mux.HandleFunc("DELETE /delete", deleteHandler(db, adminToken))
-	mux.HandleFunc("GET /history", historyHandler(db, adminToken))
-	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		fmt.Fprint(w, "ok")
-	})
+	mux := newMux(db, adminToken, writerToken)
 
 	// Wrap the router with otelhttp so each memory operation emits a server
 	// span (ISI-1406 gap 6 — "spans on the memory part"). The handler extracts
@@ -565,16 +567,70 @@ func authorizeAdmin(w http.ResponseWriter, r *http.Request, op, adminToken strin
 		writeJSON(w, http.StatusForbidden, apiResponse{Error: op + " is disabled: MEMORY_ADMIN_TOKEN is not configured"})
 		return false
 	}
-	token := ""
-	if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
-		token = strings.TrimPrefix(auth, "Bearer ")
-	}
-	if subtle.ConstantTimeCompare([]byte(token), []byte(adminToken)) != 1 {
+	if !bearerMatches(r, adminToken) {
 		log.Printf("[%s] rejected: invalid or missing bearer token", op)
 		writeJSON(w, http.StatusUnauthorized, apiResponse{Error: "unauthorized"})
 		return false
 	}
 	return true
+}
+
+// requireWriter wraps a write handler so it only runs for requests carrying
+// the writer token. An empty writerToken leaves the handler open, for a
+// memory-server run outside the controller. The admin token is not accepted
+// here: each route takes exactly one token.
+func requireWriter(writerToken string, next http.HandlerFunc) http.HandlerFunc {
+	if writerToken == "" {
+		return next
+	}
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !bearerMatches(r, writerToken) {
+			log.Printf("[%s] rejected: invalid or missing writer token", r.URL.Path)
+			writeJSON(w, http.StatusUnauthorized, apiResponse{Error: "unauthorized"})
+			return
+		}
+		next(w, r)
+	}
+}
+
+// bearerMatches reports whether the request's bearer token equals want, in
+// constant time.
+func bearerMatches(r *http.Request, want string) bool {
+	token := ""
+	if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
+		token = strings.TrimPrefix(auth, "Bearer ")
+	}
+	return subtle.ConstantTimeCompare([]byte(token), []byte(want)) == 1
+}
+
+// checkTokens rejects a configuration where the writer token equals the admin
+// token. Agent-runner pods hold the writer token; sharing the value would let
+// them call the admin-only /delete and /history endpoints.
+func checkTokens(adminToken, writerToken string) error {
+	if writerToken != "" && subtle.ConstantTimeCompare([]byte(writerToken), []byte(adminToken)) == 1 {
+		return errors.New("MEMORY_WRITER_TOKEN must differ from MEMORY_ADMIN_TOKEN")
+	}
+	return nil
+}
+
+// newMux builds the memory server's routes. Writes take the writer token,
+// /delete and /history take the admin token, and reads are open.
+func newMux(db *sql.DB, adminToken, writerToken string) *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /search", searchHandler(db))
+	mux.HandleFunc("POST /store", requireWriter(writerToken, storeHandler(db)))
+	mux.HandleFunc("POST /update", requireWriter(writerToken, updateHandler(db)))
+	mux.HandleFunc("POST /forget", requireWriter(writerToken, forgetHandler(db)))
+	mux.HandleFunc("GET /list", listHandler(db))
+	mux.HandleFunc("GET /stats", statsHandler(db))
+	mux.HandleFunc("GET /provenance", provenanceHandler(db))
+	mux.HandleFunc("DELETE /delete", deleteHandler(db, adminToken))
+	mux.HandleFunc("GET /history", historyHandler(db, adminToken))
+	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, "ok")
+	})
+	return mux
 }
 
 // historyHandler returns every version of the memory with the given id,
@@ -1130,16 +1186,44 @@ const memoriesTableSQL = `
 		UNIQUE (id, seq)
 	)`
 
-// openDB opens the SQLite database at dbPath and brings its schema up to date.
+// openDB opens the memory database for the configured path dbPath
+// (MEMORY_DB_PATH) and brings its schema up to date.
+//
+// The server never writes to dbPath itself. That file is the database of
+// older releases, and older images cannot use the versioned schema, so it is
+// left exactly as it is: a `helm rollback` then needs no restore. The server
+// works on versionedDBPath(dbPath) instead. On first start it creates that
+// file as a migrated copy of dbPath (see copyLegacyDB), or as a fresh
+// database when dbPath does not exist. On every later start it uses the file
+// as it is, and warns when dbPath has changed since the copy was made.
+//
+// MEMORY_DB_PATH keeps naming the old file on purpose: the controller only
+// sets it when it creates a memory Deployment, so after a rollback the older
+// release would still see a changed value and open the migrated file.
+//
 // Transactions start with BEGIN IMMEDIATE (_txlock), so a write transaction
 // takes the write lock before its first read. Concurrent writers then wait on
 // busy_timeout instead of failing with SQLITE_BUSY when a read-then-write
 // transaction (MAX(seq), current version) tries to upgrade its lock.
 func openDB(dbPath string) (*sql.DB, error) {
-	db, err := sql.Open("sqlite", dbPath+"?_pragma=journal_mode(wal)&_pragma=busy_timeout(5000)&_txlock=immediate")
+	path := versionedDBPath(dbPath)
+	if err := copyLegacyDB(dbPath, path); err != nil {
+		return nil, err
+	}
+	db, err := sql.Open("sqlite", path+"?_pragma=journal_mode(wal)&_pragma=busy_timeout(5000)&_txlock=immediate")
 	if err != nil {
 		return nil, fmt.Errorf("failed to open database: %w", err)
 	}
+	if err := migrateSchema(db); err != nil {
+		db.Close()
+		return nil, err
+	}
+	warnIfLegacyChanged(db, dbPath, path)
+	return db, nil
+}
+
+// migrateSchema runs every schema step in order. Each step is idempotent.
+func migrateSchema(db *sql.DB) error {
 	for _, step := range []struct {
 		name string
 		run  func(*sql.DB) error
@@ -1149,13 +1233,201 @@ func openDB(dbPath string) (*sql.DB, error) {
 		{"run evidence migration", migrateEvidenceColumn},
 		{"run versioned schema migration", migrateVersionedSchema},
 		{"set up search index", ensureSearchIndex},
+		{"set up copy record", initCopyRecord},
 	} {
 		if err := step.run(db); err != nil {
-			db.Close()
-			return nil, fmt.Errorf("failed to %s: %w", step.name, err)
+			return fmt.Errorf("failed to %s: %w", step.name, err)
 		}
 	}
+	return nil
+}
+
+// versionedDBPath returns the path of the versioned database for the legacy
+// path dbPath: /data/memory.db becomes /data/memory.v2.db.
+func versionedDBPath(dbPath string) string {
+	ext := filepath.Ext(dbPath)
+	return strings.TrimSuffix(dbPath, ext) + ".v2" + ext
+}
+
+// copyLegacyDB creates the versioned database at path from the legacy
+// database at legacyPath, when path does not exist yet and legacyPath does.
+//
+// It copies legacyPath with VACUUM INTO over a read-only connection. That is
+// a consistent snapshot, including writes still in the WAL of a server that
+// was killed, and it leaves legacyPath and its side files unchanged. The copy
+// is written to path+".tmp", migrated there, and only then renamed to path, so
+// path never holds a partial copy. A ".tmp" file from an interrupted start is
+// discarded first. The copy is migrated without WAL, so it is a single file
+// when renamed.
+func copyLegacyDB(legacyPath, path string) error {
+	tmp := path + ".tmp"
+	for _, f := range []string{tmp, tmp + "-journal", tmp + "-wal", tmp + "-shm"} {
+		if err := os.Remove(f); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("remove partial copy %s: %w", f, err)
+		}
+	}
+	if _, err := os.Stat(path); err == nil {
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("check %s: %w", path, err)
+	}
+	// path does not exist, so any side files with its name are leftovers of a
+	// deleted database (for example a WAL from a killed server). SQLite would
+	// replay a leftover WAL into the new file, so remove them first.
+	for _, f := range []string{path + "-wal", path + "-shm", path + "-journal"} {
+		if err := os.Remove(f); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("remove leftover %s: %w", f, err)
+		}
+	}
+	if _, err := os.Stat(legacyPath); errors.Is(err, os.ErrNotExist) {
+		return nil // Fresh install: openDB creates path.
+	} else if err != nil {
+		return fmt.Errorf("check %s: %w", legacyPath, err)
+	}
+
+	log.Printf("[memory-server] copying %s to %s; %s is left unchanged", legacyPath, path, legacyPath)
+	fp, err := snapshotLegacyDB(legacyPath, tmp)
+	if err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	if err := migrateCopy(tmp, legacyPath, fp); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		os.Remove(tmp)
+		return fmt.Errorf("move %s into place: %w", tmp, err)
+	}
+	log.Printf("[memory-server] %s is ready", path)
+	return nil
+}
+
+// legacyFingerprint summarises the legacy memories table, so a later start
+// can tell whether an older server wrote to it after the copy was made.
+type legacyFingerprint struct {
+	Rows         int64
+	MaxID        int64
+	MaxUpdatedAt string
+}
+
+// openReadOnly opens path read-only; nothing it does can change the file.
+func openReadOnly(path string) (*sql.DB, error) {
+	db, err := sql.Open("sqlite", "file:"+path+"?mode=ro&_pragma=busy_timeout(5000)")
+	if err != nil {
+		return nil, fmt.Errorf("open %s read-only: %w", path, err)
+	}
 	return db, nil
+}
+
+// snapshotLegacyDB writes a copy of legacyPath to dst and returns the
+// fingerprint of the copied data, read in the same read transaction.
+func snapshotLegacyDB(legacyPath, dst string) (legacyFingerprint, error) {
+	src, err := openReadOnly(legacyPath)
+	if err != nil {
+		return legacyFingerprint{}, err
+	}
+	defer src.Close()
+	if _, err := src.Exec(`VACUUM INTO ?`, dst); err != nil {
+		return legacyFingerprint{}, fmt.Errorf("copy %s: %w", legacyPath, err)
+	}
+	// Fingerprint the copy rather than the source: it is exactly the data
+	// that was copied, even if the source changed in between.
+	cp, err := openReadOnly(dst)
+	if err != nil {
+		return legacyFingerprint{}, err
+	}
+	defer cp.Close()
+	return fingerprint(cp)
+}
+
+// fingerprint reads the legacyFingerprint of db. A database without a
+// memories table has the zero fingerprint.
+func fingerprint(db *sql.DB) (legacyFingerprint, error) {
+	var tables int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'memories'`).Scan(&tables); err != nil {
+		return legacyFingerprint{}, fmt.Errorf("fingerprint: %w", err)
+	}
+	var fp legacyFingerprint
+	if tables == 0 {
+		return fp, nil
+	}
+	err := db.QueryRow(`SELECT COUNT(*), COALESCE(MAX(id), 0), COALESCE(MAX(updated_at), '') FROM memories`).
+		Scan(&fp.Rows, &fp.MaxID, &fp.MaxUpdatedAt)
+	if err != nil {
+		return legacyFingerprint{}, fmt.Errorf("fingerprint: %w", err)
+	}
+	return fp, nil
+}
+
+// migrateCopy migrates the copied database at tmp and records where it was
+// copied from.
+func migrateCopy(tmp, legacyPath string, fp legacyFingerprint) error {
+	db, err := sql.Open("sqlite", tmp+"?_pragma=busy_timeout(5000)&_txlock=immediate")
+	if err != nil {
+		return fmt.Errorf("open copy %s: %w", tmp, err)
+	}
+	defer db.Close()
+	if err := migrateSchema(db); err != nil {
+		return err
+	}
+	_, err = db.Exec(`
+		INSERT INTO copied_from (source, rows, max_id, max_updated_at, copied_at)
+		VALUES (?, ?, ?, ?, ?)
+	`, legacyPath, fp.Rows, fp.MaxID, fp.MaxUpdatedAt, time.Now().UTC().Format(time.RFC3339))
+	if err != nil {
+		return fmt.Errorf("record copy source: %w", err)
+	}
+	return db.Close()
+}
+
+// initCopyRecord creates the copied_from table. It holds one row when the
+// database was created as a copy of a legacy database, and none when it
+// started fresh.
+func initCopyRecord(db *sql.DB) error {
+	_, err := db.Exec(`
+		CREATE TABLE IF NOT EXISTS copied_from (
+			source         TEXT NOT NULL,
+			rows           INTEGER NOT NULL,
+			max_id         INTEGER NOT NULL,
+			max_updated_at TEXT NOT NULL,
+			copied_at      TEXT NOT NULL
+		)`)
+	return err
+}
+
+// warnIfLegacyChanged logs a warning when the legacy database at legacyPath
+// differs from the one path was copied from. That happens when an older
+// memory server wrote to it after a rollback: those writes are not in path,
+// and this server will not pick them up. It never changes either file.
+func warnIfLegacyChanged(db *sql.DB, legacyPath, path string) {
+	var want legacyFingerprint
+	var copiedAt string
+	err := db.QueryRow(`SELECT rows, max_id, max_updated_at, copied_at FROM copied_from LIMIT 1`).
+		Scan(&want.Rows, &want.MaxID, &want.MaxUpdatedAt, &copiedAt)
+	if err != nil {
+		return // Not a copy (fresh database), or unreadable: nothing to compare.
+	}
+	if _, err := os.Stat(legacyPath); err != nil {
+		return // The old file was removed after the upgrade.
+	}
+	legacy, err := openReadOnly(legacyPath)
+	if err != nil {
+		log.Printf("[memory-server] cannot check %s for changes: %v", legacyPath, err)
+		return
+	}
+	defer legacy.Close()
+	got, err := fingerprint(legacy)
+	if err != nil {
+		log.Printf("[memory-server] cannot check %s for changes: %v", legacyPath, err)
+		return
+	}
+	if got != want {
+		log.Printf("[memory-server] WARNING: %s has changed since it was copied to %s at %s "+
+			"(an older memory server wrote to it, probably after a rollback). Those writes are not in %s. "+
+			"To start over from %s instead, stop this server and delete %s; the writes made since %s will then be lost.",
+			legacyPath, path, copiedAt, path, legacyPath, path, copiedAt)
+	}
 }
 
 // initSchema creates the versioned memories table on a fresh database. On a
@@ -1233,6 +1505,10 @@ func migrateEvidenceColumn(db *sql.DB) error {
 // row becomes version seq of memory id, so ids agents already know keep
 // working. It then makes sure the indexes and the id counter exist.
 // Idempotent: the rebuild is skipped once version_id exists.
+//
+// The rebuild is one-way: older memory-server images cannot write to the new
+// table. openDB therefore only runs it on a copy of the old database, never
+// on the old database itself (see copyLegacyDB).
 func migrateVersionedSchema(db *sql.DB) error {
 	var count int
 	err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('memories') WHERE name='version_id'`).Scan(&count)

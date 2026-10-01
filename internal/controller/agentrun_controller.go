@@ -2738,6 +2738,9 @@ func (r *AgentRunReconciler) buildContainers(
 		memoryURL := fmt.Sprintf("http://%s-memory.%s.svc:8080", agentRun.Spec.AgentRef, agentRun.Namespace)
 		containers[0].Env = append(containers[0].Env,
 			corev1.EnvVar{Name: "MEMORY_SERVER_URL", Value: memoryURL},
+			// The writer token goes into the agent container only, never into
+			// skill sidecars, where execute_command runs model-chosen commands.
+			memoryWriterTokenEnv(memoryWriterTokenEnvName, agentRun.Spec.AgentRef+"-memory"),
 		)
 
 		// Init container to wait for memory server readiness before agent starts.
