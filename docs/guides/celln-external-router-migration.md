@@ -1,11 +1,5 @@
 # Upgrading a host-managed one-shot Celln router
 
-!!! note "Historical record"
-    This page records a Celln development milestone (September 2026). Interfaces and limits it
-    describes may since have changed or been replaced by the Celln fleet. For current behaviour
-    see [Celln Backend](../../concepts/celln-backend.md) and
-    [Celln Fleet Installation](../../guides/celln-fleet-installation.md).
-
 This path preserves an existing one-shot dispatcher and its state while replacing
 the legacy in-cluster router with an authenticated host router and TLS edge.
 It is separate from the native enduring parent endpoint. Do not point execution
@@ -89,5 +83,5 @@ new requests; assess journal compatibility explicitly. Never start the old route
 with an empty ledger, strip finalizers, or restore an older authority snapshot to
 replenish consumed limits. Retain protected backups according to audit policy.
 
-See [native installation](../../guides/celln-native-installation.md) for the independent
+See [native installation](celln-native-installation.md) for the independent
 persistent parent installation and its context-loss limitations.

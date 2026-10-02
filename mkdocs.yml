@@ -49,7 +49,6 @@ plugins:
         guides/celln-catalogue-controller-bridge.md: design/history/celln-catalogue-controller-bridge.md
         guides/celln-durable-issuance-cli.md: design/history/celln-durable-issuance-cli.md
         guides/celln-enduring-run.md: design/history/celln-enduring-run.md
-        guides/celln-external-router-migration.md: design/history/celln-external-router-migration.md
         guides/celln-framework-manual-review.md: design/history/celln-framework-manual-review.md
         guides/celln-harness-selection-ux.md: design/history/celln-harness-selection-ux.md
         guides/celln-interactive-session.md: design/history/celln-interactive-session.md
@@ -151,6 +150,7 @@ nav:
       - Native Celln Installation: guides/celln-native-installation.md
       - Mediated Model Access: guides/celln-mediated-model-access.md
       - Model Gateway Component: guides/celln-model-gateway-component-installation.md
+      - Host Router Migration (legacy): guides/celln-external-router-migration.md
     - Models & Providers:
       - Model Connections: guides/model-connections.md
       - Cluster-Local Models: guides/local-models.md

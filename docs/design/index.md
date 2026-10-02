@@ -41,7 +41,6 @@ superseded. Each page carries a historical note.
 - [Catalogue controller bridge — integration in progress](history/celln-catalogue-controller-bridge.md)
 - [Durable catalogue issuance from the operator CLI](history/celln-durable-issuance-cli.md)
 - [Enduring Celln run contract (development)](history/celln-enduring-run.md)
-- [Upgrading a host-managed one-shot Celln router](history/celln-external-router-migration.md)
 - [Isolated Celln framework manual review](history/celln-framework-manual-review.md)
 - [Harness + Celln selection UX: administrator-assisted one-shot delivery](history/celln-harness-selection-ux.md)
 - [Local Harness + Celln hands-on session](history/celln-interactive-session.md)
