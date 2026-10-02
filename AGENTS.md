@@ -281,6 +281,7 @@ SkillPacks are CRDs containing Markdown instructions + optional sidecar definiti
 | Writing UX tests | `docs/guides/writing-ux-tests.md` | Cypress specs |
 | Web endpoint skill | `docs/skills/web-endpoint.md` | How to expose agents as HTTP APIs (OpenAI-compat + MCP) |
 | Serving mode | `docs/guides/serving-mode.md` | How serving mode works for long-lived agent deployments |
+| Design notes | `docs/design/index.md` | Design records, qualification evidence and Celln milestone history (`docs/design/history/`) |
 | Historical design | `docs/design.md` | Original February 2026 design draft |
 | Sample CRs | `config/samples/` | Example Agent, AgentRun, AgentRuntime, HarnessSession, policy, schedule, SkillPack, Celln catalogue |
 | CRD definitions | `api/v1alpha1/` | Go type definitions for all CRDs |

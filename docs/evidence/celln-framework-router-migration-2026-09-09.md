@@ -69,4 +69,4 @@ long-lived operator CA certificate using the same protected CA key. This does no
 claim reboot/context recovery. Old failed native journals without
 process identity still require conservative operator reconciliation; no manual
 finalizer removal is claimed as cleanup. See the
-[migration guide](../guides/celln-external-router-migration.md).
+[migration guide](../design/history/celln-external-router-migration.md).

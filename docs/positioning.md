@@ -70,6 +70,22 @@ meeting at the claim.
   from decode-grade silicon); the engine moves the tokens; a Sympozium
   persona just sees one endpoint.
 
+## Where Celln fits
+
+[Celln](concepts/celln-backend.md) is an **execution backend**, the
+counterpart of the Kubernetes Job an agent otherwise runs in: it decides how
+an agent's *own* work is isolated (a KVM microVM instead of a Pod), not where
+a model is served. It passes the boundary test as "what agents do" — the
+agent's lifecycle, tools and authority.
+
+Cell placement follows the same rule as everything else: Sympozium does not
+pick the node. The Celln gateway issues each parent on the owner with the
+most spare capacity, and a fleet node joins by carrying the
+`celln.dev/kvm=true` label. That label is capability inventory, applied today
+by node-probe next to its inference discovery, and the same caveat below
+applies to it. Accelerator power from ergoz is a read-only view of an
+external collector, in the same way as the density dashboard.
+
 ## Consequences already scheduled
 
 Two existing subsystems fail the boundary test and are being migrated, not
@@ -87,7 +103,7 @@ The full migration map lives in the llmfit-dra repo
 ## The one-liners
 
 - **Sympozium**: a coordination layer for multi-agent AI systems on
-  Kubernetes. Agents are Pods, policy is CRDs — and when an agent needs a
+  Kubernetes. Agents are Pods or microVMs, policy is CRDs — and when an agent needs a
   model, it *claims* one; Sympozium never decides where it runs.
 - **llmfit-dra**: ask for a model instead of a device — capability inventory
   and physics-based placement for heterogeneous accelerators, through the

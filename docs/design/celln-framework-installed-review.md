@@ -8,7 +8,7 @@ bounded deterministic-provider review, not completion of epic #495, the A01–A1
 acceptance bundle, or production enablement. The scoped UI code is merged but
 is not served by this review deployment.
 
-Use [the manual walkthrough](../guides/celln-framework-manual-review.md).
+Use [the manual walkthrough](history/celln-framework-manual-review.md).
 
 ## Actual installed path
 
