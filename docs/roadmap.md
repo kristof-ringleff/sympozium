@@ -1,5 +1,13 @@
 # Sympozium Roadmap
 
+!!! note "Historical document"
+    This gap analysis dates from February 2026 and is no longer maintained. Several items have
+    shipped since (the web dashboard, `sympozium doctor`, token usage and cost tracking, agent-to-agent delegation
+    in Ensembles), and the project's direction has moved to hardware-isolated Celln agents and
+    AgentHarness. Current plans live in
+    [GitHub issues and epics](https://github.com/sympozium-ai/sympozium/issues) and
+    [Discussions](https://github.com/sympozium-ai/sympozium/discussions).
+
 Feature gap analysis against OpenClaw and planned improvements.
 
 Last updated: 2026-02-25

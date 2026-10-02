@@ -32,7 +32,7 @@ const DefaultExecTimeout = 120
 //   - argv = Exec prefix + optional fixed Subcommand + "--" + positional values.
 //     The "--" end-of-options marker means a model-supplied positional value
 //     beginning with "-" is an operand, not a flag. Wrapped CLIs must honour it
-//     (docs/guides/writing-sidecars.md).
+//     (docs/sidecars/writing-tool-sidecars.md).
 //   - Argv mode is executed with no shell, so argument values cannot inject
 //     shell syntax.
 //   - Numbers keep their exact literal form; without json.Number a large id

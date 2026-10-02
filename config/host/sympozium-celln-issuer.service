@@ -1,6 +1,6 @@
 [Unit]
 Description=Sympozium Celln trusted issuance service
-Documentation=https://github.com/sympozium-ai/sympozium/blob/main/docs/guides/celln-issuer-service.md
+Documentation=https://github.com/sympozium-ai/sympozium/blob/main/docs/design/history/celln-issuer-service.md
 Wants=network-online.target
 After=network-online.target
 RequiresMountsFor=/var/lib/celln /etc/sympozium-issuer /opt/sympozium-celln
