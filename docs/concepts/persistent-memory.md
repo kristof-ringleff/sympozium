@@ -1,8 +1,8 @@
 # Persistent Memory
 
-Each `Agent` can enable **persistent memory** — a SQLite database with FTS5 full-text search, served by a memory sidecar that runs alongside agent pods. The database lives on a PersistentVolume, so memory survives across ephemeral agent runs.
+Each `Agent` can enable **persistent memory** — a SQLite database with FTS5 full-text search, served by a per-Agent memory server (a Deployment and Service next to the agent pods). The database lives on a PersistentVolume, so memory survives across ephemeral agent runs.
 
-Agents interact with memory through these tools exposed via file-based JSON IPC (the same pattern used by MCP tools):
+Agents interact with memory through these tools, which the agent-runner serves by calling the memory server over HTTP:
 
 | Tool | Description |
 |------|-------------|
@@ -14,15 +14,14 @@ Agents interact with memory through these tools exposed via file-based JSON IPC 
 
 ## How It Works
 
-1. The `memory` SkillPack adds a **memory sidecar** (`cmd/memory-server/`) to the agent pod.
-2. A **PersistentVolumeClaim** is created per instance to hold `memory.v2.db` — the SQLite database. (Releases before update/forget used `memory.db`; see [Upgrading and rolling back](#upgrading-and-rolling-back).)
-3. The agent and memory sidecar share an `/ipc` volume. The agent writes JSON tool requests; the sidecar responds with results.
-4. SQLite FTS5 indexes all stored content for fast full-text search.
-5. Because the PVC outlives individual pods, memories persist across runs.
+1. Attaching the `memory` SkillPack makes the controller create a **memory server** for the Agent: a Deployment `<agent>-memory` (the `skill-memory` image, `cmd/memory-server/`), a Service of the same name on port 8080, and a PVC `<agent>-memory-db` holding `memory.v2.db`, the SQLite database. (Releases before update/forget used `memory.db`; see [Upgrading and rolling back](#upgrading-and-rolling-back).)
+2. Each AgentRun's agent container receives `MEMORY_SERVER_URL` (`http://<agent>-memory.<namespace>.svc:8080`); the memory tools call it over HTTP.
+3. SQLite FTS5 indexes all stored content for fast full-text search.
+4. Because the server and its PVC outlive individual runs, memories persist across runs.
 
 ```mermaid
 graph LR
-    A["Agent Container"] -- "JSON IPC<br/>/ipc volume" --> M["Memory Sidecar"]
+    A["Agent Container"] -- "HTTP<br/>MEMORY_SERVER_URL" --> M["Memory Server<br/>(Deployment + Service)"]
     M -- "reads / writes" --> DB[("SQLite + FTS5<br/>on PVC")]
 ```
 
@@ -222,7 +221,7 @@ Always delete a database together with its `-wal` and `-shm` files. The server a
 
 ## Enabling Memory
 
-Add the `memory` SkillPack to your instance's skills list:
+Add the `memory` SkillPack to your Agent's skills list:
 
 ```yaml
 apiVersion: sympozium.ai/v1alpha1
@@ -259,21 +258,22 @@ spec:
           - "Note any nodes that frequently report NotReady"
 ```
 
-Seed memories are inserted into the SQLite database when the instance is first created.
+Seed memories are inserted into the SQLite database when the Agent is first created.
 
 ## SkillPack Configuration
 
-The memory SkillPack is defined at `config/skills/memory.yaml`. It follows the standard SkillPack pattern — Markdown instructions mounted at `/skills/` plus a sidecar container:
+The memory SkillPack is defined at `config/skills/memory.yaml`. It carries Markdown instructions mounted at `/skills/` and **no sidecar**; the controller runs the server separately:
 
 - **Skills layer:** Instructions that teach the agent when and how to use `memory_search`, `memory_store`, `memory_list`, `memory_update`, and `memory_forget`.
-- **Sidecar layer:** The `memory-server` container that manages the SQLite database and responds to IPC requests.
-- **No RBAC required:** The memory sidecar only accesses its own PVC — it does not talk to the Kubernetes API.
+- **Server:** The per-Agent `memory-server` Deployment that manages the SQLite database and answers HTTP requests.
+- **No RBAC required:** The memory server only accesses its own PVC — it does not talk to the Kubernetes API.
+- **Admin endpoints:** With `memory.adminDelete.enabled` (Helm, default on) the server also accepts the admin-only `DELETE /delete` and `GET /history` with a bearer token that is never given to agent pods.
 
 ## Data Persistence
 
 | Aspect | Detail |
 |--------|--------|
-| **Storage** | One PVC per instance, named `<instance>-memory-db` (shared workflow memory: `<ensemble>-shared-memory-db`) |
+| **Storage** | One PVC per Agent, named `<agent>-memory-db` (shared workflow memory: `<ensemble>-shared-memory-db`) |
 | **Database** | SQLite 3 with FTS5 extension |
 | **Lifecycle** | PVC persists until the Agent is deleted (or manually removed) |
 | **Backup** | Standard PV backup tools apply (Velero, volume snapshots, etc.) |
@@ -284,13 +284,13 @@ The memory SkillPack is defined at `config/skills/memory.yaml`. It follows the s
 View an agent's stored memories through the TUI:
 
 ```
-/memory <instance-name>
+/memory <agent-name>
 ```
 
-Or query the database directly by exec-ing into the memory sidecar during a run:
+Or query the database directly by exec-ing into the memory server:
 
 ```bash
-kubectl exec <pod> -c memory-server -- sqlite3 /data/memory.v2.db "SELECT content, tags FROM memories ORDER BY created_at DESC LIMIT 10;"
+kubectl exec deploy/<agent>-memory -c memory-server -- sqlite3 /data/memory.v2.db "SELECT content, tags FROM memories ORDER BY created_at DESC LIMIT 10;"
 ```
 
 A direct query like this shows every row, including replaced versions and forget versions (`NULL` content). See [Auditing history](#auditing-history).
@@ -303,8 +303,8 @@ When agents work together in a **Ensemble**, each persona has its own private me
 
 | Aspect | Private Memory | Shared Workflow Memory |
 |--------|---------------|----------------------|
-| **Scope** | One instance | All personas in an Ensemble |
-| **Storage** | `<instance>-memory-db` PVC | `<pack>-shared-memory-db` PVC |
+| **Scope** | One Agent | All personas in an Ensemble |
+| **Storage** | `<agent>-memory-db` PVC | `<pack>-shared-memory-db` PVC |
 | **Tools** | `memory_search`, `memory_store`, `memory_list` | `workflow_memory_search`, `workflow_memory_store`, `workflow_memory_list` |
 | **Access** | Always read-write | Per-persona: `read-write` or `read-only` |
 | **Attribution** | N/A (single owner) | Auto-tagged with source persona name |
@@ -433,12 +433,12 @@ kubectl exec deploy/research-delegation-example-shared-memory -c memory-server -
 
 ## Migration from ConfigMap Memory (Legacy)
 
-The previous ConfigMap-based memory system (`<instance>-memory` ConfigMap with `MEMORY.md`) is preserved as a **legacy fallback**. If an instance has `spec.memory.enabled: true` but does not include the `memory` SkillPack, the controller falls back to the ConfigMap approach.
+The previous ConfigMap-based memory system (`<agent>-memory` ConfigMap with `MEMORY.md`) is preserved as a **legacy fallback**. If an Agent has `spec.memory.enabled: true` but does not include the `memory` SkillPack, the controller falls back to the ConfigMap approach.
 
 To migrate:
 
-1. Add `memory` to the instance's skills list.
+1. Add `memory` to the Agent's skills list.
 2. Existing ConfigMap memories can be imported by storing them via `memory_store` during the first run — the agent's skill instructions include guidance for this.
 3. Once migrated, you can disable the legacy ConfigMap by removing `spec.memory.enabled` or setting it to `false`.
 
-Both systems can coexist during the transition period. The memory sidecar takes precedence when both are present.
+Both systems can coexist during the transition period. The memory server takes precedence when both are present. Ensembles still create a seeded `<agent>-memory` ConfigMap alongside the `memory` SkillPack.

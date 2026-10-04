@@ -44,16 +44,26 @@ sympozium version
 
 ## Deploy the control plane
 
-Sympozium needs its CRDs, controller, NATS event bus, and webhook installed in
-your cluster. The CLI handles this automatically during onboarding, or you can
-do it manually:
+Sympozium needs its CRDs, controller, API server, NATS event bus, and webhook
+installed in your cluster:
 
 ```bash
 sympozium install
 ```
 
-This creates the `sympozium-system` namespace and deploys all components. It is
-idempotent — safe to run again if something changes.
+This creates the `sympozium-system` namespace and deploys the control plane,
+the built-in Ensembles, SkillPacks and policies, the
+[Celln](concepts/celln-backend.md) hardware-isolated execution plane, and
+[ergoz](https://github.com/sympozium-ai/ergoz) accelerator power telemetry
+(`--no-celln` / `--no-ergoz` skip them). It is idempotent — safe to run again
+to upgrade.
+
+If `DEEPSEEK_API_KEY`, `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` is set (or you
+answer the prompt in a terminal), the same command installs the **Celln
+fleet**: every node with `/dev/kvm` and a kernel under `/boot` runs
+long-running, hardware-isolated agents for every namespace, one model backend
+per key. On Kind, copy the host kernel into each node first — see
+[Celln Fleet Installation](guides/celln-fleet-installation.md#prerequisites).
 
 ---
 
@@ -65,7 +75,10 @@ Sympozium offers two onboarding paths:
    the TUI wizard. One action creates multiple purpose-built agents with skills,
    schedules, memory, and tool policies.
 2. **Manual onboard** — create a single Agent with `sympozium onboard`.
-   Best for custom setups or CI/headless environments.
+   Best for custom setups or headless environments.
+
+You can also create Agents, runs and Celln conversations from the
+[web dashboard](#the-web-dashboard).
 
 ### Ensemble activation (recommended)
 
@@ -75,19 +88,24 @@ Launch the TUI:
 sympozium
 ```
 
-The TUI opens on the **Personas** tab, listing the built-in Ensembles:
+The TUI opens on the **Ensembles** tab, listing the built-in Ensembles:
 
-| Pack | Personas | Focus |
-|------|----------|-------|
+| Pack | Agents | Focus |
+|------|--------|-------|
 | `platform-team` | security-guardian, sre-watchdog, platform-engineer | Security audit, cluster health, scheduled ops |
 | `devops-pipeline-example` | incident-responder, cost-analyzer | Incident triage, resource optimisation |
+| `developer-team` | 7 (tech lead, backend, frontend, QA, reviewer, DevOps, docs) | A software team on one GitHub repository |
+| `research-delegation-example` | lead, researcher, writer, reviewer | Delegation and sequential workflows |
+| `code-analysis-team`, `subagent-analysis-example` | 1–2 | Dynamic sub-agent spawning |
+| `observability-mcp-example` | 2 | SRE investigation through MCP servers |
+| `local-inference-example` | 2 | Runs entirely on a cluster-local `Model` |
 
 Press **Enter** on a pack to start the activation wizard:
 
 | Step | What it does |
 |------|-------------|
 | **1 — Pick personas** | Review the personas in the pack, deselect any you don't need |
-| **2 — Provider** | Choose your LLM provider (OpenAI, Anthropic, Azure OpenAI, Ollama, LM Studio, Unsloth, or custom endpoint) |
+| **2 — Provider** | Choose your LLM provider (OpenAI, Anthropic, Azure OpenAI, AWS Bedrock, Ollama, LM Studio, llama-server, Unsloth, or custom endpoint) |
 | **3 — API key** | Paste your API key (stored as a Kubernetes Secret) |
 | **4 — Model** | Pick a model (e.g. `gpt-4o`, `claude-sonnet-4-20250514`, `llama3`) |
 | **5 — Channels** | Optionally bind messaging channels (Telegram, Slack, Discord, WhatsApp) |
@@ -95,43 +113,47 @@ Press **Enter** on a pack to start the activation wizard:
 
 Within seconds you'll have multiple agents running on schedules, each with
 their own skills, memory, and tool policies. The TUI switches to the
-**Instances** tab where you can see them come online.
+**Agents** tab where you can see them come online.
 
 **What gets created:**
 
 For each persona in the pack, the Ensemble controller creates:
 
-- A **Agent** — the agent identity with model, skills, and auth
+- An **Agent** — the agent identity with model, skills, and auth
 - A **SympoziumSchedule** — the recurring task (heartbeat, sweep, or cron)
-- A **ConfigMap** — persistent memory seeded with initial context
+- **Persistent memory** — the `memory` SkillPack (a per-Agent memory server
+  with SQLite on a PVC) plus a ConfigMap seeded with initial context
 
 All resources are owned by the Ensemble — deleting the pack cascades to
 everything it created.
 
-### Manual onboard (single instance)
+### Manual onboard (single Agent)
 
-For a single custom agent, or in headless/CI environments:
+For a single custom agent, or in headless environments:
 
 ```bash
-sympozium onboard           # TUI wizard
-sympozium onboard --console # plain text fallback for CI
+sympozium onboard           # interactive text wizard
 ```
 
-The wizard walks you through six steps:
+The wizard (also available in the TUI with `O` or `/onboard`) walks you
+through nine steps:
 
 | Step | What it does |
 |------|--------------|
 | **1 — Cluster check** | Verifies the cluster is reachable and Sympozium is installed. Offers to run `sympozium install` if CRDs are missing. |
-| **2 — Provider** | Choose your LLM provider (OpenAI, Anthropic, Azure OpenAI, Ollama, LM Studio, Unsloth, or any OpenAI-compatible endpoint). Enter a base URL if needed, then paste your API key. |
-| **3 — Channel** | Optionally connect a messaging channel (Telegram, Slack, Discord, WhatsApp) or skip for now. |
-| **4 — Policy** | Choose a policy preset: **Permissive** (everything allowed), **Default** (commands require approval), or **Restrictive** (very locked-down). |
-| **5 — Heartbeat** | Pick how often the agent should wake up on its own: every 30 min, hourly (recommended), every 6 hours, daily at 9 AM, or disabled. |
-| **6 — Confirm** | Review a summary of your choices and apply. |
+| **2 — Namespace** | Pick the namespace for the Agent. |
+| **3 — Agent** | Name your Agent. |
+| **4 — Provider** | Choose your LLM provider (OpenAI, Anthropic, Azure OpenAI, AWS Bedrock, Ollama, LM Studio, llama-server, Unsloth, or any OpenAI-compatible endpoint), enter a base URL if needed, your API key, and a model. |
+| **5 — GitHub repository** | Optionally connect a repository for GitOps skills. |
+| **6 — Instructions** | Optional system instructions for the Agent. |
+| **7 — Channel** | Optionally connect a messaging channel (Telegram, Slack, Discord, WhatsApp). |
+| **8 — Policy** | Choose a policy preset: **Permissive** (everything allowed), **Default** (commands require approval), or **Restrictive** (very locked-down). |
+| **9 — Heartbeat** | Pick how often the agent should wake up on its own: every 30 min, hourly (recommended), every 6 hours, daily at 9 AM, or disabled. |
 
 The wizard creates:
 
 - A **Kubernetes Secret** with your API key
-- A **Agent** custom resource (your agent identity)
+- An **Agent** custom resource (your agent identity)
 - A **SympoziumPolicy** (tool-gating rules)
 - A **SympoziumSchedule** heartbeat (unless you chose "disabled")
 
@@ -148,14 +170,14 @@ access it from your workstation, use the CLI:
 sympozium serve
 ```
 
-This port-forwards the in-cluster API server to `http://127.0.0.1:8080` and
+This port-forwards the in-cluster API server to `http://127.0.0.1:9090` and
 prints the authentication token. Log in with the token shown in the terminal.
 
 ### Options
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--port` | `8080` | Local port to forward to |
+| `--port` | `9090` | Local port to forward to |
 | `--open` | `false` | Automatically open a browser |
 | `--service-namespace` | `sympozium-system` | Namespace of the apiserver service |
 
@@ -177,17 +199,25 @@ sympozium token
 
 The web dashboard provides a graphical interface for **all** Sympozium actions:
 
-- **Dashboard** — cluster overview with instance counts, run stats, and recent activity
-- **Instances** — list, create, and delete Agents
+- **Dashboard** — cluster overview with agent counts, run stats, and recent activity
+- **Agents** — list, create, and delete Agents; choose the execution plane
+  (Kubernetes or Celln), harness runtime and, on the Celln fleet, the
+  **Model backend**
+- **Agents → Chat / Harness** — start or resume a persistent conversation:
+  an AgentHarness session (Pi, Hermes) or an enduring Celln conversation
+  (with **Answer once** for one-shots and **Restart elsewhere** to continue
+  on another node)
 - **Runs** — view all AgentRuns, inspect logs, create new runs
-- **Agents → Chat** — start or resume a persistent private conversation when
-  the Agent has a session-capable AgentHarness runtime
 - **Harnesses** — inspect administrator-approved harness runtimes and advanced
   session state
 - **Policies** — browse SympoziumPolicy rules
 - **Skills** — explore installed SkillPacks
 - **Schedules** — list and manage SympoziumSchedules
-- **Personas** — browse and activate Ensembles
+- **Ensembles** — browse and activate Ensembles
+- **Models**, **Topology** and **Infrastructure** — cluster-local models,
+  node fitness and, with an energy collector such as ergoz, live accelerator
+  power
+- **MCP Servers** and **Gateway** — external tool providers and web-endpoint routing
 
 ### Helm values
 
@@ -217,9 +247,11 @@ From the dashboard you can:
 
 - **Send tasks** to your agent by typing a message and pressing Enter.
 - **View runs** — see live status of current and past AgentRuns.
-- **Edit an instance** — open the edit modal (press `e`) to change the
+- **Edit an Agent** — open the edit modal (press `e`) to change the
   heartbeat schedule, review memory, or toggle skills.
-- **Switch instances** — if you have multiple Agents.
+- **Switch Agents** — if you have multiple Agents.
+
+See the [TUI reference](reference/tui.md) for every view and key.
 
 ---
 
@@ -457,8 +489,7 @@ iteration without approval gates.
 
 ## Built-in SkillPacks
 
-Sympozium ships with six built-in SkillPacks. Enable them on any
-Agent:
+Sympozium installs ten built-in SkillPacks. Enable them on any Agent:
 
 | SkillPack | Category | What it includes |
 |-----------|----------|------------------|
@@ -466,16 +497,21 @@ Agent:
 | **sre-observability** | SRE | Observability triage with Prometheus queries, Loki/kubectl log analysis, and event correlation. Comes with a sidecar and read-only observability RBAC. |
 | **incident-response** | SRE | Structured incident triage, log analysis, rollback procedures. |
 | **code-review** | Development | Code review checklist, security anti-patterns, Go-specific review patterns. |
+| **software-dev** | Development | Software development workflows used by the `developer-team` Ensemble. |
+| **github-gitops** | GitOps | GitHub repository, issue and pull-request workflows. See [GitHub GitOps](skills/github-gitops.md). |
+| **memory** | Core | Persistent memory with full-text search across runs. See [Persistent Memory](concepts/persistent-memory.md). |
+| **subagents** | Orchestration | Dynamically spawn sub-agents to parallelize or pipeline work. |
 | **llmfit** | SRE | Node-level model placement analysis. Runs llmfit probes per node and ranks best nodes for requested models. Comes with a sidecar containing `llmfit`, `kubectl`, and `jq`. |
 | **web-endpoint** | Connectivity | Expose agents as HTTP APIs — OpenAI-compatible chat completions and MCP protocol. Deploys a long-lived web-proxy sidecar with bearer-token auth and rate limiting. See [Web Endpoint Skill](skills/web-endpoint.md). |
 
-Apply them from the `config/skills/` directory:
+The chart installs them automatically. To apply them by hand from a checkout,
+use the `config/skills/` directory:
 
 ```bash
 kubectl apply -f config/skills/
 ```
 
-Or enable them through the TUI edit modal (press `e` on your instance, go to
+Or enable them through the TUI edit modal (press `e` on your Agent, go to
 the **Skills** tab).
 
 ---
@@ -523,7 +559,7 @@ You can change the heartbeat at any time through the TUI edit modal or by
 editing the SympoziumSchedule CR directly:
 
 ```bash
-kubectl edit sympoziumschedule <instance>-heartbeat
+kubectl edit sympoziumschedule <agent>-heartbeat
 ```
 
 ---
@@ -557,6 +593,10 @@ kubectl get agentrun quick-check -w   # watch status.phase
 ```
 
 The phase transitions: `Pending` → `Running` → `Succeeded` (or `Failed`).
+
+To run the same task in a hardware-isolated Celln cell instead of a pod, set
+`backend: celln` and select a Celln backend's wrapper Agent and runtime; see
+[Celln Backend](concepts/celln-backend.md#selecting-celln-in-yaml).
 
 ---
 
@@ -610,7 +650,7 @@ spec:
 kubectl apply -f my-team-ensemble.yaml
 ```
 
-The pack appears in the TUI Personas tab in `Pending` phase. Press Enter to
+The pack appears in the TUI Ensembles tab in `Pending` phase. Press Enter to
 activate it with your API key — the controller does the rest.
 
 ---
@@ -642,9 +682,9 @@ networkPolicies:
 Then upgrade:
 
 ```bash
-helm upgrade sympozium-crds oci://ghcr.io/sympozium-ai/sympozium/charts/sympozium-crds \
-  -n sympozium-system
-helm upgrade sympozium      oci://ghcr.io/sympozium-ai/sympozium/charts/sympozium \
+helm repo add sympozium https://deploy.sympozium.ai/charts && helm repo update
+helm upgrade sympozium-crds sympozium/sympozium-crds -n sympozium-system
+helm upgrade sympozium      sympozium/sympozium \
   -n sympozium-system --skip-crds --set createNamespace=false -f values.yaml
 ```
 
@@ -654,4 +694,5 @@ helm upgrade sympozium      oci://ghcr.io/sympozium-ai/sympozium/charts/sympoziu
 - **Write a custom SkillPack** — see [Writing Skills](guides/writing-skills.md)
 - **Add a new tool** — see [Writing Tools](guides/writing-tools.md)
 - **Write integration tests** — see [Writing Integration Tests](guides/writing-integration-tests.md)
-- **Read the full architecture** — see [Design Document](design.md)
+- **Run agents in hardware-isolated cells** — see [Celln Backend](concepts/celln-backend.md)
+- **Read the architecture** — see [Architecture](architecture.md)

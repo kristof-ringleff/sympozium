@@ -41,7 +41,7 @@ effective-permission preview on its Harness tab is available after creation.
 Existing approvals for another Agent are not transferable. An unapproved run
 must remain unapproved rather than acquiring authority from wizard defaults.
 
-See [the paired Agent/AgentRun YAML example](../../config/samples/agent-native-execution-defaults.yaml).
+See [the paired Agent/AgentRun YAML example](https://github.com/sympozium-ai/sympozium/blob/main/config/samples/agent-native-execution-defaults.yaml).
 
 ### Start a run or override its defaults
 
@@ -252,7 +252,7 @@ not supported by this single-owner package.
 Once installation is qualified, select the dedicated namespace in the UI,
 create a Harness run, choose Celln and enduring conversation, then explicitly
 select approved starter revisions. See
-[the YAML example](../../config/samples/celln-native-starter-run.yaml). The
+[the YAML example](https://github.com/sympozium-ai/sympozium/blob/main/config/samples/celln-native-starter-run.yaml). The
 installed operator template must match the chosen model, persona and ceilings.
 Read/write are logical run-owned artifacts, not host paths; HTTPS destinations
 and budgets are explicit grants. Tools cannot be added to a live parent.

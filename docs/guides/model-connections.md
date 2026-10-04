@@ -40,7 +40,7 @@ unauthenticated endpoint, leave the key blank. The controller supplies an inert
 `OPENAI_API_KEY` placeholder because the SDK/adapter requires a nonempty setting
 even when the server does not authenticate. It creates no Secret.
 
-See [the complete Hermes example](../../config/samples/hermes-framework-connection.yaml)
+See [the complete Hermes example](https://github.com/sympozium-ai/sympozium/blob/main/config/samples/hermes-framework-connection.yaml)
 for the Agent and HarnessSession manifests. API/wizard Agent creation creates
 `<agent>-chat` automatically; declarative creation also requires a HarnessSession.
 

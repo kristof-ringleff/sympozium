@@ -112,14 +112,15 @@ at two different layers, and they compose with different things:
 |---|---|---|
 | Selected by | `spec.backend` | `spec.task.mode` |
 | Changes | **where** the run executes | **what process runs** inside the Job |
-| Composes with | nothing — it bypasses the pod entirely | `agentSandbox`, gates, ensembles, MCP, skills, memory |
-| Runtime owned in | [the celln repo](https://github.com/sympozium-ai/celln) | the adapter's repo |
-| Footprint when unused | zero (`celln.enabled=false`) | zero (no image, no chart resource) |
+| Composes with | Celln's own runtime profiles and borrowed tools — it bypasses the pod entirely | `agentSandbox`, gates, ensembles, MCP, skills, memory |
+| Runtime owned in | [the celln repo](https://github.com/sympozium-ai/celln) (the in-cell harness comes from the reviewed starter package) | the adapter's repo |
+| Footprint when unused | zero with `--no-celln` (`celln.enabled=false`) | zero (no image, no chart resource) |
 
 Two consequences worth knowing:
 
-- **`mode: harness` + `backend: celln` is rejected at admission.** Celln dispatches the task
-  string to its router and never builds a pod, so there is no agent container to replace.
+- **`mode: harness` + `backend: celln` is rejected at admission.** Celln runs its own
+  harness inside a cell (selected through a Celln `AgentRuntime` wrapper and
+  `cellnSelection`) and never builds a pod, so there is no agent container to replace.
   Admitting it would run the task with the harness image silently ignored, which is exactly
   the failure the [capability descriptor](#capability-descriptors) exists to prevent.
 - **`agentSandbox` works normally.** It builds its pod through `buildAgentPodTemplate`, which
@@ -127,9 +128,10 @@ Two consequences worth knowing:
   isolation like any other.
 
 Harness mode requires an explicit policy opt-in because it changes the trusted primary
-process and exposes the run's model and MCP credentials to that process. Celln's enable flag
-instead controls deployment of its privileged installer DaemonSet; the two gates protect
-different boundaries.
+process and exposes the run's model and MCP credentials to that process. Celln's gates are its own: the
+namespace's `CellnExecutionPolicy`, the runtime profile and the lent tool revisions decide what a
+cell may do, and `--no-celln` keeps its privileged node components off the cluster entirely. The
+two gates protect different boundaries.
 
 ## What Sympozium supplies
 

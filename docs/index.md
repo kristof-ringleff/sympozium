@@ -2,8 +2,9 @@
 
 **A coordination layer for multi-agent AI systems on Kubernetes**
 
-Every agent is an ephemeral Pod. Every policy is a CRD. Every execution is a Job.
-Coordinate multi-agent workflows on Kubernetes — from single tasks to coordinated teams.
+Every agent runs in an isolated workload — an ephemeral Pod, or a hardware-isolated
+Celln microVM. Every policy is a CRD. Coordinate multi-agent workflows on
+Kubernetes — from single tasks and long-running conversations to coordinated teams.
 Multi-tenant. Horizontally scalable. Safe by design.
 
 Sympozium decides what agents *do*. Where compute happens belongs to
@@ -34,8 +35,9 @@ to the serving engine. See [Positioning](positioning.md) for the boundary.
 Then deploy to your cluster and activate your first agents:
 
 ```bash
-sympozium install          # deploys CRDs, controllers, and built-in Ensembles
-sympozium                  # launch the TUI — go to Personas tab, press Enter to onboard
+sympozium install          # deploys CRDs, controllers, built-in Ensembles, the Celln plane and ergoz
+                           # (with DEEPSEEK_/OPENAI_/ANTHROPIC_API_KEY set: the Celln fleet on every KVM node)
+sympozium                  # launch the TUI — go to the Ensembles tab, press Enter to onboard
 sympozium serve            # open the web dashboard (port-forwards to the in-cluster UI)
 ```
 
@@ -57,13 +59,15 @@ Every concept that traditional agent frameworks manage in application code, Symp
 ## Key Features
 
 - **Ephemeral agent pods** — each agent run is an isolated Kubernetes Job with its own security context
+- **Hardware-isolated agents (Celln)** — one-shot and long-running agents in KVM microVMs on every labelled node, each Agent choosing its model backend; conversations continue on another node if theirs is lost
+- **AgentHarness** — run approved external harnesses (Pi, Hermes) as one-shot runs or persistent chat sessions
 - **Skill sidecars** — every skill runs in its own container with auto-provisioned, least-privilege RBAC
 - **Ensembles** — pre-configured bundles of agents that activate with a few keypresses
 - **Multiple interfaces** — k9s-style TUI, full web dashboard, or CLI
 - **Channel integrations** — Telegram, Slack, Discord, WhatsApp
-- **Persistent memory** — agents retain context across runs via ConfigMap-backed memory
+- **Persistent memory** — agents retain context across runs via a SQLite + FTS5 memory server on a PersistentVolume
 - **Policy-as-CRD** — feature and tool gating enforced at admission time
-- **OpenTelemetry** — built-in observability with traces and metrics
+- **OpenTelemetry** — built-in observability with traces, metrics, token usage and cost estimates; accelerator power via ergoz
 - **Web endpoints** — expose agents as OpenAI-compatible APIs and MCP servers
 - **Scheduled tasks** — cron-based recurring agent runs
 - **Local inference discovery** — node-probe DaemonSet discovers Ollama/vLLM/llama-cpp on host nodes with automatic model listing and node pinning
@@ -76,10 +80,13 @@ Every concept that traditional agent frameworks manage in application code, Symp
 |-------|-------------|
 | [Getting Started](getting-started.md) | Install, deploy, and onboard your first agent |
 | [Architecture](architecture.md) | System design and how it all fits together |
-| [Custom Resources](concepts/custom-resources.md) | The ten CRDs that model every agentic concept |
+| [Custom Resources](concepts/custom-resources.md) | The CRDs that model every agentic concept |
 | [Ensembles](concepts/ensembles.md) | Pre-configured agent bundles |
 | [Skills & Sidecars](concepts/skills.md) | Isolated tool containers with ephemeral RBAC |
 | [Lifecycle Hooks](concepts/lifecycle-hooks.md) | PreRun and postRun containers for setup and teardown |
+| [Celln Backend](concepts/celln-backend.md) | Hardware-isolated one-shot and enduring agents |
+| [Celln Fleet Installation](guides/celln-fleet-installation.md) | Model backends, toolbox, capacity and operations for the fleet |
+| [AgentHarness](guides/agentharness.md) | Approved external harnesses and persistent chat sessions |
 | [Security](concepts/security.md) | Defence-in-depth at every layer |
 | [Writing Skills](guides/writing-skills.md) | Build your own SkillPacks |
 | [Writing Tools](guides/writing-tools.md) | Add new tools to the agent runner |

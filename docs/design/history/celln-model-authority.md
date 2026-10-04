@@ -1,0 +1,163 @@
+# Independent Celln model authority
+
+!!! note "Historical record"
+    This page records a Celln development milestone (September 2026). Interfaces and limits it
+    describes may since have changed or been replaced by the Celln fleet. For current behaviour
+    see [Celln Backend](../../concepts/celln-backend.md) and
+    [Celln Fleet Installation](../../guides/celln-fleet-installation.md).
+
+Tool approval does not grant permission to spend a model credential. The
+control-plane `cellnauthority.ModelLoader` reads a separate operator-configured
+ConfigMap, with its document in `data["model-policy.json"]`. Its location must
+come from trusted deployment configuration, not an AgentRun. RBAC must deny
+tenant writes; labels and same-named tenant ConfigMaps do not prove ownership.
+The model policy source must differ from each of the three tool-grant sources.
+
+The `sympozium.ai/celln-model-policy-v1` document contains:
+
+- `agent` and `runtime`: complete `Subject` identities from the reviewed
+  selection (namespace, name, UID, generation and full-spec SHA256).
+- `provider`, `model`, `url`: exact model authority. The currently supported
+  contract is `deepseek`, an explicit model, and
+  `https://api.deepseek.com/chat/completions`.
+- `credentialProfile`: an opaque 1–64 character alphanumeric/underscore/hyphen
+  name for an independently configured host credential mapping. Not a path,
+  secret value, Kubernetes Secret reference, or authorization by itself.
+- `maxRequests`: 1–6, at least the selected runtime's maximum turns.
+- `maxOutputTokens`: 512, matching the current host broker contract.
+- `maxTotalOutputTokens`: 512–3072 and at least `maxTurns * 512`, matching the
+  host's non-refundable reservation for every configured JSON Harness turn.
+  Insufficient funding refuses; it must never be silently expanded.
+
+Resolution revalidates the frozen selection, reads the policy, compares the
+live run's full identity and explicit model options, then revalidates selection
+and policy revision again. Nonempty tenant credential references, provider
+headers, model discovery, node selectors and unsupported thinking modes refuse
+instead of falling back to an ambient provider or credential. Documents are
+bounded to 64 KiB and unknown fields or trailing JSON refuse.
+
+The resulting `sympozium.ai/celln-model-approval-v1` record pins the complete
+frozen-selection SHA256, run-derived caller, policy content and source
+namespace/name/UID/resourceVersion/exact-document SHA256. Revalidation compares
+the entire record and never substitutes a new plan or execution ID.
+
+Operators can add `--model-policy CONFIGMAP` to `celln-tool plan` or
+`celln-tool compose`, along with `--run` and the existing grant-source flags.
+The policy resides in `--grant-namespace`. Composition revalidates model
+approval after building artifacts. These commands print a `modelApproval`
+observation and keep `executionAuthorized: false`.
+
+## Per-connection request policy (model gateway)
+
+On the gateway-mediated path the request settings of an Agent belong to its own
+namespaced `ModelConnection`, not to a fleet-wide backend. Two optional fields
+of `spec` carry them, and the model gateway enforces both on every invocation
+from the live spec:
+
+```yaml
+apiVersion: sympozium.ai/v1alpha1
+kind: ModelConnection
+metadata: {name: team-model, namespace: team-a}
+spec:
+  provider: openai
+  protocol: openai-chat
+  endpoint: https://api.example.com/v1/chat/completions
+  secretRef: team-model-key
+  models: [example-model]
+  maxOutputTokens: 2048
+  parameters:
+    temperature: 0.7
+    chat_template_kwargs: {enable_thinking: false}
+```
+
+- `maxOutputTokens`: the output tokens one request may ask for, 256–4096;
+  omitted means 512. A request above it refuses (`MODEL_AUTH_FORBIDDEN`). The
+  turn's own output-token cap from the signed decision still applies, so a
+  raised bound is only usable when the turn is funded for it.
+- `parameters`: a JSON object merged into every provider request. The same
+  rules as fleet backend parameters apply (one implementation,
+  `api/v1alpha1.ValidateModelParameters`): at most 16 top-level keys matching
+  `^[a-z][a-z0-9_]{0,63}$`, 3 levels deep, 2048 bytes serialized, no `null`, and
+  none of the fields the host owns: `model`, `messages`, `system`, `stream`,
+  `stream_options`, `max_tokens`, `max_completion_tokens`, `n`, `tools`,
+  `tool_choice`, `functions`, `function_call`, `parallel_tool_calls`, `user`.
+  A connection that breaks a rule is invalid: nothing resolves or runs on it.
+
+Both are **host-pinned operator policy**. The guest never sees them and cannot
+set or override them: a guest body that carries any key of the connection's
+`parameters` is refused outright (even with an equal value) rather than merged,
+and top-level guest fields must use the exact provider field names, so a key
+cannot be aliased by letter case. Precedence therefore never arises: a
+forwarded body holds the guest's fields and the operator's parameters, and the
+two sets are disjoint.
+
+The guest body is validated, canonicalised and digested for the reservation
+exactly as before, and its integer-only number rule is unchanged (a guest
+`"temperature": 0.7` still refuses). Parameters are appended to the canonical
+guest body only afterwards and never pass through that canonicaliser, so
+fractional values such as `temperature: 0.7` are forwarded as the operator
+wrote them. The reservation's request digest covers the guest body alone.
+
+Both fields are covered by the decision's `route.modelConnectionSpecSha256`,
+which the issuer and the gateway compute from the same view of the spec
+(`ModelConnectionSpec.DigestView`). Because decision digests use integer-only
+canonical JSON, `parameters` enters that view as one string: its key-sorted
+compact JSON text. A connection without `parameters` digests exactly as it did
+before the fields existed. The gateway re-reads the spec on every invocation,
+so editing `parameters` or `maxOutputTokens` refuses every run pinned to the old
+spec (`MODEL_ROUTE_CHANGED`) instead of silently retargeting it; new runs pick
+up the new policy.
+
+The fields are only valid on gateway-mediated connections (`secretRef`, or no
+credential). A connection with a host `credentialProfile` is served by the
+native host broker, which does not read them, so combining them is refused.
+
+## Remaining issuance boundary
+
+### Catalogue-derived execution candidate
+
+Operator `celln-tool plan` accepts paired `--execution-mote` and
+`--execution-closure` hashes with `--run` and `--model-policy`. These name actual
+packaging outputs, not the runtime profile's template mote. The command derives
+a `celln.dev/v1alpha3` request from the revalidated frozen selection and live
+AgentRun: exact task/persona/model, runtime executable, ordered borrowed tools,
+schema/loop limits, intersected memory/output ceilings, and the lower of the
+run timeout and runtime ceiling. It does not accept a caller-provided tool list
+or task override at this stage.
+
+The deterministic execution ID binds the frozen run/selection/model approval
+and materialized artifact hashes. A retry must persist/reuse this candidate;
+changed approval must be reconciled, not silently turned into a fresh attempt.
+SessionKey is only correlation metadata here: this is not a transcript or
+conversation implementation. Pod environment, sidecars/skills, parent runs,
+custom lifecycle/storage, server/dry-run modes, existing low-level Celln bindings
+and unsupported context settings refuse instead of being silently discarded.
+
+The candidate contains a zero placeholder model-grant hash. It is **not
+authorized for dispatch**. Hash syntax validation does not authenticate the
+packaging outputs. Trusted provisioning must verify their exact composition
+sources, obtain the actual host request binding and issue a grant after fresh
+approval checks. The host issuer must independently verify artifacts and model
+policy. Tests include passing the generated request to the actual Celln
+`harness-binding` command; that is parser/binding compatibility, not KVM/model
+execution or deployed controller proof.
+
+### Host bridge still required
+
+The model-policy resolver reads no credentials, writes no Kubernetes resources or
+host grant files, and performs no model calls. Tests use a fake Kubernetes API;
+they are not deployment/RBAC or live-model proof. Observed rereads are not an
+atomic transaction, lease or fleet-wide withdrawal guarantee.
+
+The host issuer must still independently authenticate its control-plane caller,
+resolve `credentialProfile` through operator-owned host configuration, validate
+the actual admitted/prewarmed mote and composed closure, bind exact runtime,
+borrowed tools, persona and budgets, and publish a content-addressed grant only
+after fresh policy checks. Distribution, issuer/controller integration and the
+catalogue-backed real-model E2E remain required. An uploaded approval JSON or
+successful prewarm observation alone must never create model authority.
+
+The [local operator issuance bridge](celln-local-issuance.md) now connects these
+approvals to the real host issuer, including failure cleanup and explicit
+withdrawal. It is not yet an autonomous deployed controller or a crash-safe
+fleet approval watcher; see its recovery limits before use.

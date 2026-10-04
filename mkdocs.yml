@@ -44,6 +44,40 @@ theme:
 
 plugins:
   - search
+  - redirects:
+      redirect_maps:
+        guides/celln-catalogue-controller-bridge.md: design/history/celln-catalogue-controller-bridge.md
+        guides/celln-durable-issuance-cli.md: design/history/celln-durable-issuance-cli.md
+        guides/celln-enduring-run.md: design/history/celln-enduring-run.md
+        guides/celln-framework-manual-review.md: design/history/celln-framework-manual-review.md
+        guides/celln-harness-selection-ux.md: design/history/celln-harness-selection-ux.md
+        guides/celln-interactive-session.md: design/history/celln-interactive-session.md
+        guides/celln-issuer-client.md: design/history/celln-issuer-client.md
+        guides/celln-issuer-service.md: design/history/celln-issuer-service.md
+        guides/celln-issuer-systemd.md: design/history/celln-issuer-systemd.md
+        guides/celln-json-harness.md: design/history/celln-json-harness.md
+        guides/celln-live-catalogue-proof.md: design/history/celln-live-catalogue-proof.md
+        guides/celln-local-issuance.md: design/history/celln-local-issuance.md
+        guides/celln-mlp-acceptance.md: design/history/celln-mlp-acceptance.md
+        guides/celln-mlp-borrowed-tools.md: design/history/celln-mlp-borrowed-tools.md
+        guides/celln-mlp-installation.md: design/history/celln-mlp-installation.md
+        guides/celln-mlp-kind-network.md: design/history/celln-mlp-kind-network.md
+        guides/celln-mlp-troubleshooting.md: design/history/celln-mlp-troubleshooting.md
+        guides/celln-model-authority.md: design/history/celln-model-authority.md
+        guides/celln-parent-hands-on.md: design/history/celln-parent-hands-on.md
+        guides/celln-parent-only-controller.md: design/history/celln-parent-only-controller.md
+        guides/celln-permission-preview.md: design/history/celln-permission-preview.md
+        guides/celln-reference-harness.md: design/history/celln-reference-harness.md
+        guides/celln-registered-issuance.md: design/history/celln-registered-issuance.md
+        guides/celln-router-deployment.md: design/history/celln-router-deployment.md
+        guides/celln-router-execution-client.md: design/history/celln-router-execution-client.md
+        guides/celln-router-prewarm-client.md: design/history/celln-router-prewarm-client.md
+        guides/celln-runtime-profile.md: design/history/celln-runtime-profile.md
+        guides/celln-tenancy-migration.md: design/history/celln-tenancy-migration.md
+        guides/celln-tool-authority.md: design/history/celln-tool-authority.md
+        guides/celln-tool-catalogue.md: design/history/celln-tool-catalogue.md
+        guides/celln-tool-review.md: design/history/celln-tool-review.md
+        architecture-simplified.md: design/history/architecture-simplified.md
 
 markdown_extensions:
   - admonition
@@ -84,42 +118,54 @@ nav:
     - Custom Resources: concepts/custom-resources.md
     - Ensembles: concepts/ensembles.md
     - Skills & Sidecars: concepts/skills.md
+    - Skills, Tools & Execution: concepts/skills-tools-and-execution.md
     - Lifecycle Hooks: concepts/lifecycle-hooks.md
     - Task Modes:
       - Sidecar-Driven Mode: modes/sidecar-driven.md
       - Harness Mode: modes/harness.md
       - Writing a Harness Adapter: modes/harness-adapters.md
       - Adding a Task Mode: modes/extension-guide.md
-    - Channels: concepts/channels.md
-    - Agent Sandboxing: concepts/agent-sandbox.md
     - Celln Backend: concepts/celln-backend.md
-    - Skills, Tools & Execution: concepts/skills-tools-and-execution.md
-    - Security: concepts/security.md
+    - Agent Sandboxing: concepts/agent-sandbox.md
+    - MCP Servers: mcp-servers.md
+    - Channels: concepts/channels.md
     - Persistent Memory: concepts/persistent-memory.md
+    - Persistent Workspaces: concepts/workspaces.md
     - Scheduled Tasks: concepts/scheduled-tasks.md
+    - Security: concepts/security.md
     - Observability: concepts/observability.md
-  - Sidecars:
-    - Writing Tool Sidecars: sidecars/writing-tool-sidecars.md
-    - Writing Orchestrator Sidecars: sidecars/writing-orchestrator-sidecars.md
   - Guides:
-    - Your First AgentRun: guides/first-agentrun.md
-    - AgentHarness: guides/agentharness.md
-    - AgentHarness UX: guides/agentharness-ux.md
-    - Native Celln Installation: guides/celln-native-installation.md
-    - Celln Fleet Installation: guides/celln-fleet-installation.md
-    - Celln Mediated Model Access: guides/celln-mediated-model-access.md
-    - Using Ollama: guides/ollama.md
-    - LM Studio & Local Inference: guides/lm-studio.md
-    - Unsloth: guides/unsloth.md
-    - AWS Bedrock: guides/aws-bedrock.md
-    - Serving Mode: guides/serving-mode.md
-    - Writing Ensembles: guides/writing-ensembles.md
-    - Prompt Engineering: guides/prompt-engineering.md
-    - Writing Skills: guides/writing-skills.md
-    - Writing Tools: guides/writing-tools.md
-    - Writing Integration Tests: guides/writing-integration-tests.md
-    - Writing UX Tests (Cypress): guides/writing-ux-tests.md
-    - Detailed File Logging: guides/detailed-logging.md
+    - Agents:
+      - Your First AgentRun: guides/first-agentrun.md
+      - Writing Ensembles: guides/writing-ensembles.md
+      - Prompt Engineering: guides/prompt-engineering.md
+      - Serving Mode: guides/serving-mode.md
+      - Context Cost: guides/context-cost.md
+      - Detailed File Logging: guides/detailed-logging.md
+    - AgentHarness:
+      - AgentHarness: guides/agentharness.md
+      - AgentHarness UX: guides/agentharness-ux.md
+    - Celln:
+      - Celln Fleet Installation: guides/celln-fleet-installation.md
+      - Native Celln Installation: guides/celln-native-installation.md
+      - Mediated Model Access: guides/celln-mediated-model-access.md
+      - Model Gateway Component: guides/celln-model-gateway-component-installation.md
+      - Host Router Migration (legacy): guides/celln-external-router-migration.md
+    - Models & Providers:
+      - Model Connections: guides/model-connections.md
+      - Cluster-Local Models: guides/local-models.md
+      - Using Ollama: guides/ollama.md
+      - LM Studio & Local Inference: guides/lm-studio.md
+      - llama-server: guides/llama-server.md
+      - Unsloth: guides/unsloth.md
+      - AWS Bedrock: guides/aws-bedrock.md
+    - Extending:
+      - Writing Skills: guides/writing-skills.md
+      - Writing Tools: guides/writing-tools.md
+      - Writing Tool Sidecars: sidecars/writing-tool-sidecars.md
+      - Writing Orchestrator Sidecars: sidecars/writing-orchestrator-sidecars.md
+      - Writing Integration Tests: guides/writing-integration-tests.md
+      - Writing UX Tests (Cypress): guides/writing-ux-tests.md
   - Skills Reference:
     - LLMFit: skills/llmfit.md
     - Web Endpoint: skills/web-endpoint.md
@@ -132,5 +178,13 @@ nav:
     - Helm Chart: reference/helm.md
     - Testing: reference/testing.md
   - Sympozium vs kagent: sympozium-vs-kagent.md
-  - Design Document: design.md
-  - Roadmap: roadmap.md
+  - Design & History:
+    - Design Notes: design/index.md
+    - Original Design (Feb 2026): design.md
+    - Roadmap (Feb 2026): roadmap.md
+
+not_in_nav: |
+  /design/*.md
+  /design/history/
+  /evidence/
+  /releases/

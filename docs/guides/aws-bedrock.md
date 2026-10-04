@@ -306,6 +306,6 @@ kubectl get agentrun test-bedrock -n sympozium -o yaml
 
 ## Related Documentation
 
-- [Sympozium Design](/docs/design.md) - Architecture overview
-- [Writing Skills](/guides/writing-skills.md) - Creating custom skills
-- [Channels](/concepts/channels.md) - Connecting Telegram, Slack, etc.
+- [Architecture](../architecture.md) - Architecture overview
+- [Writing Skills](writing-skills.md) - Creating custom skills
+- [Channels](../concepts/channels.md) - Connecting Telegram, Slack, etc.

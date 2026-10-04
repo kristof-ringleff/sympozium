@@ -32,7 +32,7 @@ jobs:
           python-version: '3.12'
 
       - name: Install MkDocs Material
-        run: pip install "mkdocs>=1.6,<2" mkdocs-material
+        run: pip install "mkdocs>=1.6,<2" mkdocs-material mkdocs-redirects
 
       - name: Build docs site
         run: mkdocs build --site-dir _site/docs
