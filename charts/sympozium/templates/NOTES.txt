@@ -29,7 +29,7 @@ Components:
   hidden there. semverCompare fails the render on a version it cannot parse,
   hence the regexMatch guard.
 */}}
-{{- $memoryVersioningSince := "0.10.88" }}
+{{- $memoryVersioningSince := "0.10.89" }}
 {{- $prevVersion := "" }}
 {{- if .Release.IsUpgrade }}
 {{- with lookup "apps/v1" "Deployment" (include "sympozium.namespace" .) "sympozium-controller-manager" }}
