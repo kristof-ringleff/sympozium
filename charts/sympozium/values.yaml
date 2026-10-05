@@ -14,7 +14,10 @@ modelGateway:
   enabled: false
   image: "" # required immutable repository@sha256:digest
   configurationClaim: "" # files readable by UID 65532; secret files mode 0600
-  # Explicit reviewed DNS, Kubernetes API and provider egress peers/ports.
+  # -- NetworkPolicy egress rules for the gateway. Empty allows any
+  # destination: an Agent may use any provider, and the gateway still binds
+  # each call to that Agent's route and key. Set a list (DNS, Kubernetes API,
+  # providers) to restrict it.
   egress: []
   # -- Used with celln.mediation.enabled, which deploys this gateway from
   # Secret/ConfigMap volumes instead of configurationClaim. Set secretName to
@@ -703,9 +706,11 @@ celln:
       maxTurns: 0
       maxModelRequests: 0
       maxOutputTokens: 0
-    # -- Exact hosts the https-fetch and https-post-json starter tools may
-    # reach (lowercase DNS names, at most 16). Empty keeps Celln's reviewed
-    # default, example.com. The installer's --celln-fleet-https-host sets it.
+    # -- Hosts the https-fetch and https-post-json starter tools may reach.
+    # Empty (or ["*"]) means any public HTTPS host; Celln's broker always
+    # refuses private, loopback, link-local and reserved addresses. List
+    # lowercase DNS names (at most 16) to restrict it. The installer's
+    # --celln-fleet-https-host sets it.
     httpsHosts: []
     # -- Rolled by the API server when a backend is added after the install
     # (the celln-fleet-backends-extra ConfigMap); leave empty.
@@ -738,15 +743,19 @@ celln:
       create: true
       storageClass: ""
       storage: 1Gi
-  # -- Mediated model access (default off): each native Celln Agent's model
-  # requests go through the model gateway, which injects that Agent's own
-  # provider key from its namespaced Secret; no provider key on Celln nodes.
-  # This one switch wires the controller's scoped dispatch
-  # (CELLN_SCOPED_CONFIG), the fleet dispatchers' scoped receiver and the model
-  # gateway to the same issuer, keys, tokens and CA. Requires celln.fleet, and
-  # modelGateway.image/egress/database. All key material is operator-provided
-  # by `sympozium celln-mediation bootstrap`; nothing is generated or rendered
-  # from values. Runs take the path of their model route: an Agent's own
+  # -- Mediated model access: each native Celln Agent's model requests go
+  # through the model gateway, which injects that Agent's own provider key
+  # from its namespaced Secret; no provider key on Celln nodes. Off in the
+  # chart's own defaults, but `sympozium install` turns it on for every fleet
+  # install (opt out with --no-celln-mediation): it bootstraps the key
+  # material and sets enabled, clusterId, issuer.keyId, mediateBackends and
+  # modelGateway.image itself, on every run. This one switch wires the
+  # controller's scoped dispatch (CELLN_SCOPED_CONFIG), the fleet dispatchers'
+  # scoped receiver and the model gateway to the same issuer, keys, tokens and
+  # CA. Requires celln.fleet and modelGateway.image (egress and database have
+  # working defaults). Key material lives only in the objects the installer
+  # (or `sympozium celln-mediation bootstrap`) publishes; nothing is generated
+  # or rendered from values. Runs take the path of their model route: an Agent's own
   # Secret-backed (or credential-free) connection goes down this path, while
   # fleet backends (host-profile) keep starting fleet parents as before.
   # See docs/guides/celln-mediated-model-access.md.
@@ -777,29 +786,36 @@ celln:
     # signed both TLS certificates). Public material only, so a ConfigMap.
     trustConfigMap: celln-mediation-trust
     receiver:
-      # -- HTTPS origin of the ONE scoped receiver the controller uses. Empty
-      # uses the chart's celln-scoped-receiver Service, which is correct only
-      # while a single celln-node pod exists: scoped state lives on the node
-      # that prepared it and the router does not forward /v1/scoped/*. With
-      # several nodes, set an origin that reaches exactly one of them (its
-      # host name must be in the receiver certificate).
+      # -- HTTPS origin of the scoped receiver the controller uses. Empty uses
+      # the chart's celln-scoped-receiver Service: the router's TLS edge,
+      # which forwards each operation to the node that prepared it, on any
+      # number of nodes. Set this only to reach it another way (its host name
+      # must be in the receiver certificate).
       url: ""
       port: 9443
     # -- Also offer every HTTPS fleet backend's provider, protocol, origin and
     # model to an Agent's own key. Plain-HTTP and port-bearing backends are
     # never offered: a cluster Secret does not cross them.
     mediateBackends: false
-    # -- The providers an Agent may bring its own key for; none by default.
-    # Matching is EXACT on provider, protocol, model and origin (no wildcard),
-    # and only the operator declares routes: an endpoint a tenant wrote is not
-    # authorisation. Recorded in ConfigMap celln-system/celln-mediated-routes
+    # -- Record the built-in routes when `routes` is empty: any model of
+    # openai (openai-chat, https://api.openai.com), anthropic
+    # (anthropic-messages, https://api.anthropic.com) and deepseek
+    # (openai-chat, https://api.deepseek.com), each with the Agent's own key.
+    # Set false to record no route until you declare one. Declaring any route
+    # replaces the defaults entirely.
+    defaultRoutes: true
+    # -- The providers an Agent may bring its own key for; empty records the
+    # defaults above. Matching is EXACT on provider, protocol and origin (there
+    # is no wildcard origin); models are exact names, or exactly ["*"] for any
+    # model of that provider at those origins. Only the operator declares
+    # routes: an endpoint a tenant wrote is not authorisation. Recorded in ConfigMap celln-system/celln-mediated-routes
     # and appended to the scope's policy by the next `sympozium install
     # --celln-fleet`, added backend, or `sympozium celln-mediation
     # apply-routes`; removing an entry here never removes a published route.
     # Requires `enabled`. Example:
     #   - provider: anthropic
     #     protocol: anthropic-messages        # or openai-chat
-    #     models: [claude-sonnet-5]           # 1-32 exact names
+    #     models: [claude-sonnet-5]           # 1-32 exact names, or ["*"] alone
     #     endpointOrigins: [https://api.anthropic.com]   # https://host, no port or path
     # For keyless local models set auth: none and allowInsecure: true, and
     # also list the exact HTTP origin (including port) in modelGateway.privateOrigins.

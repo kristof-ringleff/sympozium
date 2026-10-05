@@ -48,6 +48,7 @@ import (
 	"github.com/sympozium-ai/sympozium/internal/eventbus"
 	"github.com/sympozium-ai/sympozium/internal/ipc"
 	"github.com/sympozium-ai/sympozium/internal/modelconnection"
+	"github.com/sympozium-ai/sympozium/internal/modelkey"
 	"github.com/sympozium-ai/sympozium/internal/orchestrator"
 	"github.com/sympozium-ai/sympozium/internal/pricing"
 	"github.com/sympozium-ai/sympozium/internal/sessionkey"
@@ -551,6 +552,21 @@ func (r *AgentRunReconciler) resolveAgentRunInputs(ctx context.Context, agentRun
 	return out, nil
 }
 
+// runModelSecrets lists the credential Secrets a run would use: its inline
+// key, its provider-headers Secret and its ModelConnection's Secret. A
+// connection that cannot be read is skipped; resolving it fails the run later.
+func (r *AgentRunReconciler) runModelSecrets(ctx context.Context, agentRun *sympoziumv1alpha1.AgentRun) []string {
+	model := agentRun.Spec.Model
+	secrets := []string{model.AuthSecretRef, model.ProviderHeadersSecretRef}
+	if model.ConnectionRef != "" {
+		var connection sympoziumv1alpha1.ModelConnection
+		if err := r.Get(ctx, client.ObjectKey{Namespace: agentRun.Namespace, Name: model.ConnectionRef}, &connection); err == nil {
+			secrets = append(secrets, connection.Spec.SecretRef)
+		}
+	}
+	return secrets
+}
+
 // resolveProviderHeaders merges the providerHeadersSecretRef contents into
 // spec.model.providerHeaders in memory, so buildContainers can pass them to the
 // agent-runner. Shared by both execution backends; never persisted back to the CR.
@@ -914,6 +930,16 @@ func (r *AgentRunReconciler) reconcilePending(ctx context.Context, log logr.Logg
 	}
 	if taskmodes.HarnessImage(agentRun.Spec.Task) != "" && !agentAllowsModelCredential(&runtimeInstance, agentRun.Spec.Model.Provider, agentRun.Spec.Model.AuthSecretRef) {
 		return ctrl.Result{}, r.failRun(ctx, agentRun, fmt.Sprintf("harness model credential %q is not declared in Agent %q spec.authRefs for provider %q", agentRun.Spec.Model.AuthSecretRef, runtimeInstance.Name, agentRun.Spec.Model.Provider))
+	}
+	// Every model credential a run names must belong to its Agent (or the
+	// Agent's Ensemble): one key per Agent, shared only with its sub-agents.
+	for _, secret := range r.runModelSecrets(ctx, agentRun) {
+		if err := modelkey.Authorize(ctx, r.Client, &runtimeInstance, "", secret); err != nil {
+			if modelkey.IsRefusal(err) {
+				return ctrl.Result{}, r.failRun(ctx, agentRun, err.Error())
+			}
+			return ctrl.Result{}, fmt.Errorf("checking model key ownership: %w", err)
+		}
 	}
 
 	// Agent Sandbox mode — create Sandbox CR instead of Job.
@@ -2768,8 +2794,25 @@ func (r *AgentRunReconciler) validatePolicy(ctx context.Context, agentRun *sympo
 // agentRunServiceAccountName returns the identity used only by this AgentRun.
 // AgentRun names already satisfy Kubernetes DNS-subdomain requirements.
 func agentRunServiceAccountName(agentRun *sympoziumv1alpha1.AgentRun) string {
+	if agentRun.Status.ServiceAccountName != "" {
+		return agentRun.Status.ServiceAccountName
+	}
+	return runServiceAccountName(restrictedRunAccountPrefix, agentRun)
+}
+
+// Run ServiceAccount prefixes. The chart's admission policy stops accounts
+// with the restricted prefix from creating workloads that reference Secrets;
+// only runs whose SympoziumPolicy allows skill Secret access get the trusted
+// prefix. The controller records the choice in status, which run authors
+// cannot write.
+const (
+	restrictedRunAccountPrefix = "sympozium-run-"
+	trustedRunAccountPrefix    = "sympozium-trusted-run-"
+)
+
+func runServiceAccountName(prefix string, agentRun *sympoziumv1alpha1.AgentRun) string {
 	const maxDNSSubdomainLength = 253
-	name := "sympozium-run-" + agentRun.Name
+	name := prefix + agentRun.Name
 	if len(name) <= maxDNSSubdomainLength {
 		return name
 	}
@@ -2833,6 +2876,20 @@ func (r *AgentRunReconciler) ensureNATSBridgeCredentials(ctx context.Context, ag
 // existing cloud workload-identity configuration continues to apply. The
 // shared account itself is never selected by an AgentRun pod or RoleBinding.
 func (r *AgentRunReconciler) ensureAgentServiceAccount(ctx context.Context, agentRun *sympoziumv1alpha1.AgentRun) error {
+	if agentRun.Status.ServiceAccountName == "" {
+		allowed, err := r.skillSecretAccessAllowed(ctx, agentRun)
+		if err != nil {
+			return err
+		}
+		prefix := restrictedRunAccountPrefix
+		if allowed {
+			prefix = trustedRunAccountPrefix
+		}
+		agentRun.Status.ServiceAccountName = runServiceAccountName(prefix, agentRun)
+		if err := r.Status().Update(ctx, agentRun); err != nil {
+			return fmt.Errorf("recording run service account: %w", err)
+		}
+	}
 	name := agentRunServiceAccountName(agentRun)
 	sa := &corev1.ServiceAccount{}
 	err := r.Get(ctx, client.ObjectKey{Name: name, Namespace: agentRun.Namespace}, sa)
@@ -5265,7 +5322,22 @@ func (r *AgentRunReconciler) mirrorSkillConfigMaps(ctx context.Context, log logr
 // ensureSkillRBAC creates Role/ClusterRole and bindings for skill sidecars.
 // Resources are labelled with the AgentRun name for cleanup.
 func (r *AgentRunReconciler) ensureSkillRBAC(ctx context.Context, log logr.Logger, agentRun *sympoziumv1alpha1.AgentRun, sidecars []resolvedSidecar) error {
+	allowSecrets, err := r.skillSecretAccessAllowed(ctx, agentRun)
+	if err != nil {
+		return err
+	}
 	for _, sc := range sidecars {
+		if !allowSecrets {
+			restricted, err := withoutKeyAccess(sc.sidecar.RBAC)
+			if err != nil {
+				return fmt.Errorf("skill %s: %w", sc.skillPackName, err)
+			}
+			clusterRestricted, err := withoutKeyAccess(sc.sidecar.ClusterRBAC)
+			if err != nil {
+				return fmt.Errorf("skill %s: %w", sc.skillPackName, err)
+			}
+			sc.sidecar.RBAC, sc.sidecar.ClusterRBAC = restricted, clusterRestricted
+		}
 		// Namespace-scoped Role + RoleBinding
 		if len(sc.sidecar.RBAC) > 0 {
 			roleName := fmt.Sprintf("sympozium-skill-%s-%s", sc.skillPackName, agentRun.Name)
@@ -5385,6 +5457,61 @@ func (r *AgentRunReconciler) ensureSkillRBAC(ctx context.Context, log logr.Logge
 		}
 	}
 	return nil
+}
+
+// keyAccessResources are the core resources that reach model keys: the
+// Secrets themselves, and the environment of running agent pods.
+var keyAccessResources = map[string]bool{"secrets": true, "pods/exec": true, "pods/attach": true}
+
+// withoutKeyAccess drops key-reaching resources from a skill's requested
+// rules unless its Agent's policy allows Secret access. A rule granting every
+// core resource cannot be narrowed, so it is refused rather than trusted.
+func withoutKeyAccess(rules []sympoziumv1alpha1.RBACRule) ([]sympoziumv1alpha1.RBACRule, error) {
+	out := make([]sympoziumv1alpha1.RBACRule, 0, len(rules))
+	for _, rule := range rules {
+		core := slices.Contains(rule.APIGroups, "") || slices.Contains(rule.APIGroups, "*")
+		if !core {
+			out = append(out, rule)
+			continue
+		}
+		var kept []string
+		for _, resource := range rule.Resources {
+			if resource == "*" || resource == "pods/*" {
+				return nil, fmt.Errorf("requests all core resources (%q), which include Secrets; allow it with SympoziumPolicy spec.skillPolicy.allowSecretAccess", resource)
+			}
+			if !keyAccessResources[resource] {
+				kept = append(kept, resource)
+			}
+		}
+		if len(kept) > 0 {
+			rule.Resources = kept
+			out = append(out, rule)
+		}
+	}
+	return out, nil
+}
+
+// skillSecretAccessAllowed reports whether the run's Agent has a
+// SympoziumPolicy that opts its skills into Secret access.
+func (r *AgentRunReconciler) skillSecretAccessAllowed(ctx context.Context, agentRun *sympoziumv1alpha1.AgentRun) (bool, error) {
+	var agent sympoziumv1alpha1.Agent
+	if err := r.Get(ctx, client.ObjectKey{Namespace: agentRun.Namespace, Name: agentRun.Spec.AgentRef}, &agent); err != nil {
+		if errors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	if agent.Spec.PolicyRef == "" {
+		return false, nil
+	}
+	var policy sympoziumv1alpha1.SympoziumPolicy
+	if err := r.Get(ctx, client.ObjectKey{Namespace: agentRun.Namespace, Name: agent.Spec.PolicyRef}, &policy); err != nil {
+		if errors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	return policy.Spec.SkillPolicy != nil && policy.Spec.SkillPolicy.AllowSecretAccess, nil
 }
 
 // validateHarnessIsolation rejects pod-level privilege combinations that an

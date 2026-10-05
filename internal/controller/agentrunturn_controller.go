@@ -21,6 +21,8 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
 const agentRunTurnFinalizer = "sympozium.ai/agentrunturn-finalizer"
@@ -153,6 +155,21 @@ func (r *AgentRunTurnReconciler) Reconcile(ctx context.Context, request ctrl.Req
 		}
 		if err != nil {
 			return r.turnUncertain(ctx, &turn, "OriginalParentUnavailable", err)
+		}
+	}
+	// The parent's confirmed cleanup (or confirmed loss of its node) ends
+	// every turn of that parent: this one can never complete, and waiting
+	// would hold the run's finalizer forever.
+	if turn.Status.CellnScoped != nil {
+		var original api.AgentRun
+		if err := reader.Get(ctx, client.ObjectKey{Namespace: turn.Namespace, Name: turn.Spec.RunName}, &original); err == nil && string(original.UID) == turn.Spec.RunUID && parentCleanupCoversTurn(&original, &turn) {
+			if err := r.updateTurnStatus(ctx, &turn, func(current *api.AgentRunTurn) error {
+				meta.SetStatusCondition(&current.Status.Conditions, metav1.Condition{Type: "CellnTurnComplete", Status: metav1.ConditionTrue, Reason: "ParentEnded", Message: "The conversation's parent ended and its cleanup was confirmed; this turn cannot complete.", ObservedGeneration: current.Generation})
+				return nil
+			}); err != nil {
+				return ctrl.Result{}, err
+			}
+			return r.cleanupTurn(ctx, &turn)
 		}
 	}
 	parent, err := r.scopedTurnParent(ctx, reader, &turn)
@@ -379,6 +396,15 @@ func (r *AgentRunTurnReconciler) applyTurnStatus(ctx context.Context, turn *api.
 	return r.cleanupTurn(ctx, turn)
 }
 
+// parentCleanupCoversTurn reports a run whose original owner confirmed
+// cleanup of this turn's parent (stopping it and every child), or whose node
+// was lost with it. A turn that never enrolled with a receiver has no owner of
+// its own; one that did must share the run's.
+func parentCleanupCoversTurn(run *api.AgentRun, turn *api.AgentRunTurn) bool {
+	rs, ts := run.Status.CellnScoped, turn.Status.CellnScoped
+	return rs != nil && ts != nil && rs.CleanupConfirmed && rs.ParentIncarnation != "" && rs.ParentIncarnation == ts.ParentIncarnation && (ts.Owner == "" || ts.Owner == rs.Owner)
+}
+
 func (r *AgentRunTurnReconciler) cleanupTurn(ctx context.Context, turn *api.AgentRunTurn) (ctrl.Result, error) {
 	if turn.Status.CellnScoped == nil {
 		return r.removeTurnFinalizer(ctx, turn)
@@ -394,7 +420,7 @@ func (r *AgentRunTurnReconciler) cleanupTurn(ctx context.Context, turn *api.Agen
 	// Root cleanup is stronger evidence: the lifecycle-aware receiver only sets
 	// this after stopping and joining the retained parent and every child owner.
 	// Do not send a child cleanup request after that owner has been destroyed.
-	if parent.Status.CellnScoped != nil && parent.Status.CellnScoped.CleanupConfirmed && parent.Status.CellnScoped.ParentIncarnation == turn.Status.CellnScoped.ParentIncarnation && parent.Status.CellnScoped.Owner == turn.Status.CellnScoped.Owner {
+	if parentCleanupCoversTurn(&parent, turn) {
 		if err := r.updateTurnScoped(ctx, turn, func(state *api.CellnScopedStatus) error { state.CleanupConfirmed = true; return nil }); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -563,5 +589,27 @@ func (r *AgentRunTurnReconciler) recordTurnObservationReason(ctx context.Context
 }
 
 func (r *AgentRunTurnReconciler) SetupWithManager(manager ctrl.Manager) error {
-	return ctrl.NewControllerManagedBy(manager).For(&api.AgentRunTurn{}).Complete(r)
+	return ctrl.NewControllerManagedBy(manager).
+		For(&api.AgentRunTurn{}).
+		// A turn waits on its run: when the run fails, is cleaned up or is
+		// deleted, its turns must re-check at once. Without this a turn that
+		// never acquired authority sits in error backoff while the run's
+		// finalizer waits for it.
+		Watches(&api.AgentRun{}, handler.EnqueueRequestsFromMapFunc(r.turnsOfRun)).
+		Complete(r)
+}
+
+// turnsOfRun maps a run to its turns.
+func (r *AgentRunTurnReconciler) turnsOfRun(ctx context.Context, obj client.Object) []reconcile.Request {
+	var turns api.AgentRunTurnList
+	if err := r.List(ctx, &turns, client.InNamespace(obj.GetNamespace())); err != nil {
+		return nil
+	}
+	var requests []reconcile.Request
+	for _, turn := range turns.Items {
+		if turn.Spec.RunName == obj.GetName() {
+			requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&turn)})
+		}
+	}
+	return requests
 }

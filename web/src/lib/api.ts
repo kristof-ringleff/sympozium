@@ -206,6 +206,8 @@ export interface CellnMediatedRoute {
   provider: string;
   protocol: "openai-chat" | "anthropic-messages";
   models: string[];
+  /** The route declares models ["*"]: any model name of this provider at these exact origins. */
+  anyModel?: boolean;
   endpointOrigins: string[];
   /** The execution policy carrying the route; absent on a pending one. */
   policy?: string;
@@ -250,6 +252,8 @@ export interface CellnPlatformProfile {
   /** The policy's per-parent maxima and the budget a new conversation should ask for. */
   ceilings: EnduringLimits;
   sessionDefaults: EnduringLimits;
+  /** The backend's key never reached the fleet: only Agents with their own key run on it (no shared agent). */
+  mediationOnly?: boolean;
 }
 
 export interface EnduringLimits {
