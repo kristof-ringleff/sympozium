@@ -1,5 +1,153 @@
 # Changelog
 
+## [0.11.0](https://github.com/sympozium-ai/sympozium/compare/v0.10.88...v0.11.0) (2026-10-05)
+
+
+### ⚠ BREAKING CHANGES
+
+* two Agents can no longer share a key Secret, and a run can no longer name a Secret its Agent does not grant in spec.authRefs.
+* **policy:** SympoziumPolicy toolGating is now enforced, so agents on a policy lose the tools it denies; the built-in restrictive policy denies execute_command. Policies using `ask` fail validation; use allow or deny.
+
+### Features
+
+* **celln:** scoped artifact authority and installed development proof ([#636](https://github.com/sympozium-ai/sympozium/issues/636)) ([939f383](https://github.com/sympozium-ai/sympozium/commit/939f383745227768e6dfae0b635a1a7ab8a359be))
+* **chart:** bundle PostgreSQL for mediated model access ([#647](https://github.com/sympozium-ai/sympozium/issues/647)) ([70f360d](https://github.com/sympozium-ai/sympozium/commit/70f360d23e4bb27d4d6692f910e5d04393476b3c))
+* one key per Agent, mediated by default, on any number of nodes ([#650](https://github.com/sympozium-ai/sympozium/issues/650)) ([f7b474d](https://github.com/sympozium-ai/sympozium/commit/f7b474db4c81fb318f32c958791c1cc34d7dfc91))
+
+
+### Bug Fixes
+
+* **policy:** enforce SympoziumPolicy tool gating; docs: compare with Google AX and Agent Substrate ([#631](https://github.com/sympozium-ai/sympozium/issues/631)) ([c4a4c95](https://github.com/sympozium-ai/sympozium/commit/c4a4c9535a5898a31ec363a5b3003ddcba318896))
+
+## [0.10.88](https://github.com/sympozium-ai/sympozium/compare/v0.10.87...v0.10.88) (2026-10-04)
+
+
+### Features
+
+* **cli:** add `sympozium update` and `sympozium upgrade` ([664bcfe](https://github.com/sympozium-ai/sympozium/commit/664bcfe6ceda128e194bceb2af2f67f242ee5e4f))
+* **cli:** add `sympozium update` and `sympozium upgrade` ([9ecfd9a](https://github.com/sympozium-ai/sympozium/commit/9ecfd9a3302315367afa5fb9b79000090a9a9ec3))
+
+
+### Bug Fixes
+
+* **apiserver:** write OpenAI-compatible provider keys as OPENAI_API_KEY ([#638](https://github.com/sympozium-ai/sympozium/issues/638)) ([f0f514c](https://github.com/sympozium-ai/sympozium/commit/f0f514cdb30c967e6cd363b0d2dc3a50defbd7b5)), closes [#627](https://github.com/sympozium-ai/sympozium/issues/627)
+* **celln:** propagate dispatcher pod tolerations ([#632](https://github.com/sympozium-ai/sympozium/issues/632)) ([1dff955](https://github.com/sympozium-ai/sympozium/commit/1dff955421e2c20ba6d39e022803c7a51723d399))
+* **channel:** reject empty Discord chatId and log every delivery ([#644](https://github.com/sympozium-ai/sympozium/issues/644)) ([b8bd12d](https://github.com/sympozium-ai/sympozium/commit/b8bd12db65e9ca9c6a62601a3ee9973b99e9fb44)), closes [#330](https://github.com/sympozium-ai/sympozium/issues/330)
+* **channel:** reply on agent failure and stop cross-instance outbound… ([#581](https://github.com/sympozium-ai/sympozium/issues/581)) ([82117f1](https://github.com/sympozium-ai/sympozium/commit/82117f14126cf3b4b856520455096ae6380292bb))
+* **controller:** measure the postRun timeout from the postRun Job, not the agent run ([#589](https://github.com/sympozium-ai/sympozium/issues/589)) ([574610a](https://github.com/sympozium-ai/sympozium/commit/574610a7b3473aeeb658d9707705f9d68fe3b564))
+* **harness:** mount /ipc/control read-only so adapters can honour preRun skips ([#633](https://github.com/sympozium-ai/sympozium/issues/633)) ([2483f43](https://github.com/sympozium-ai/sympozium/commit/2483f433555785ab57e99c4d49828a56807e1447))
+
+## [0.10.87](https://github.com/sympozium-ai/sympozium/compare/v0.10.86...v0.10.87) (2026-09-20)
+
+
+### Bug Fixes
+
+* **celln:** pin v0.5.28 for isolated starter runtimes ([4985084](https://github.com/sympozium-ai/sympozium/commit/4985084513216ba1e26ed4a723ad4ea230f749cf))
+* **celln:** pin v0.5.28 for isolated starter runtimes ([0dc600f](https://github.com/sympozium-ai/sympozium/commit/0dc600f0a438edf9d26487e698b3290003be0d63))
+
+## [0.10.86](https://github.com/sympozium-ai/sympozium/compare/v0.10.85...v0.10.86) (2026-09-20)
+
+
+### Features
+
+* **apiserver:** list key Secrets by name and grant a Celln Agent its connection's Secret ([3299376](https://github.com/sympozium-ai/sympozium/commit/3299376642106e9897e79f2ecd5e834dc41a682e))
+* **celln:** mediate explicitly approved keyless local models ([0110107](https://github.com/sympozium-ai/sympozium/commit/01101076bdc560400c13d0bec5dd534a656db69b))
+* **celln:** mediate explicitly approved keyless local models ([4576074](https://github.com/sympozium-ai/sympozium/commit/45760747d2d58c543d78b1bd3056f2f36151be0e))
+* **console:** create Celln agents with their own provider, key and model ([9eeaa15](https://github.com/sympozium-ai/sympozium/commit/9eeaa152f69311b0ab9428d212ed58cd97b46abc))
+* **console:** give Celln agents their own provider, key and model ([af67a57](https://github.com/sympozium-ai/sympozium/commit/af67a579be2f6522675fcc93d7c4a2eddf547b98))
+
+
+### Bug Fixes
+
+* **celln:** pin v0.5.27 for installed mediated runs ([e0e593f](https://github.com/sympozium-ai/sympozium/commit/e0e593f000f827d300af19be6f79e145987ccdd8))
+* **celln:** pin v0.5.27 for installed mediated runs ([5404447](https://github.com/sympozium-ai/sympozium/commit/5404447de6037e5c66108daeddf9088b983cf484))
+
+## [0.10.85](https://github.com/sympozium-ai/sympozium/compare/v0.10.84...v0.10.85) (2026-09-20)
+
+
+### Features
+
+* **apiserver:** carry the mediation record into added backends and expose it ([d9b6416](https://github.com/sympozium-ai/sympozium/commit/d9b6416660d42eee1a0b6225a3aa8025218e1118))
+* **celln:** admit an Agent's own Secret-backed connection on the mediated path ([2e99bba](https://github.com/sympozium-ai/sympozium/commit/2e99bbae7c3fa1fad2a6264ef077222ccf56f189))
+* **celln:** admit an Agent's own Secret-backed connection on the mediated path ([b1a2973](https://github.com/sympozium-ai/sympozium/commit/b1a2973dd5bea92132ee06b02b3f3637ea88a886))
+* **celln:** declare which providers Agents may bring their own key for ([462f838](https://github.com/sympozium-ai/sympozium/commit/462f8387ca4cb71e75defcca80b00675be96539c))
+* **celln:** install mediated model access from the chart behind one switch ([aa471af](https://github.com/sympozium-ai/sympozium/commit/aa471af9c7f3c6e2faff5feeea9d5bfa2743995f))
+* **celln:** install mediated model access from the chart behind one switch ([4830920](https://github.com/sympozium-ai/sympozium/commit/483092018db093b42871a8b1759942212fdd5a59)), closes [#611](https://github.com/sympozium-ai/sympozium/issues/611)
+* **celln:** let the operator declare mediated routes at install ([c4a3b4b](https://github.com/sympozium-ai/sympozium/commit/c4a3b4b03cc233ddb012b64f7b5c97c28db626a9))
+* **doctor:** report mediated model access ([3043e0d](https://github.com/sympozium-ai/sympozium/commit/3043e0dd777885de76665d9cdd41fb54b26e8513))
+* **gateway:** per-connection request policy on ModelConnection ([240eab4](https://github.com/sympozium-ai/sympozium/commit/240eab4f8ad9cde403ca23422b3fdf4d8269f16a))
+* **gateway:** per-connection request policy on ModelConnection ([d841853](https://github.com/sympozium-ai/sympozium/commit/d84185368f4ee9f3acb8bb53f8743f5d2a2e811a))
+
+
+### Bug Fixes
+
+* **celln:** pin Celln v0.5.26 ([09dc2ea](https://github.com/sympozium-ai/sympozium/commit/09dc2eaf601fbd7dd7d8b76fd9e68e7a16161bec))
+* **celln:** pin Celln v0.5.26 (mediated native parents: scoped receiver, per-operation output cap, starter parent request) ([619e980](https://github.com/sympozium-ai/sympozium/commit/619e980e42316b7adeaa604df70b0f937cf7a39e))
+
+## [0.10.84](https://github.com/sympozium-ai/sympozium/compare/v0.10.83...v0.10.84) (2026-09-20)
+
+
+### Bug Fixes
+
+* **celln:** let a fleet backend's turn lifetime follow its output-token cap ([8000d51](https://github.com/sympozium-ai/sympozium/commit/8000d5166723ee9e318847abe2e5bece828c954a))
+* **celln:** let a fleet backend's turn lifetime follow its output-token cap ([f020d3e](https://github.com/sympozium-ai/sympozium/commit/f020d3eb902ef5d9b15090017f379de0251cd2e7))
+* **celln:** pin Celln v0.5.25 ([2f3698e](https://github.com/sympozium-ai/sympozium/commit/2f3698e02c0d8ccab004ab7d9d1bfd4cfece1fbe))
+* **celln:** pin Celln v0.5.25 (worker turn lifetime follows the output-token cap) ([676da52](https://github.com/sympozium-ai/sympozium/commit/676da52bdbf5ded0cb0d2da448f20b2d10bab584))
+
+## [0.10.83](https://github.com/sympozium-ai/sympozium/compare/v0.10.82...v0.10.83) (2026-09-19)
+
+
+### Features
+
+* **celln:** max output tokens per request for fleet backends ([97d8eca](https://github.com/sympozium-ai/sympozium/commit/97d8ecac4c25bdfb504c2d1cff971e8f8191c635))
+* **celln:** output tokens per request for fleet backends ([a6e8880](https://github.com/sympozium-ai/sympozium/commit/a6e8880932150aaa23885a59faaf193a824d6326))
+
+
+### Bug Fixes
+
+* **celln:** a failed first turn no longer ends the conversation ([b1dcbc9](https://github.com/sympozium-ai/sympozium/commit/b1dcbc9614a61569f74c3887560df92f725f9bdc))
+* **celln:** keep a conversation open after a failed initial turn ([096bbfc](https://github.com/sympozium-ai/sympozium/commit/096bbfcc936f323331833d2f8ab064b06dd83b5b))
+
+## [0.10.82](https://github.com/sympozium-ai/sympozium/compare/v0.10.81...v0.10.82) (2026-09-19)
+
+
+### Features
+
+* **celln:** model parameters for fleet backends ([cae4cce](https://github.com/sympozium-ai/sympozium/commit/cae4cce07754aa8aac16601db07a62d1598326ba))
+* **celln:** model parameters for fleet backends ([e5f440b](https://github.com/sympozium-ai/sympozium/commit/e5f440b8e6911ddd2e5b5f1114e9bbefe6bdfcb2))
+
+## [0.10.81](https://github.com/sympozium-ai/sympozium/compare/v0.10.80...v0.10.81) (2026-09-19)
+
+
+### Features
+
+* **celln:** list fleet cells through the gateway, falling back to node reports ([48e35db](https://github.com/sympozium-ai/sympozium/commit/48e35db99dbd53d8aab51515895e079c8a4180c2))
+* **celln:** list fleet cells through the gateway, falling back to node reports ([35ef5eb](https://github.com/sympozium-ai/sympozium/commit/35ef5ebb1dded550cc5f1186eeb594c829d90ee9)), closes [#591](https://github.com/sympozium-ai/sympozium/issues/591)
+* **celln:** match Celln v0.5.22's conversation limits, and pin it ([730f4a6](https://github.com/sympozium-ai/sympozium/commit/730f4a6192254b76148ef196c990150ebe0bb7bb))
+* **celln:** match the widened enduring-conversation bounds ([a90b876](https://github.com/sympozium-ai/sympozium/commit/a90b87693e1decf0c08eb7600cce1b4828075ea7)), closes [#591](https://github.com/sympozium-ai/sympozium/issues/591)
+* **cli:** sympozium doctor and an install preflight for used machines ([d379a06](https://github.com/sympozium-ai/sympozium/commit/d379a06b0480b64b1605ea998202acd4f07bac6a))
+* **cli:** sympozium doctor and an install preflight for used machines ([d27db72](https://github.com/sympozium-ai/sympozium/commit/d27db72bf3940124b05c2da2d1cbfbb952d3cafe))
+* **web:** explain why a run failed, and what to do about it ([db2a023](https://github.com/sympozium-ai/sympozium/commit/db2a023577bff9bb174b46f1d1d9a0e7e4f182d1))
+* **web:** explain why a run failed, and what to do about it ([e2fa476](https://github.com/sympozium-ai/sympozium/commit/e2fa4768aacee5e2efe98582c44e0a4fadd9b3d9))
+* **web:** say which cluster the console is connected to ([9660d27](https://github.com/sympozium-ai/sympozium/commit/9660d27d65e9af3619f3801fc83a7940bd3dae9d))
+* **web:** say which cluster the console is connected to ([4217c10](https://github.com/sympozium-ai/sympozium/commit/4217c108ec6bdf17dde756c9db8e57c073759bcb)), closes [#591](https://github.com/sympozium-ai/sympozium/issues/591)
+
+
+### Bug Fixes
+
+* **release:** republish the Celln starter package when its inputs are unchanged ([9714173](https://github.com/sympozium-ai/sympozium/commit/9714173529693e7346f1e022bdcd3df78c4b621f))
+* **release:** republish the Celln starter package when its inputs are unchanged ([326490d](https://github.com/sympozium-ai/sympozium/commit/326490dd70bf0e55418cddbab1174caec9b5cc2d)), closes [#591](https://github.com/sympozium-ai/sympozium/issues/591)
+* **web:** make the Create Agent wizard fleet-aware ([91f659d](https://github.com/sympozium-ai/sympozium/commit/91f659d4a67a051b6c6de41ce432c4a920985fb2))
+* **web:** make the Create Agent wizard fleet-aware ([470e16d](https://github.com/sympozium-ai/sympozium/commit/470e16d68d75173cae564e40a9d37c8f590f6973)), closes [#591](https://github.com/sympozium-ai/sympozium/issues/591)
+
+## [0.10.80](https://github.com/sympozium-ai/sympozium/compare/v0.10.79...v0.10.80) (2026-09-17)
+
+
+### Bug Fixes
+
+* **web:** choose a fleet backend once, and keep the wizard inside its dialog ([fe215a7](https://github.com/sympozium-ai/sympozium/commit/fe215a72eceadc4a04f6849ce44cb5c31bce34d9))
+* **web:** choose a fleet backend once, and keep the wizard inside its dialog ([aa550a4](https://github.com/sympozium-ai/sympozium/commit/aa550a4532b543ea6598c4aedabee60e5c40e39a))
+
 ## [0.10.79](https://github.com/sympozium-ai/sympozium/compare/v0.10.78...v0.10.79) (2026-09-17)
 
 

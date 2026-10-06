@@ -71,10 +71,12 @@ Then deploy to your cluster and activate your first agents:
 
 ```bash
 sympozium install          # deploys CRDs, controllers, built-in Ensembles, the Celln plane and ergoz
-# With DEEPSEEK_API_KEY, OPENAI_API_KEY and/or ANTHROPIC_API_KEY set (or a prompt in a
+# With DEEPSEEK_API_KEY, OPENAI_API_KEY or ANTHROPIC_API_KEY set (or a prompt in a
 # terminal), the same command installs the Celln fleet: every node with KVM runs
-# hardware-isolated, long-running agents for every namespace, one backend per key,
-# each Agent choosing its own. No further flags.
+# hardware-isolated, long-running agents for every namespace, on any number of
+# nodes. Model access is mediated by default: a gateway holds provider keys, nodes
+# never do, the key you gave becomes the `starter` Agent's own key, and every other
+# Agent brings its own. No further flags (opt out with --no-celln-mediation).
 sympozium                  # launch the TUI — go to Ensembles tab, press Enter to onboard
 sympozium serve            # open the web dashboard (port-forwards to the in-cluster UI)
 ```
@@ -132,6 +134,8 @@ Sympozium is a **Kubernetes-native coordination layer** for multi-agent AI syste
 
 **And that is the whole product.** Sympozium decides what agents *do*. Where compute *happens* is the job of a capability layer &mdash; [llmfit-dra](https://github.com/sympozium-ai/llmfit-dra), a Kubernetes DRA driver that places models by physics through the stock scheduler. How tokens *move* is the serving engine's job (vLLM, SGLang, llama.cpp). When an agent needs a model, Sympozium *claims* one the way an application claims a PersistentVolume &mdash; it never decides where it runs. See [Positioning](https://deploy.sympozium.ai/docs/positioning/) for the boundary and what's deliberately out of scope.
 
+Evaluating Google's [AX](https://github.com/google/ax) and [Agent Substrate](https://github.com/agent-substrate/substrate)? Read [Sympozium vs Google AX](https://deploy.sympozium.ai/docs/sympozium-vs-google-ax/), an honest comparison that includes where they are ahead (idle-agent density, suspend/resume, control-plane scale) and how the two could fit together.
+
 ### Agent Coordination
 
 | | |
@@ -153,7 +157,9 @@ Sympozium is a **Kubernetes-native coordination layer** for multi-agent AI syste
 | **Agent Sandbox** | Kernel-level isolation via [kubernetes-sigs/agent-sandbox](https://deploy.sympozium.ai/docs/concepts/agent-sandbox/) &mdash; gVisor or Kata with warm pools for instant starts |
 | **MCP Servers** | External tool providers via Model Context Protocol with auto-discovery and allow/deny filtering |
 | **TUI & Web UI** | Terminal and browser dashboards with live workflow canvas, or skip the UI entirely with Helm and kubectl |
-| **Policy & Governance** | Cluster-wide `SympoziumPolicy` CRD &mdash; tool gating (allow/deny/ask), sandbox requirements, network egress rules, and image-registry allowlists, enforced by an admission webhook |
+| **Policy & Governance** | `SympoziumPolicy` CRD &mdash; tool gating (allow/deny, enforced on every run), sandbox requirements, network egress rules, image-registry allowlists, and whether skills may touch Secrets |
+| **One Key per Agent** | Every Agent uses its own model key; only its sub-agents share it. The key's owner is recorded on its Secret and checked by the controller, the admission webhook and, on every call, the model gateway. Skills cannot read Secrets or start pods that do unless a policy allows it. See [Security](https://deploy.sympozium.ai/docs/concepts/security/#model-keys) |
+| **Mediated Model Access** | By default a model gateway holds provider keys, so hardware-isolated agents never see one. Built-in routes cover OpenAI, Anthropic and DeepSeek (any model), and approved local servers work keyless. See the [mediation guide](https://deploy.sympozium.ai/docs/guides/celln-mediated-model-access/) |
 | **Serving Mode** | Run an agent as a long-lived, OpenAI-compatible + MCP HTTP endpoint instead of a one-shot Job &mdash; agents as services |
 | **Observability & Cost** | OpenTelemetry traces and metrics, Prometheus endpoints, per-run trace IDs, and token usage with estimated cost on every AgentRun |
 | **Celln Tool Catalogue** | Hardware-isolated agents borrow real programs (grep, sed, awk, jq, &hellip;) taken from container images pinned by digest, never reimplemented. Every borrowed tool names the image layer it came from, and operators extend the toolbox by adding an image to the catalogue, no rebuild. See [the fleet guide](docs/guides/celln-fleet-installation.md#the-toolbox) |
@@ -167,6 +173,7 @@ Sympozium is a **Kubernetes-native coordination layer** for multi-agent AI syste
 |-------|------|
 | Getting Started | [deploy.sympozium.ai/docs/getting-started](https://deploy.sympozium.ai/docs/getting-started/) |
 | Positioning &mdash; what Sympozium is (and isn't) | [deploy.sympozium.ai/docs/positioning](https://deploy.sympozium.ai/docs/positioning/) |
+| Sympozium vs Google AX &amp; Agent Substrate &mdash; an honest comparison | [deploy.sympozium.ai/docs/sympozium-vs-google-ax](https://deploy.sympozium.ai/docs/sympozium-vs-google-ax/) |
 | Architecture | [deploy.sympozium.ai/docs/architecture](https://deploy.sympozium.ai/docs/architecture/) |
 | Custom Resources | [deploy.sympozium.ai/docs/concepts/custom-resources](https://deploy.sympozium.ai/docs/concepts/custom-resources/) |
 | Ensembles | [deploy.sympozium.ai/docs/concepts/ensembles](https://deploy.sympozium.ai/docs/concepts/ensembles/) |
@@ -178,6 +185,7 @@ Sympozium is a **Kubernetes-native coordination layer** for multi-agent AI syste
 | Agent Sandboxing | [deploy.sympozium.ai/docs/concepts/agent-sandbox](https://deploy.sympozium.ai/docs/concepts/agent-sandbox/) |
 | Hermetic Workloads (Celln) | [deploy.sympozium.ai/docs/concepts/celln-backend](https://deploy.sympozium.ai/docs/concepts/celln-backend/) |
 | Security | [deploy.sympozium.ai/docs/concepts/security](https://deploy.sympozium.ai/docs/concepts/security/) |
+| Mediated Model Access (keys, gateway, routes) | [deploy.sympozium.ai/docs/guides/celln-mediated-model-access](https://deploy.sympozium.ai/docs/guides/celln-mediated-model-access/) |
 | CLI & TUI Reference | [deploy.sympozium.ai/docs/reference/cli](https://deploy.sympozium.ai/docs/reference/cli/) |
 | Helm Chart | [deploy.sympozium.ai/docs/reference/helm](https://deploy.sympozium.ai/docs/reference/helm/) |
 | Local Models | [deploy.sympozium.ai/docs/guides/local-models](https://deploy.sympozium.ai/docs/guides/local-models/) |
@@ -201,7 +209,7 @@ make test        # run tests
 make test-system # run envtest system tests (no cluster needed)
 make lint        # run linter
 make manifests   # generate CRD manifests
-make run         # run controller locally (needs kubeconfig)
+make run-controller # run controller locally (needs kubeconfig)
 ```
 
 ## License

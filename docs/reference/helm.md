@@ -33,26 +33,76 @@ Both charts are kept in lockstep. Always upgrade `sympozium-crds` before `sympoz
 
 See [`charts/sympozium/values.yaml`](https://github.com/sympozium-ai/sympozium/blob/main/charts/sympozium/values.yaml) for all configuration options. The `sympozium-crds` chart has no configurable values.
 
-### Celln (hermetic execution)
+### Celln (hardware-isolated execution)
 
-Enabled by default (`celln.enabled: true`) so a standard installation deploys
-the in-cluster (pod-based) dispatcher, the router and controller/API wiring.
-The dispatcher carries no node selector and may schedule on any node (it still
-mounts the node's `/dev/kvm`, so the node it lands on must provide KVM).
-A bare-metal host dispatcher (systemd, via the `celln-installer`
-DaemonSet) is available with `celln.installer.enabled=true` but is loopback-only
-and mutually exclusive with the in-cluster dispatcher; the installer schedules
-only on nodes explicitly labelled `celln.dev/kvm=true`, so label KVM-capable
-hosts deliberately before enabling it. Disable all Celln
-resources with `--set celln.enabled=false`. See [Celln Backend](../concepts/celln-backend.md).
+The raw chart default is `celln.enabled: false`; `sympozium install` turns it
+on (and `--no-celln` leaves it off). Every Celln workload schedules only on
+nodes labelled `celln.dev/kvm=true` (except the single in-cluster dispatcher,
+below); the node probe applies that label to
+nodes with `/dev/kvm` and a kernel under `/boot` (`nodeProbe.labelKVMNodes`).
+See [Celln Backend](../concepts/celln-backend.md).
 
-`celln.fleet.*` replaces the single dispatcher with one owner per labeled KVM
-node: a `celln-node` DaemonSet prepares each node from a digest-pinned,
-operator-signed starter package and serves enduring parents from it, the
-router discovers owners through a headless Service, and the controller keeps
-its parent journal on a claim instead of a node. It is driven end to end by
-`sympozium install --celln-fleet`; see
-[Celln Fleet Installation](../guides/celln-fleet-installation.md).
+- **`celln.fleet.*`** (the default when `sympozium install` finds a model
+  backend) runs one owner per labeled node: a `celln-node` DaemonSet prepares
+  each node from a digest-pinned, signed starter package and serves one-shot
+  and enduring parents; a `celln-node-configure` DaemonSet configures each
+  model backend; the router discovers owners through a headless Service; and
+  the controller keeps its parent journal on a claim instead of a node. Its
+  values (scope, package, publisher, backends, capacity, HTTPS hosts) are
+  set by the installer; driving them by hand is possible but see
+  [Celln Fleet Installation](../guides/celln-fleet-installation.md) for what
+  must exist first.
+- **`celln.dispatcher.*`** is the single in-cluster dispatcher used by the
+  one-shot router when no fleet is configured. It carries no node selector
+  but mounts the node's `/dev/kvm`, so the node it lands on must provide KVM.
+  `celln.dispatcher.tolerations` lets it run on a tainted KVM node (for
+  example a single-node cluster's control plane).
+- **`celln.installer.enabled`** deploys the legacy privileged host-installer
+  DaemonSet (bare-metal systemd dispatcher, labelled nodes only); it is
+  mutually exclusive with the in-cluster dispatcher. Only this path reads `celln.anthropicApiKey`,
+  `openaiApiKey`, `deepseekApiKey` and `openaiBaseUrl`.
+
+Disable all Celln resources with `--set celln.enabled=false`.
+
+### Energy collector (ergoz)
+
+```yaml
+energyCollector:
+  enabled: true
+  discovery:
+    namespaces: [sympozium-system, ergoz-system]
+```
+
+Any Service labelled `sympozium.ai/collector=energy` in one of the listed
+namespaces is used for accelerator power draw (`GET /api/v1/power`, shown on
+the density and topology views). The namespace list is a security
+allowlist: only list namespaces an administrator controls. `sympozium
+install` deploys the pinned [ergoz](https://github.com/sympozium-ai/ergoz)
+release (`config/ergoz/release.json`) into `ergoz-system` as a separate Helm
+release; `--no-ergoz` skips it, and a failed ergoz install never fails the
+Sympozium install. With plain Helm, install ergoz yourself if you want it.
+
+### Pricing and memory
+
+```yaml
+pricing:
+  enabled: true        # ship the sympozium-model-pricing ConfigMap; cost estimates on AgentRuns
+  extraEntries: []     # extra/overriding price entries (provider, match, inputPerMTokMicro, outputPerMTokMicro)
+memory:
+  adminDelete:
+    enabled: true      # admin-only DELETE /delete on memory servers, bearer token never given to agents
+```
+
+Cost estimates are display-only and never gate runs; local providers are
+always exempt.
+
+### Model gateway
+
+`modelGateway.enabled` (default `false`) packages the separate Celln model
+gateway for controlled qualification. It requires an immutable image digest,
+a configuration claim and explicit egress peers, and does not by itself
+enable mediated Celln admission. See
+[Model gateway component installation](../guides/celln-model-gateway-component-installation.md).
 
 ### AgentHarness examples
 
@@ -118,11 +168,12 @@ If `token` is left empty, Helm creates a `<release>-ui-token` Secret with a rand
 
 ## Node Probe (inference provider discovery)
 
-The node-probe DaemonSet discovers inference providers (Ollama, vLLM, llama-cpp) installed directly on cluster nodes. It probes localhost ports and annotates nodes so the web wizard can offer model selection and node pinning.
+The node-probe DaemonSet discovers inference providers (Ollama, vLLM, llama-cpp, LM Studio) installed directly on cluster nodes. It probes localhost ports and annotates nodes so the web wizard can offer model selection and node pinning. It also labels KVM-capable nodes `celln.dev/kvm=true` for Celln; a label an operator set (either value) is never changed.
 
 ```yaml
 nodeProbe:
-  enabled: false          # Opt-in: deploys a DaemonSet on all nodes
+  enabled: true           # Deployed by default on all nodes
+  labelKVMNodes: true     # Label nodes with /dev/kvm and a /boot kernel celln.dev/kvm=true
   config:
     probeInterval: 30s
     targets:
@@ -137,6 +188,10 @@ nodeProbe:
       - name: llama-cpp
         port: 8080
         healthPath: /health
+        modelsPath: /v1/models
+      - name: lm-studio
+        port: 1234
+        healthPath: /v1/models
         modelsPath: /v1/models
   resources:
     requests:

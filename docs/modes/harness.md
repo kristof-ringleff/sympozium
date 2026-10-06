@@ -112,14 +112,15 @@ at two different layers, and they compose with different things:
 |---|---|---|
 | Selected by | `spec.backend` | `spec.task.mode` |
 | Changes | **where** the run executes | **what process runs** inside the Job |
-| Composes with | nothing — it bypasses the pod entirely | `agentSandbox`, gates, ensembles, MCP, skills, memory |
-| Runtime owned in | [the celln repo](https://github.com/sympozium-ai/celln) | the adapter's repo |
-| Footprint when unused | zero (`celln.enabled=false`) | zero (no image, no chart resource) |
+| Composes with | Celln's own runtime profiles and borrowed tools — it bypasses the pod entirely | `agentSandbox`, gates, ensembles, MCP, skills, memory |
+| Runtime owned in | [the celln repo](https://github.com/sympozium-ai/celln) (the in-cell harness comes from the reviewed starter package) | the adapter's repo |
+| Footprint when unused | zero with `--no-celln` (`celln.enabled=false`) | zero (no image, no chart resource) |
 
 Two consequences worth knowing:
 
-- **`mode: harness` + `backend: celln` is rejected at admission.** Celln dispatches the task
-  string to its router and never builds a pod, so there is no agent container to replace.
+- **`mode: harness` + `backend: celln` is rejected at admission.** Celln runs its own
+  harness inside a cell (selected through a Celln `AgentRuntime` wrapper and
+  `cellnSelection`) and never builds a pod, so there is no agent container to replace.
   Admitting it would run the task with the harness image silently ignored, which is exactly
   the failure the [capability descriptor](#capability-descriptors) exists to prevent.
 - **`agentSandbox` works normally.** It builds its pod through `buildAgentPodTemplate`, which
@@ -127,9 +128,10 @@ Two consequences worth knowing:
   isolation like any other.
 
 Harness mode requires an explicit policy opt-in because it changes the trusted primary
-process and exposes the run's model and MCP credentials to that process. Celln's enable flag
-instead controls deployment of its privileged installer DaemonSet; the two gates protect
-different boundaries.
+process and exposes the run's model and MCP credentials to that process. Celln's gates are its own: the
+namespace's `CellnExecutionPolicy`, the runtime profile and the lent tool revisions decide what a
+cell may do, and `--no-celln` keeps its privileged node components off the cluster entirely. The
+two gates protect different boundaries.
 
 ## What Sympozium supplies
 
@@ -149,7 +151,7 @@ Nothing new was built for this. The mode reuses what the platform already had:
 | Adapter contract | `SYMPOZIUM_HARNESS_CONTRACT_VERSION=v1alpha1`; reject versions the adapter does not understand |
 | Working directory | `/workspace`, regardless of the image's own `WORKDIR` |
 | Result | `/ipc/output/result.json` plus the `__SYMPOZIUM_RESULT__` stdout marker |
-| `/ipc` | **only** `input/` (read-only) and `output/` — see [/ipc is not a shared surface](#ipc-is-not-a-shared-surface) |
+| `/ipc` | **only** `input/` (read-only), `control/` (read-only) and `output/` — see [/ipc is not a shared surface](#ipc-is-not-a-shared-surface) |
 
 The exact contract, in both directions, is [harness-adapters.md](harness-adapters.md).
 
@@ -242,11 +244,18 @@ files only for tools it chose to register — policy and writer are one trusted
 process, which is why the skill sidecars execute what arrives without checking
 authority. Harness mode separates them.
 
-So a harness gets two `subPath` mounts and nothing else: `/ipc/input`
-(read-only) and `/ipc/output`. The other six directories are **not in its mount
-namespace** — not filtered, not checked, absent. A harness cannot spawn a child
-run or message a channel by writing a file, whatever its capability descriptor
-claims, because there is nowhere to write it.
+So a harness gets three `subPath` mounts and nothing else: `/ipc/input`
+(read-only), `/ipc/control` (read-only) and `/ipc/output`. The other six
+directories are **not in its mount namespace** — not filtered, not checked,
+absent. A harness cannot spawn a child run or message a channel by writing a
+file, whatever its capability descriptor claims, because there is nowhere to
+write it.
+
+`/ipc/control` holds the skip marker a preRun hook writes when there is no work
+to do. The bridge does not watch it. With `agent-runner`, Sympozium reads the
+marker and skips the run. A harness replaces `agent-runner`, so the adapter must
+read the marker and report `status: skipped` itself — see
+[Skipped runs](harness-adapters.md#skipped-runs).
 
 `agent-runner` is unaffected and still mounts the volume root.
 

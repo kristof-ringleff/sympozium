@@ -10,10 +10,10 @@ Thanks for your interest in contributing! This document covers how we work, what
 2. **Roadmap** — The project roadmap lives in [GitHub Projects](https://github.com/sympozium-ai/sympozium/projects). Pick items from the current milestone.
 3. **AGENTS.md** — If you're an AI coding agent (Copilot, Cursor, etc.), read [`AGENTS.md`](AGENTS.md) for repo layout, build instructions, and common task recipes.
 4. **Documentation** — Architecture and guides live in [`docs/`](docs/):
-   - [`sympozium-design.md`](docs/sympozium-design.md) — Full architecture and CRD schemas
-   - [`writing-tools.md`](docs/writing-tools.md) — How to add agent tools
-   - [`writing-skills.md`](docs/writing-skills.md) — How to create SkillPack CRDs
-   - [`writing-integration-tests.md`](docs/writing-integration-tests.md) — Integration test patterns
+   - [`architecture.md`](docs/architecture.md) — Components, execution planes and data flow; [`concepts/custom-resources.md`](docs/concepts/custom-resources.md) for every CRD
+   - [`writing-tools.md`](docs/guides/writing-tools.md) — How to add agent tools
+   - [`writing-skills.md`](docs/guides/writing-skills.md) — How to create SkillPack CRDs
+   - [`writing-integration-tests.md`](docs/guides/writing-integration-tests.md) — Integration test patterns
 
 ---
 

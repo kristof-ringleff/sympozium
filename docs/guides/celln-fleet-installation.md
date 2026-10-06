@@ -40,6 +40,48 @@ wrapper in every namespace (`celln-<name>`) and each Agent picks its
 backend in the wizard. Rerunning the install with one more backend adds it
 to the running fleet without restarting anyone's conversation.
 
+### Model keys: mediated by default
+
+A released binary also pins the model gateway image it published, and with
+it the install turns on [mediated model access](celln-mediated-model-access.md)
+with no further input. Your provider key then becomes **one Agent's own
+key**, never the fleet's:
+
+- In the `-n` namespace (`default`, or `--celln-starter-namespace`) the
+  installer creates a Secret `starter-model-key` holding the key (as
+  `OPENAI_API_KEY` or `ANTHROPIC_API_KEY`, by protocol), a `ModelConnection`
+  `starter` naming it, and an Agent `starter` that grants it in
+  `spec.authRefs` and runs on the backend's runtime through the gateway.
+  Further backends get `starter-<backend>`. The Secret records the Agent as
+  its owner, so no other Agent can use it.
+- The fleet still configures the backend (its starter configuration is the
+  runtime every mediated run executes on), but `celln-fleet-model-credentials`
+  holds a placeholder for it, the scope's policy offers it only as an
+  `auth: secret` route, and no namespace gets a shared `celln-agent` or
+  host-profile connection for it. No Celln node holds the key; the
+  installer probes the provider with it in memory only.
+- Every other Agent brings its own key (Create Agent → Celln). The policy
+  admits each HTTPS backend's provider and model for Agents' own keys
+  (`celln.mediation.mediateBackends`); declare further providers with
+  `--celln-mediated-route`.
+
+The installer bootstraps the mediation trust itself (cluster id = the
+`kube-system` namespace UID, certificate names from the release's actual
+full name and namespace, valid ten years), and derives every
+`celln.mediation.*` value and `modelGateway.image` again on each run, so a
+rerun keeps mediation on and never rotates the trust. The gateway's
+PostgreSQL is the chart's bundled one, which needs a default StorageClass.
+
+Opt out with `--no-celln-mediation`: the key is then published to every fleet
+node as below, and any Agent in an admitted namespace runs on it. A source
+build pins no gateway image; it installs without mediation and says so,
+unless you pass `--model-gateway-image ghcr.io/sympozium-ai/sympozium/model-gateway@sha256:<digest>`.
+A cluster that already mediates is never switched off by a rerun that cannot
+find an image: the install stops and asks for the flag or the opt-out.
+Keyless backends (llama-server), backends on plain HTTP or an explicit port,
+and backends whose key an earlier unmediated install already published keep
+the fleet path; the installer says which.
+
 In a terminal with none of those set, the install asks for a provider and a
 key; without a terminal it installs the one-shot router only and says what to
 set. The default picks scope `starter`, keeps its records under
@@ -64,12 +106,14 @@ The same command installs [ergoz](https://github.com/sympozium-ai/ergoz)
   BLAKE3 hash as the client policy every node installs. Owners never see the
   token; the controller never sees the policy. Rerunning the installer verifies
   the pair and refuses to rotate it by replacement.
-- **Model credentials.** Each backend's model profile references an absolute
-  file path. In fleet mode that is one Secret (`celln-fleet-model-credentials`,
-  one key per backend) mounted read-only into each dispatcher; guests and the
-  controller cannot read it.
-  This keeps the key inside the cluster trust boundary until the dedicated
-  model gateway (#502) is attached to native parents; treat it as interim.
+- **Model credentials.** By default (mediated model access) a keyed
+  backend's key is the starter Agent's own Secret and only the model gateway
+  reads it; the fleet holds a placeholder (see above). With
+  `--no-celln-mediation`, and for keyless or plain-HTTP backends, each
+  backend's model profile references an absolute file path: one Secret
+  (`celln-fleet-model-credentials`, one key per backend) mounted read-only
+  into each dispatcher; guests and the controller cannot read it, but every
+  Agent in an admitted namespace runs on it.
 - **Configuration publication.** Only the DaemonSet's init step holds a
   projected ServiceAccount token, scoped to creating and reading one ConfigMap
   in `celln-system`. The dispatcher container has no API credential.
@@ -150,7 +194,19 @@ parent. Pass `--celln-fleet-skip-preflight` when only the nodes can reach
 the endpoint (for example a LAN llama-server the operator's machine cannot
 see).
 
-The command runs two phases and is safe to rerun:
+The command runs two phases and is safe to rerun. With mediated model access
+(the default) the exact sequence is: decide mediation (gateway image from
+`--model-gateway-image`, `--set modelGateway.image`, the release pin, or the
+deployed release); read an existing mediation trust's key id or choose a new
+one; probe each backend with its key in memory; install the chart with
+`celln.fleet.*` and the derived `celln.mediation.*` values (no wait); publish
+the fleet credentials (placeholders for mediated backends) and the parent
+principal; bootstrap or verify the mediation trust under that key id (the
+pods that mount it start once it exists); wait for the nodes and the
+controller; install the platform (policy with `auth: secret` routes for
+mediated backends); upgrade the release again with the same values plus the
+controller wiring; and finally create the starter Agent's runtime wrapper,
+Secret, ModelConnection and Agent.
 
 1. Publishes the parent principal and model credential, then installs the
    chart with `celln.fleet.*` set. Labeled nodes pull the package by digest,
@@ -210,9 +266,11 @@ provider name plus `endpoint` and `protocol`. Without `--celln-fleet-backend`
 the `--celln-fleet-model-*` flags and `--celln-fleet-model-credential-file`
 define the single backend named `native`.
 
-- Each backend's key is published once as its entry in the
-  `celln-fleet-model-credentials` Secret in `celln-system` (key = backend
-  name) and mounted read-only into every dispatcher as
+- Under mediated model access (the default) each keyed backend's key becomes
+  its starter Agent's Secret and the backend's entry in the
+  `celln-fleet-model-credentials` Secret is a placeholder. With
+  `--no-celln-mediation` the key is published once as that entry (key =
+  backend name) and mounted read-only into every dispatcher as
   `/etc/celln-native/credentials/<name>`. Omit `credential-file` to keep an
   existing entry; keyless backends get a placeholder.
 - Every node configures every backend from the same package, so all backends
@@ -236,6 +294,172 @@ define the single backend named `native`.
   and namespaces get the new wrapper on first use. A scope holds at most 32
   backends; changing an existing backend's route needs a new scope (see
   **Moving to a new package or scope** below).
+
+### Model parameters
+
+A backend may carry **model parameters**: a JSON object the Celln host merges
+into every request it sends to that backend's provider. The host injects
+them after the guest has built its request, so the agent (the guest) cannot
+see, set or change them, and they apply to every conversation on the backend.
+Use them for provider switches Celln has no field for — sampling settings,
+or turning a reasoning phase off.
+
+The case that needs them: Celln allows **512 output tokens per model
+request**. A reasoning model (Qwen3, DeepSeek-R1 and the like) served by
+llama-server can spend all of them thinking and return an empty answer
+(`finish_reason: length`), which fails the turn with `final answer is
+empty…`. The server flag `--reasoning-budget 0` does not help; the switch has
+to travel with each request:
+
+```sh
+cat >/etc/sympozium/qwen-parameters.json <<'JSON'
+{"chat_template_kwargs": {"enable_thinking": false}}
+JSON
+
+sympozium install --celln-fleet --celln-native-approve-starter-tools \
+  --celln-fleet-backend name=native,provider=deepseek,model=deepseek-chat,credential-file=/path/to/deepseek-key \
+  --celln-fleet-backend name=qwen,provider=llama-server,model=MODEL.gguf,endpoint=http://HOST:8080,allow-insecure=true,parameters-file=/etc/sympozium/qwen-parameters.json
+```
+
+`parameters-file` is an absolute path to a file holding the object (a file,
+because JSON contains the commas that separate the flag's pairs). With the
+single-backend flags use `--celln-fleet-model-parameters-file`. Through the
+API, send the object as `parameters`
+(`{"name":"qwen","provider":"llama-server","endpoint":"http://HOST:8080","allowInsecure":true,"parameters":{"chat_template_kwargs":{"enable_thinking":false}}}`).
+In the console, both add-a-fleet-backend forms (the Create Agent wizard's
+Provider step and an Agent's Harness tab) have **Advanced: model parameters**:
+tick **Disable thinking (reasoning models)** — offered for llama-server and
+for Custom with the OpenAI chat protocol — or write the JSON; the two edit
+the same object. `GET /api/v1/celln-platform/backends` returns each backend's
+`parameters`, and the console shows them next to the backend.
+
+Rules (Celln's own; the installer, the API and the console check them first
+and name the rule that is broken, and Celln checks again on every node):
+
+- at most 16 top-level keys; every key, at any depth, matches
+  `^[a-z][a-z0-9_]{0,63}$`;
+- values are booleans, finite numbers, strings of at most 256 bytes (no NUL),
+  objects under the same rules, or arrays of at most 8 scalars; no `null`;
+  at most 3 levels of nesting, the object itself being the first;
+- at most 2048 bytes serialized;
+- these top-level keys are reserved, because Celln sets them on every request:
+  `model`, `messages`, `system`, `stream`, `stream_options`, `max_tokens`,
+  `max_completion_tokens`, `n`, `tools`, `tool_choice`, `functions`,
+  `function_call`, `parallel_tool_calls`, `user`. Parameters therefore cannot
+  raise the 512-token allowance.
+
+The one-token probe sends the parameters too, so one the provider rejects
+(HTTP 400) is reported at install or add time rather than as lost turns.
+
+**Celln version.** Parameters need a Celln release **newer than v0.5.22** on
+the fleet nodes; the installer image (`celln-node-configure`) carries Celln,
+so that means a Sympozium release that pins such a Celln. An older Celln
+refuses a plan that names `parameters`: the backend is never configured, the
+`celln-node-configure` log shows Celln's refusal followed by `backend NAME
+sets model parameters: they need a Celln release newer than v0.5.22…`, and
+the installer's wait (or the API's `error:` state) says the same. A backend
+without parameters gets exactly the plan it always got, on any Celln.
+
+**Parameters cannot be changed in place.** A node configures a backend once,
+and a published backend's configuration is never rewritten, so an install
+that asks for other parameters on a published backend (adding, changing or
+removing them) stops with `model parameters of a published backend cannot
+change` instead of ignoring the change. Add a backend under another name
+with the parameters you want (`--celln-fleet-backend name=qwen-2,…` or the
+API; the API refuses a name that exists) and move Agents to it on their
+Harness tab, or move the fleet to a new scope with `--celln-fleet-scope` and
+`--celln-fleet-replace-package`, which configures every backend afresh and
+ends every live parent.
+
+In a values file, `celln.fleet.backends[].parameters` takes the object
+itself.
+
+#### Output tokens per request
+
+Celln lets one model request produce **512 output tokens** by default. That
+suits chat with thinking disabled, and caps an answer near 2 KB. A backend
+may set its own cap, **256–4096**, on all three paths:
+
+```bash
+# the installer, in a backend's spec …
+sympozium install \
+  --celln-fleet-backend name=native,provider=deepseek \
+  --celln-fleet-backend name=thinker,provider=llama-server,model=qwq.gguf,endpoint=http://10.0.0.5:8080,allow-insecure=true,max-output-tokens=2048
+
+# … or for the single --celln-fleet-model-* backend
+sympozium install --celln-fleet-model-provider llama-server … \
+  --celln-fleet-model-max-output-tokens 2048
+```
+
+| Path | Field |
+| --- | --- |
+| Installer | `max-output-tokens=N` in `--celln-fleet-backend`, or `--celln-fleet-model-max-output-tokens N` |
+| Chart values | `celln.fleet.backends[].maxOutputTokens` (or `celln.fleet.model.maxOutputTokens`) |
+| API / console | `maxOutputTokens` in `POST /api/v1/celln-platform/backends`; "Max output tokens per request" under **Advanced** in both add-a-fleet-backend forms |
+
+Absent, `0` and `512` all mean the default, and a default backend carries
+nothing: its values, its entry in `FLEET_BACKENDS` and its
+`starter-configure` plan are byte for byte what they were before the field
+existed, so nodes do not roll and any Celln configures it. A non-default
+value becomes `modelConnection.maxOutputTokens` in the plan and
+`model.maxOutputTokens` in the published `configured.json`.
+
+**Which value.** 512 suits chat with thinking disabled. A reasoning model
+left thinking needs 2048–4096, which costs 4–8× the tokens per turn and may
+exceed the 60-second turn limit on a slow local model. If the model only
+needs to stop thinking, prefer the parameter above; raise the cap when you
+want it to think, or need answers longer than about 2 KB (one committed
+answer is still at most 8192 bytes; a longer one fails the turn with `final
+answer exceeds …`, and the remedy is a shorter answer or a lower cap).
+
+**The 6× rule.** A turn reserves 6 model requests and **6 × the backend's
+cap** in output tokens from its conversation's lifetime totals: 3072 at the
+default, 12288 at 2048, 24576 at 4096. The runtime profile publishes it as
+`spec.native.turnModelRequests` / `turnOutputTokens`. A scope has **one**
+policy with one set of ceilings, while its backends may now differ in what a
+turn costs, so:
+
+- The installer checks `--celln-fleet-max-output-tokens` against the **most
+  expensive** install-time backend: it must be at least 6 × the largest cap,
+  and the refusal names the backend. The maximum is 25165824
+  (1024 turns × 6 × 4096).
+- When you do not pass `--celln-fleet-max-output-tokens`, the installer
+  sizes it so the default 256 turns stay reachable on that backend
+  (256 × 6 × the largest cap: 3145728 at 2048, 6291456 at 4096) and prints
+  one line saying so. Model requests stay 256 × 6.
+- `sessionDefaults`, the sample run and the console's defaults are computed
+  **per profile**: the largest turn count up to 64 whose requests and tokens
+  the ceilings pay for at that profile's own allowance.
+- A backend added later through the API or console, with a higher cap than
+  the ceilings were sized for, still works but buys fewer turns. The API
+  answers with a `warning` when the ceilings pay for fewer than the usual 64
+  turns on it (the console shows it), refuses a cap whose single turn the
+  ceilings cannot pay for, and `sympozium doctor`'s "Fleet turn budget"
+  check reports every profile's allowance and the turns it affords, with
+  the ceilings to install for the costliest one.
+
+**Celln version and package.** A non-default cap needs a Celln release
+**newer than v0.5.23** on the fleet nodes **and a starter package built by
+that Celln** (the guest worker has to send the configured value; Celln
+refuses at configure time otherwise). Sympozium's release builds the package
+from the Celln it pins, so a new install of such a release has both. An
+**existing** fleet keeps the package it was installed with: move it with
+`--celln-fleet-replace-package` (see [Moving to a new package or
+scope](#moving-to-a-new-package-or-scope); live parents are lost) before
+adding a backend with its own cap. On an older Celln the plan is refused,
+the backend is never configured, and the `celln-node-configure` log, the
+installer's wait and the API's `error:` state all name the requirement
+(`… needs a Celln release newer than v0.5.23 …`).
+
+**It cannot be changed in place**, for the same reason as parameters: an
+install that asks for another cap on a published backend (raising, lowering
+or removing it) stops with `max output tokens per request of a published
+backend cannot change` and the same three ways forward: the backend under
+another name through the installer or the API, or a new scope with
+`--celln-fleet-replace-package`.
+
+The one-token preflight probe is unchanged: it always asks for one token,
+whatever the backend's cap.
 
 ## One-shot runs
 
@@ -288,7 +512,10 @@ admitted package; owners and their conversations are untouched. Once the
 nodes have published its configuration, the API server installs the
 backend's runtime profile, policy route and wrappers, and
 `GET /api/v1/celln-platform/backends` reports it `ready`; until then it
-shows `pending` or `configuring`, or `error: …` with the reason. The Agent
+shows `pending` or `configuring`, or `error: …` with the reason. The
+`configuring` state includes a deliberate wait of about 90 seconds for the key
+to reach the running dispatchers; the state text and the Create Agent wizard
+say so while it lasts. The Agent
 page's backend picker has the same form. A backend named at install cannot
 be added again, and a key already published for a name is never replaced.
 
@@ -305,7 +532,7 @@ namespace's policy lends exactly those revisions. Two kinds live side by side:
   They are the only way a cell touches files or the network, through host
   brokers with the quotas the policy shows: every write-like operation is an
   approved effect, reads are not. The hosts the two HTTPS tools may reach are
-  the scope's `--celln-fleet-https-host` list (default `example.com`); a
+  the scope's `--celln-fleet-https-host` list (default: any public HTTPS host, never a private address); a
   backend approved with `allow-insecure` may also post over plain HTTP to a
   private host, for example a receiver inside the cluster.
 - **Borrowed commands** are ordinary programs taken from container images
@@ -376,9 +603,13 @@ remembers before you send anything.
 The same move is available on request: **Restart elsewhere** in the UI, or
 `POST /api/v1/runs/{name}/continue?namespace=…&uid=…`, creates the seeded
 continuation and deletes the old run (`keep=true` leaves it). Memory is
-bounded by the parent's turn context (about 2 KiB of text): a long
-conversation keeps its most recent exchanges, and only committed answers are
-remembered, never failed turns, tool output or instructions. A run with
+bounded by the worker task the fleet's starter package takes, which the
+scope's `CellnRuntimeProfile` reports as `spec.limits.taskBytes`: about
+15 KiB of text (16384 − 512 bytes, at most 16 exchanges) on a current
+package, about 1.5 KiB on an older one, whose guest refuses a larger seed
+and would fail to start. A long conversation keeps its most recent
+exchanges, and only committed answers are remembered, never failed turns,
+tool output or instructions. A run with
 `spec.conversation.continuation: none` is not re-created; a chain stops after
 16 automatic continuations.
 
@@ -392,24 +623,71 @@ every run and are configured on every node at install time:
 | --- | --- | --- |
 | `--celln-fleet-max-lease-seconds` | 86400 (24 h) | 60–86400 |
 | `--celln-fleet-max-turns` | 256 | 1–1024 |
-| `--celln-fleet-max-model-requests` | 768 | 3–6144 |
-| `--celln-fleet-max-output-tokens` | 393216 | 1536–3145728 |
+| `--celln-fleet-max-model-requests` | 1536 | 6–6144 |
+| `--celln-fleet-max-output-tokens` | 786432 (256 × 6 × the largest backend cap when that is above 512) | 3072–25165824 |
+
+One turn of the current starter package may make 6 model requests (up to 4
+tool calls, then an answer) and produce 3072 output tokens, and **every turn
+reserves that whole allowance** from the parent's lifetime totals whether or
+not it spends it. Size the totals as turns × allowance: the defaults are
+256 × 6 and 256 × 3072, and the minima are one turn's worth. Totals that
+afford fewer turns than `max-turns` end the conversation early, at
+`min(requests / 6, tokens / 3072)` turns. A backend that sets its own
+[output tokens per request](#output-tokens-per-request) reserves 6 × that
+instead of 3072, and the ceilings are sized and checked for the most
+expensive backend of the scope.
+
+One message is at most 2048 bytes and one committed answer at most 8192
+bytes (2048 on a fleet still running an older starter package, where a
+longer answer is a failed turn).
 
 A new conversation asks for a working session inside those ceilings by
-default (four hours, 64 turns, 192 requests, 98304 tokens; the API reports
-them per profile as `sessionDefaults`). A run asking for more than a ceiling
+default (four hours, 64 turns, 384 requests, 196608 tokens at the default
+allowance; the API reports them per profile as `sessionDefaults`, with the
+largest turn count up to 64 that the ceilings pay for at that profile's own
+per-turn allowance). A run asking for more than a ceiling
 is refused with `AUTH_LIMIT_RANGE`. When a lease ends no new turn is admitted
 and the parent stops; the conversation view shows the deadline and asks for a
 new conversation. Leases are not extended in place. Every live parent holds
 two cells and its declared memory for its whole lease, so long defaults cost
 node capacity while conversations sit idle.
 
+### Ceilings sized for an older package
+
+Before the per-turn allowance doubled, a turn reserved 3 requests and 1536
+tokens, and the default ceilings were 768 requests and 393216 tokens for 256
+turns. Those totals buy **half the turns** at 6 and 3072: a conversation
+under them ends after 128 turns, and an Agent that saved the old session
+defaults (64 turns, 192 requests, 98304 tokens) ends after 32.
+
+Ceilings are configured on the nodes together with the package and are
+never rewritten for an unchanged package. They are rewritten when the scope
+moves to another package, which is how the current allowance arrives in the
+first place:
+
+```sh
+sympozium install --celln-fleet --celln-fleet-replace-package
+# or, to choose the totals yourself (turns × 6, turns × 3072):
+sympozium install --celln-fleet --celln-fleet-replace-package \
+  --celln-fleet-max-turns 512 --celln-fleet-max-model-requests 3072 \
+  --celln-fleet-max-output-tokens 1572864
+```
+
+The move takes the ceilings from the `--celln-fleet-max-*` flags (the new
+defaults when omitted), so passing the old totals explicitly keeps the
+shortfall. `sympozium doctor` reports it as **Fleet turn budget** with the
+turn a conversation would end at. Agents keep the budget they were saved
+with: raise `spec.execution.enduring.maxModelRequests` and `maxOutputTokens`
+on an Agent created before the move (the wizard offers the new session
+defaults for new ones). The alternative is to accept fewer turns; a
+conversation that runs out can be carried on with **Restart elsewhere**.
+
 ## Authorising namespaces
 
 The installer publishes the reviewed starter configuration **once per scope**
 as cluster-scoped objects — `CellnRuntimeProfile` `celln-native-<scope>`
-(carrying the native parent/worker material), three `ClusterCellnTool`s
-`celln-<scope>-<tool>`, and a `CellnExecutionPolicy` `celln-fleet-<scope>`
+(carrying the native parent/worker material), one `ClusterCellnTool`
+`celln-<scope>-<tool>` per tool in the package, and a `CellnExecutionPolicy` `celln-fleet-<scope>`
 with a `host-profile` model route and the reviewed ceilings.
 
 **By default every namespace is authorised** except the system exclusions
@@ -450,8 +728,11 @@ shared catalogue for them and uses the namespace's host-profile
 
 The `ModelConnection`'s `credentialProfile` names the owner-installed model
 credential (the scope); `CellnExecutionPolicy` routes with `auth: host-profile`
-are the interim boundary until the model gateway (P1) attaches to native
-parents and routes switch to `auth: secret`.
+serve those fleet-keyed backends. A mediated backend (the default for keyed
+providers) has no such route and no shared wrappers: a namespace gets its
+runtime wrapper alone (`{"runtimeOnly": true}`; the profiles list marks it
+`"mediationOnly": true`) and its Agents bring their own key through an
+`auth: secret` route.
 
 ## Verify
 
@@ -472,6 +753,24 @@ Follow-up turns created by hand must carry the run's controller
 refused as unbound. `test/integration/test-celln-fleet.sh` runs the whole
 journey on a three-node Kind cluster, including a node-leave drain.
 
+### Seeing cells in the console
+
+The Harnesses page and the topology show `celln ps` for every fleet node
+(`GET /api/v1/celln-platform/cells`), and the card says where the data came
+from. The API server first asks the Celln gateway for `GET /v1/cells` with the
+same read-only capability token it uses for `/v1/capabilities`
+(**source: gateway**); this also carries each parent's live owner status
+(`Ready`, `TurnActive`, `ContextLost`, …), which the console shows in place of
+the run's phase. Celln releases that predate that endpoint answer 404, which
+the API server remembers for five minutes, and it then reads the
+`celln-fleet-cells` ConfigMap that every node's `celln-node-configure` pod
+publishes every two seconds (**source: node reports**). The ConfigMap is also
+used when the gateway is busy or unreachable, and for a single node whose
+dispatcher the gateway could not list; a backend with neither appears as
+`node-<index>` with the gateway's reason. The node reporter and its chart
+wiring stay installed for older Celln releases and become redundant once the
+pinned Celln release serves `/v1/cells`.
+
 ## Operations
 
 - **Join a node:** label it. The package is admitted on that node only.
@@ -480,8 +779,10 @@ journey on a three-node Kind cluster, including a node-leave drain.
   owner and confirms teardown; those runs report `ContextLost`. Once the
   address has left the fleet the gateway answers `original parent backend
   removed` for its identities, which the controller also treats as context
-  loss (and as established teardown when the run is deleted); nothing is
-  re-placed.
+  loss (and as established teardown when the run is deleted). The parent
+  itself is not moved; the controller continues the conversation as a new
+  run on another node (see
+  [Conversations survive their node](#conversations-survive-their-node)).
 - **Rolling updates** replace one node's dispatcher at a time with the same
   drain semantics. A dispatcher restart loses live parents on that node.
 - **New package or scope:** see below. One scope carries exactly one package
@@ -491,12 +792,92 @@ journey on a three-node Kind cluster, including a node-leave drain.
   journal claim; remove them only after every run has been deleted and
   cleanup confirmed.
 
+## Troubleshooting an install
+
+On a machine that has been used before, start with `sympozium doctor`. It only
+reads, prints one `PASS`/`WARN`/`FAIL` line per check with the exact command
+that fixes each problem, and exits 1 when anything fails (`--json` for
+scripts). `sympozium install` runs the same leftover checks before it changes
+anything and stops with the complete list rather than failing part-way.
+
+- **`… exists and cannot be imported into the current release: invalid
+  ownership metadata`.** Objects of an older, partly removed install are in the
+  way, and Helm names only the first. `doctor` (check *Ownership*) lists every
+  one at once with a single remedy each: the `kubectl label`/`annotate` pair
+  that adopts it, or `kubectl delete`. `sympozium install --adopt-existing`
+  adopts the safe kinds for you (Namespace, ServiceAccount, ConfigMap, Secret,
+  Service, NetworkPolicy, PersistentVolumeClaim and the chart's own
+  `sympozium.ai` resources). Deployments, DaemonSets and other kinds are never
+  adopted, because an old spec may be incompatible: delete them and the chart
+  recreates them. An object another Helm release claims is never taken
+  automatically.
+- **A CRD or namespace stuck `Terminating`** (the install used to print only
+  `Detected changes to resource agentruns.sympozium.ai which is currently being
+  deleted`). Custom resources still hold a finalizer such as
+  `sympozium.ai/agentrun-finalizer` and no controller is left to remove it.
+  `doctor` (check *Terminating*) names each holder and prints its `kubectl patch
+  … '{"metadata":{"finalizers":null}}'` command. Clearing a finalizer skips
+  the controller's cleanup for that object, so only do it for an install that
+  is gone, and remove leftover run pods by hand.
+- **`celln-node` never starts and the install sits in its wait.** `doctor`
+  (check *Fleet pods*) reports an init container that has run for more than two
+  minutes, or is backing off, with its last log lines. The usual cause is a
+  state directory `/var/lib/sympozium-celln/<scope>` left by an older install
+  under another uid: `wait-prepared` now fails at once with `cannot read the
+  Celln state directory …`, naming the path, its owner and mode, instead of
+  waiting for ever, and `celln-node-configure` resets the owner to root (mode
+  0700, nothing opened to other users) on its next pass, after which the pod
+  starts by itself. If it does not, move the directory aside on the node
+  (`sudo mv /var/lib/sympozium-celln/<scope>{,.old}`) or `sudo chown 0:0` it;
+  with SELinux enforcing also `sudo chcon -R -t container_file_t` it.
+- **A CLI built from source ran an old installer image** (`error: exact
+  five-bundle starter package required`). A build without a release version
+  used to default the installer image to the mutable `latest` tag, which a
+  node may have cached months ago. It now uses the embedded chart's
+  `appVersion` (`v`-prefixed), like the control-plane images, and says so.
+  `--image-tag` still overrides the control-plane images and
+  `--celln-installer-image` the installer image.
+
+`doctor` also reports whether any node carries `celln.dev/kvm=true`, whether
+every model backend has its key in `celln-fleet-model-credentials`, and whether
+the published fleet package differs from the one this CLI installs, in which
+case the upgrade needs `--celln-fleet-replace-package` (next section).
+
 ## Moving to a new package or scope
 
-Every Sympozium release pins its own starter package (a new package hash and
-publisher key), so upgrading `sympozium` and rerunning `sympozium install`
-moves the fleet to a new package. The same applies to a rebuilt package or a
-changed `--celln-fleet-scope`. Because this ends every live parent on the
+A Sympozium release carries a new starter package only when the package's
+inputs changed: the pinned Celln release (`config/celln/release.json`), the
+packaging recipe (`hack/build-celln-starter.sh`) or the tool images it
+packages. Every other release republishes the previous release's package
+unchanged (the same image digest, package hash and publisher key), so
+upgrading `sympozium` and rerunning `sympozium install` keeps the fleet's
+package, restarts no dispatcher and says so:
+
+```console
+$ sympozium install ...
+  Celln fleet package unchanged (blake3:d365…); live conversations are kept
+```
+
+To see whether a release changes the package before you upgrade, compare the
+`celln-starter.json` asset of the two releases. `inputs` is the fingerprint of
+the package's inputs (`hack/celln-starter-inputs.sh` prints it, and
+`--manifest` shows what it covers); when it and `packageHash` are equal, the
+package is the same one:
+
+```console
+$ for tag in v0.10.80 v0.10.81; do gh release download "$tag" --repo sympozium-ai/sympozium \
+    --pattern celln-starter.json --output - | jq -c '{inputs, packageHash}'; done
+```
+
+Releases published before the fingerprint was recorded have no `inputs`
+field, and each of them carries its own package. A maintainer can also force
+a release to build a new package (`force_starter_rebuild` on the release
+workflow), which changes `packageHash` while `inputs` stays the same, so
+`packageHash` is the field that decides.
+
+`--celln-fleet-replace-package` is therefore only needed when upgrading across
+a release whose package changed, for a package you rebuilt yourself, or for a
+changed `--celln-fleet-scope`. Because a move ends every live parent on the
 fleet, the installer checks the published configuration before it changes
 anything and refuses unless you approve the move:
 
@@ -563,8 +944,10 @@ new run"); the incarnation is never retried and the run deletes cleanly.
 
 ## Limits
 
-Single active turn per parent, no parent migration or checkpoint recovery,
-no live lease extension, and the model credential Secret mounted into every
-dispatcher is an interim boundary until the model gateway attaches to native
-parents (#464 "Path to production"). One model backend per scope; persona and
-tool set are fixed by the starter package (#535).
+Single active turn per parent, no live parent migration (a lost parent is
+[continued](#conversations-survive-their-node) as a new run from its recorded
+exchanges, not restored), and no live lease extension. Only fleet-keyed
+backends (`--no-celln-mediation`, keyless, plain-HTTP or pre-existing ones)
+keep a key in a Secret mounted into every dispatcher; by default every Agent
+uses its own key through [mediated model access](celln-mediated-model-access.md). All backends
+of a scope share the package's persona and tool set (#535).

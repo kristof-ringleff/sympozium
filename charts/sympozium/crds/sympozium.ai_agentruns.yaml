@@ -493,7 +493,7 @@ spec:
                         and the answer it got.
                       properties:
                         assistant:
-                          maxLength: 2048
+                          maxLength: 8192
                           type: string
                         user:
                           maxLength: 2048
@@ -533,7 +533,7 @@ spec:
                     type: integer
                   maxOutputTokens:
                     format: int64
-                    maximum: 3145728
+                    maximum: 25165824
                     minimum: 0
                     type: integer
                   maxTurns:
@@ -1172,7 +1172,8 @@ spec:
                       type: string
                     type: array
                   deny:
-                    description: Deny lists explicitly denied tools.
+                    description: Deny lists explicitly denied tools. "*" denies every
+                      tool.
                     items:
                       type: string
                     type: array
@@ -3398,7 +3399,7 @@ spec:
                       result:
                         properties:
                           answer:
-                            maxLength: 2048
+                            maxLength: 8192
                             minLength: 1
                             type: string
                           succeeded:
@@ -3816,6 +3817,13 @@ spec:
               sandboxName:
                 description: SandboxName is the name of the Sandbox CR created for
                   this run (agent-sandbox mode).
+                type: string
+              serviceAccountName:
+                description: |-
+                  ServiceAccountName is the run's own ServiceAccount, chosen once by the
+                  controller. Runs whose policy allows skill Secret access use the
+                  sympozium-trusted-run- prefix, which the chart's admission policy does
+                  not restrict; all others use sympozium-run-.
                 type: string
               serviceName:
                 description: ServiceName is the name of the Service created for server-mode

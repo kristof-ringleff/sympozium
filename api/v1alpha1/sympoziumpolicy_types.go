@@ -24,6 +24,10 @@ type SympoziumPolicySpec struct {
 	// +optional
 	FeatureGates map[string]bool `json:"featureGates,omitempty"`
 
+	// SkillPolicy governs what skill sidecars of this policy's Agents may do.
+	// +optional
+	SkillPolicy *SkillPolicySpec `json:"skillPolicy,omitempty"`
+
 	// NetworkPolicy defines network isolation settings.
 	// +optional
 	NetworkPolicy *NetworkPolicySpec `json:"networkPolicy,omitempty"`
@@ -140,8 +144,10 @@ type SubagentPolicySpec struct {
 
 // ToolGatingSpec defines tool access rules.
 type ToolGatingSpec struct {
-	// DefaultAction is the default action for unmatched tools (allow, deny, ask).
+	// DefaultAction applies to tools no rule names. With deny, a run may use
+	// only the tools a rule allows.
 	// +kubebuilder:default="allow"
+	// +kubebuilder:validation:Enum=allow;deny
 	DefaultAction string `json:"defaultAction,omitempty"`
 
 	// Rules is the list of tool-specific rules.
@@ -153,7 +159,8 @@ type ToolGatingRule struct {
 	// Tool is the tool name this rule applies to.
 	Tool string `json:"tool"`
 
-	// Action is the action to take (allow, deny, ask).
+	// Action is allow or deny.
+	// +kubebuilder:validation:Enum=allow;deny
 	Action string `json:"action"`
 }
 
@@ -209,6 +216,16 @@ type LifecyclePolicySpec struct {
 	// 0 means no ceiling.
 	// +optional
 	MaxRetryAttempts int `json:"maxRetryAttempts,omitempty"`
+}
+
+// SkillPolicySpec governs skill sidecar permissions.
+type SkillPolicySpec struct {
+	// AllowSecretAccess keeps the secrets, pods/exec and pods/attach
+	// permissions a SkillPack requests, and lets the run create workloads
+	// that reference Secrets. Off by default: with it, an agent driving such
+	// a skill can read every model key in its namespace.
+	// +optional
+	AllowSecretAccess bool `json:"allowSecretAccess,omitempty"`
 }
 
 // SympoziumPolicyStatus defines the observed state of SympoziumPolicy.

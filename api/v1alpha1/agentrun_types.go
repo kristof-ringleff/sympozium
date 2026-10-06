@@ -371,7 +371,7 @@ type ToolPolicySpec struct {
 	// Allow lists explicitly allowed tools.
 	Allow []string `json:"allow,omitempty"`
 
-	// Deny lists explicitly denied tools.
+	// Deny lists explicitly denied tools. "*" denies every tool.
 	Deny []string `json:"deny,omitempty"`
 }
 
@@ -392,6 +392,22 @@ const (
 	AgentRunPhaseSkipped AgentRunPhase = "Skipped"
 )
 
+// IsTerminal reports whether the phase is final: the run has stopped and the
+// controller will not move it to another phase.
+//
+// Skipped is terminal alongside Succeeded and Failed. Spelling the check out
+// inline keeps losing Skipped, which leaks finalizers and makes Forbid
+// schedules block on runs that already finished — so always call this helper
+// instead of comparing phases by hand. The empty phase ("", the run not
+// observed yet) is not terminal.
+func (p AgentRunPhase) IsTerminal() bool {
+	switch p {
+	case AgentRunPhaseSucceeded, AgentRunPhaseFailed, AgentRunPhaseSkipped:
+		return true
+	}
+	return false
+}
+
 // AgentRunStatus defines the observed state of AgentRun.
 // +kubebuilder:validation:XValidation:rule="!has(oldSelf.cellnIssuance) || has(self.cellnIssuance)",message="saved Celln issuance cannot be removed"
 // +kubebuilder:validation:XValidation:rule="!has(oldSelf.cellnParent) || has(self.cellnParent)",message="saved Celln parent cannot be removed"
@@ -406,6 +422,13 @@ type AgentRunStatus struct {
 	// Phase is the current phase (Pending, Running, Succeeded, Failed, Skipped).
 	// +optional
 	Phase AgentRunPhase `json:"phase,omitempty"`
+
+	// ServiceAccountName is the run's own ServiceAccount, chosen once by the
+	// controller. Runs whose policy allows skill Secret access use the
+	// sympozium-trusted-run- prefix, which the chart's admission policy does
+	// not restrict; all others use sympozium-run-.
+	// +optional
+	ServiceAccountName string `json:"serviceAccountName,omitempty"`
 
 	// PodName is the name of the pod running this agent.
 	// +optional

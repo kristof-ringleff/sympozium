@@ -141,19 +141,6 @@ export interface Agent {
 }
 
 /** A native profile the current namespace's execution policy admits. */
-/** One model backend of the Celln fleet and, for one added through the API, how far it got. */
-export interface CellnFleetBackend {
-  name: string;
-  provider: string;
-  protocol: string;
-  endpoint: string;
-  model: string;
-  allowInsecure: boolean;
-  source: "install" | "added";
-  profile: string;
-  state: string;
-}
-
 /** One cell as `celln ps -a` reports it on a fleet node, joined to its run. */
 export interface CellnCell {
   id: string;
@@ -183,29 +170,66 @@ export interface CellnRunRef {
 export interface CellnNodeParent {
   incarnation: string;
   updatedMs: number;
+  /** Stage is one of reserved, child-destroyed, committed — whichever source reported it. */
   turns: { turnId: string; stage: string; child?: string; succeeded?: boolean; timeoutMs?: number }[];
   run?: CellnRunRef;
+  /** The owner's observation of the parent (Ready, TurnActive, ContextLost, …); gateway only. */
+  status?: string;
+  /** Whether status was observed live rather than read back from the journal. */
+  statusLive?: boolean;
 }
 
-/** One fleet node's cells and parents, as its configure pod last reported them. */
+/** Where a node's cells came from: the Celln gateway's /v1/cells, or the node's own ConfigMap report. */
+export type CellnCellsSource = "gateway" | "node-report";
+
+/** One fleet node's cells and parents, from the gateway or as its configure pod last reported them. */
 export interface CellnNodeCells {
   node: string;
   reportedMs: number;
   stale: boolean;
+  /** An unreadable node report, or the reason the gateway gave for a backend it could not list. */
   error?: string;
+  source?: CellnCellsSource;
   cells: CellnCell[];
   parents: CellnNodeParent[];
 }
 
-export interface AddCellnFleetBackendRequest {
-  name: string;
-  provider: string;
-  model?: string;
-  endpoint?: string;
-  protocol?: string;
+/**
+ * One provider route the operator declared for Agents that bring their own
+ * key (GET /api/v1/celln-platform/mediation). A ModelConnection matches it
+ * only with exactly this provider and protocol, one of these models and an
+ * endpoint on one of these origins.
+ */
+export interface CellnMediatedRoute {
+  auth?: "secret" | "none";
   allowInsecure?: boolean;
-  credential?: string;
-  skipPreflight?: boolean;
+  provider: string;
+  protocol: "openai-chat" | "anthropic-messages";
+  models: string[];
+  /** The route declares models ["*"]: any model name of this provider at these exact origins. */
+  anyModel?: boolean;
+  endpointOrigins: string[];
+  /** The execution policy carrying the route; absent on a pending one. */
+  policy?: string;
+  /** The fixed key name the provider Secret must hold for this protocol. */
+  secretKey: string;
+}
+
+export interface CellnMediation {
+  enabled: boolean;
+  mediateBackends: boolean;
+  /** Routes the namespace's policies carry now: what a run is matched against. */
+  routes: CellnMediatedRoute[];
+  /** Declared routes no policy carries yet (sympozium celln-mediation apply-routes). */
+  pending: CellnMediatedRoute[];
+}
+
+/** A Secret in the namespace that already holds a model key. Names only, never values. */
+export interface CellnKeySecret {
+  name: string;
+  key: string;
+  /** Created by the console for a model connection. */
+  managed?: boolean;
 }
 
 export interface CellnPlatformProfile {
@@ -228,6 +252,8 @@ export interface CellnPlatformProfile {
   /** The policy's per-parent maxima and the budget a new conversation should ask for. */
   ceilings: EnduringLimits;
   sessionDefaults: EnduringLimits;
+  /** The backend's key never reached the fleet: only Agents with their own key run on it (no shared agent). */
+  mediationOnly?: boolean;
 }
 
 export interface EnduringLimits {
@@ -456,6 +482,8 @@ export interface AgentRunStatus {
     initialTurn?: ParentTurnExecution;
     acceptedTurns: number;
     activeTurn?: { name: string; uid: string };
+    /** The first terminal owner observation, frozen by the controller. */
+    ownerOutcome?: { status: "ContextLost" | "Stopped" | "TeardownUncertain" | "CreateRefused" | string; reachedReady: boolean; observedAt?: string };
     /** The run that continues this conversation after its context was lost. */
     continuedBy?: string;
   };
@@ -1095,6 +1123,28 @@ export interface ClusterInfoResponse {
   version?: string;
 }
 
+/** One node in the cluster identity response. */
+export interface ClusterIdentityNode {
+  name: string;
+  roles: string[];
+  kubeletVersion?: string;
+}
+
+/** GET /api/v1/cluster/identity — which cluster this console is talking to.
+ *  Every field is best effort and may be empty. */
+export interface ClusterIdentity {
+  /** kube-system namespace UID. */
+  clusterID: string;
+  /** kubeadm clusterName, else the Kind cluster name, else "". */
+  name: string;
+  kubernetesVersion: string;
+  /** Capped server-side; nodeCount is the total. */
+  nodes: ClusterIdentityNode[];
+  nodeCount: number;
+  /** The API server's own build version. */
+  sympoziumVersion: string;
+}
+
 // ── Provider Discovery ───────────────────────────────────────────────────────
 
 export interface NodeProvider {
@@ -1135,7 +1185,7 @@ export interface CapabilitiesResponse {
 
 export interface ModelConnection {
   metadata: ObjectMeta;
-  spec: { provider: string; protocol: "openai-chat" | "anthropic-messages"; endpoint: string; credentialProfile?: string; secretRef?: string; models: string[]; disabled?: boolean; allowInsecure?: boolean };
+  spec: { provider: string; protocol: "openai-chat" | "anthropic-messages"; endpoint: string; credentialProfile?: string; secretRef?: string; models: string[]; disabled?: boolean; allowInsecure?: boolean; parameters?: Record<string, unknown>; maxOutputTokens?: number };
 }
 
 export interface AgentExecutionDefaults {
@@ -1601,10 +1651,11 @@ export const api = {
 
   cellnPlatform: {
     profiles: () => apiFetch<CellnPlatformProfile[]>("/api/v1/celln-platform/profiles"),
-    ensureWrappers: (profile: string) => apiFetch<CellnPlatformWrappers>("/api/v1/celln-platform/wrappers", { method: "POST", body: JSON.stringify({ profile }) }),
-    backends: () => apiFetch<CellnFleetBackend[]>("/api/v1/celln-platform/backends", { skipNamespace: true }),
+    /** The AgentRuntime wrapper alone: all an Agent with its own key needs from the fleet. */
+    ensureRuntime: (profile: string) => apiFetch<CellnPlatformWrappers>("/api/v1/celln-platform/wrappers", { method: "POST", body: JSON.stringify({ profile, runtimeOnly: true }) }),
+    mediation: () => apiFetch<CellnMediation>("/api/v1/celln-platform/mediation"),
+    keySecrets: (key: string) => apiFetch<CellnKeySecret[]>(`/api/v1/celln-platform/key-secrets?key=${encodeURIComponent(key)}`),
     cells: () => apiFetch<CellnNodeCells[]>("/api/v1/celln-platform/cells", { skipNamespace: true }),
-    addBackend: (body: AddCellnFleetBackendRequest) => apiFetch<CellnFleetBackend>("/api/v1/celln-platform/backends", { method: "POST", body: JSON.stringify(body), skipNamespace: true, retryNetwork: false }),
   },
 
   cellnTools: {
@@ -1898,6 +1949,10 @@ export const api = {
 
   cluster: {
     info: () => apiFetch<ClusterInfoResponse>("/api/v1/cluster"),
+    get: () =>
+      apiFetch<ClusterIdentity>("/api/v1/cluster/identity", {
+        skipNamespace: true,
+      }),
   },
 
   capabilities: {

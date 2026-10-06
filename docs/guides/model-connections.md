@@ -40,7 +40,7 @@ unauthenticated endpoint, leave the key blank. The controller supplies an inert
 `OPENAI_API_KEY` placeholder because the SDK/adapter requires a nonempty setting
 even when the server does not authenticate. It creates no Secret.
 
-See [the complete Hermes example](../../config/samples/hermes-framework-connection.yaml)
+See [the complete Hermes example](https://github.com/sympozium-ai/sympozium/blob/main/config/samples/hermes-framework-connection.yaml)
 for the Agent and HarnessSession manifests. API/wizard Agent creation creates
 `<agent>-chat` automatically; declarative creation also requires a HarnessSession.
 
@@ -82,9 +82,9 @@ Secret. Revoking a connection and rotating a Secret are different operations.
 
 ## Native Celln
 
-Native connections require a full HTTPS endpoint, an opaque
-`credentialProfile`, and either `openai-chat` or `anthropic-messages`. They cannot
-reference Kubernetes Secrets or use the HTTP/private-network llama-server route
+Native connections served by the fleet's own credential require a full HTTPS
+endpoint, an opaque `credentialProfile`, and either `openai-chat` or
+`anthropic-messages`. They cannot use the HTTP/private-network llama-server route
 above: the native host transport retains its public HTTPS boundary.
 
 ```yaml
@@ -95,6 +95,46 @@ spec:
   credentialProfile: team-anthropic
   models: [your-model-id]
 ```
+
+### An Agent's own key (gateway-mediated)
+
+A shared-catalogue run (a platform wrapper runtime, cluster tools) may instead
+select a connection that names the namespace's own Secret:
+
+```yaml
+spec:
+  provider: anthropic
+  protocol: anthropic-messages
+  endpoint: https://api.anthropic.com/v1/messages
+  secretRef: my-anthropic-key
+  models: [your-model-id]
+  maxOutputTokens: 4096   # optional, 256-4096 per request; 512 when omitted
+```
+
+Such a run is never provisioned with the key. The controller picks the path from
+the connection: `credentialProfile` is provisioned on the fleet as before, while
+`secretRef` (or no credential) is executed by the scoped receiver, and the model
+gateway injects the key from the Secret it pinned. Without a configured scoped
+receiver the run is held with condition `CellnScopedExecution` /
+`ScopedDispatchDisabled`; it never falls back. Three things must all hold:
+
+- The operator's `CellnExecutionPolicy` lists an `auth: secret` route with the
+  connection's exact provider, protocol and HTTPS origin, and the model: one of
+  the route's exact names, or any model when the route declares `["*"]`. Routes
+  are the operator's allow-list; origins are never a wildcard, and a connection
+  is never its own authorisation.
+- The Agent grants the Secret: it is listed in the Agent's `spec.authRefs` (an
+  empty `provider` grants it for any provider), or the Agent's
+  `spec.execution.modelConnectionRef` names this connection. A run cannot borrow
+  another Secret-backed connection in its namespace.
+- The run's budget pays for a turn. With `maxOutputTokens: N` a turn reserves
+  the worker's model requests (6 on the starter package) times N output tokens,
+  so `spec.enduring.maxOutputTokens` and the policy ceiling must be at least
+  that; otherwise admission is refused with the numbers (`AUTH_LIMIT_OUT_OF_RANGE`).
+
+The run may use the same runtime wrapper as the fleet's backend: only a
+`credentialProfile` connection is bound to the runtime profile's installed
+credential.
 
 The Agent's native `execution` defaults contain `modelConnectionRef`, `model`,
 the Celln selection, lifecycle, and existing bounded enduring settings. Runs

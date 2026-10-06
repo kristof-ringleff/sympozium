@@ -10,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -47,6 +48,7 @@ import (
 	"github.com/sympozium-ai/sympozium/internal/eventbus"
 	"github.com/sympozium-ai/sympozium/internal/ipc"
 	"github.com/sympozium-ai/sympozium/internal/modelconnection"
+	"github.com/sympozium-ai/sympozium/internal/modelkey"
 	"github.com/sympozium-ai/sympozium/internal/orchestrator"
 	"github.com/sympozium-ai/sympozium/internal/pricing"
 	"github.com/sympozium-ai/sympozium/internal/sessionkey"
@@ -129,6 +131,12 @@ var allowedAuthSecretKeys = []string{
 	"DEEPSEEK_API_KEY",
 	"OPENROUTER_API_KEY",
 	"API_KEY",
+}
+
+// IsAllowedAuthSecretKey reports whether key is on the auth secret allowlist,
+// i.e. whether a Secret entry under that key reaches the agent container.
+func IsAllowedAuthSecretKey(key string) bool {
+	return slices.Contains(allowedAuthSecretKeys, key)
 }
 
 // deniedEnvVarKeys lists environment variable names that cannot be set via
@@ -365,9 +373,7 @@ func (r *AgentRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	// their finalizer removed in reconcileCompleted; we must not re-add it or
 	// we create an infinite remove→add→remove loop.
 	// Serving-mode runs are long-lived and also need a finalizer.
-	isTerminal := agentRun.Status.Phase == sympoziumv1alpha1.AgentRunPhaseSucceeded ||
-		agentRun.Status.Phase == sympoziumv1alpha1.AgentRunPhaseFailed ||
-		agentRun.Status.Phase == sympoziumv1alpha1.AgentRunPhaseSkipped
+	isTerminal := agentRun.Status.Phase.IsTerminal()
 	// Persist this boundary only for untouched new runs, before adding our
 	// finalizer or creating any resources. Never infer it from mutable backend
 	// intent on an existing run. Requeue to confirm the API retains the field.
@@ -404,12 +410,12 @@ func (r *AgentRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		if !scopedCatalogueSelected(agentRun) && !isTerminal {
 			return ctrl.Result{}, r.failRun(ctx, agentRun, "Scoped Celln run selection or lifecycle changed; create a new run")
 		}
-		switch agentRun.Status.Phase {
-		case "", sympoziumv1alpha1.AgentRunPhasePending:
+		switch phase := agentRun.Status.Phase; {
+		case phase == "" || phase == sympoziumv1alpha1.AgentRunPhasePending:
 			return r.reconcilePendingScoped(ctx, log, agentRun)
-		case sympoziumv1alpha1.AgentRunPhaseRunning:
+		case phase == sympoziumv1alpha1.AgentRunPhaseRunning:
 			return r.reconcileRunningScoped(ctx, log, agentRun)
-		case sympoziumv1alpha1.AgentRunPhaseSucceeded, sympoziumv1alpha1.AgentRunPhaseFailed, sympoziumv1alpha1.AgentRunPhaseSkipped:
+		case phase.IsTerminal():
 			return r.reconcileCompleted(ctx, log, agentRun)
 		default:
 			return ctrl.Result{}, r.failRun(ctx, agentRun, "Scoped Celln run entered an unsupported controller phase")
@@ -442,18 +448,18 @@ func (r *AgentRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	// Reconcile based on current phase
 	var result ctrl.Result
 	var err error
-	switch agentRun.Status.Phase {
-	case "", sympoziumv1alpha1.AgentRunPhasePending:
+	switch phase := agentRun.Status.Phase; {
+	case phase == "" || phase == sympoziumv1alpha1.AgentRunPhasePending:
 		result, err = r.reconcilePending(ctx, log, agentRun)
-	case sympoziumv1alpha1.AgentRunPhaseRunning:
+	case phase == sympoziumv1alpha1.AgentRunPhaseRunning:
 		result, err = r.reconcileRunning(ctx, log, agentRun)
-	case sympoziumv1alpha1.AgentRunPhasePostRunning:
+	case phase == sympoziumv1alpha1.AgentRunPhasePostRunning:
 		result, err = r.reconcilePostRunning(ctx, log, agentRun)
-	case sympoziumv1alpha1.AgentRunPhaseServing:
+	case phase == sympoziumv1alpha1.AgentRunPhaseServing:
 		result, err = r.reconcileServing(ctx, log, agentRun)
-	case sympoziumv1alpha1.AgentRunPhaseAwaitingDelegate:
+	case phase == sympoziumv1alpha1.AgentRunPhaseAwaitingDelegate:
 		result, err = r.reconcileAwaitingDelegate(ctx, log, agentRun)
-	case sympoziumv1alpha1.AgentRunPhaseSucceeded, sympoziumv1alpha1.AgentRunPhaseFailed, sympoziumv1alpha1.AgentRunPhaseSkipped:
+	case phase.IsTerminal():
 		result, err = r.reconcileCompleted(ctx, log, agentRun)
 	default:
 		log.Info("Unknown phase", "phase", agentRun.Status.Phase)
@@ -574,6 +580,21 @@ func (r *AgentRunReconciler) resolveAgentRunInputs(ctx context.Context, agentRun
 	}
 
 	return out, nil
+}
+
+// runModelSecrets lists the credential Secrets a run would use: its inline
+// key, its provider-headers Secret and its ModelConnection's Secret. A
+// connection that cannot be read is skipped; resolving it fails the run later.
+func (r *AgentRunReconciler) runModelSecrets(ctx context.Context, agentRun *sympoziumv1alpha1.AgentRun) []string {
+	model := agentRun.Spec.Model
+	secrets := []string{model.AuthSecretRef, model.ProviderHeadersSecretRef}
+	if model.ConnectionRef != "" {
+		var connection sympoziumv1alpha1.ModelConnection
+		if err := r.Get(ctx, client.ObjectKey{Namespace: agentRun.Namespace, Name: model.ConnectionRef}, &connection); err == nil {
+			secrets = append(secrets, connection.Spec.SecretRef)
+		}
+	}
+	return secrets
 }
 
 // resolveProviderHeaders merges the providerHeadersSecretRef contents into
@@ -949,6 +970,16 @@ func (r *AgentRunReconciler) reconcilePending(ctx context.Context, log logr.Logg
 	if taskmodes.HarnessImage(agentRun.Spec.Task) != "" && !agentAllowsModelCredential(&runtimeInstance, agentRun.Spec.Model.Provider, agentRun.Spec.Model.AuthSecretRef) {
 		return ctrl.Result{}, r.failRun(ctx, agentRun, fmt.Sprintf("harness model credential %q is not declared in Agent %q spec.authRefs for provider %q", agentRun.Spec.Model.AuthSecretRef, runtimeInstance.Name, agentRun.Spec.Model.Provider))
 	}
+	// Every model credential a run names must belong to its Agent (or the
+	// Agent's Ensemble): one key per Agent, shared only with its sub-agents.
+	for _, secret := range r.runModelSecrets(ctx, agentRun) {
+		if err := modelkey.Authorize(ctx, r.Client, &runtimeInstance, "", secret); err != nil {
+			if modelkey.IsRefusal(err) {
+				return ctrl.Result{}, r.failRun(ctx, agentRun, err.Error())
+			}
+			return ctrl.Result{}, fmt.Errorf("checking model key ownership: %w", err)
+		}
+	}
 
 	// Agent Sandbox mode — create Sandbox CR instead of Job.
 	if agentRun.Spec.AgentSandbox != nil && agentRun.Spec.AgentSandbox.Enabled {
@@ -1090,7 +1121,11 @@ func (r *AgentRunReconciler) reconcilePending(ctx context.Context, log logr.Logg
 	// Build and create the Job. buildJob delegates to buildAgentPodTemplate, which
 	// applies the pod mutators; register a podMutator rather than injecting here,
 	// so the agentSandbox backend is covered too.
-	job, err := r.buildJob(ctx, agentRun, prereqs.inputs.memoryEnabled, prereqs.inputs.observability,
+	podRun, err := r.withPolicyToolGating(ctx, agentRun)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	job, err := r.buildJob(ctx, podRun, prereqs.inputs.memoryEnabled, prereqs.inputs.observability,
 		sidecars, prereqs.mcpServers, prereqs.inputs.allowedOutboundChannels)
 	if err != nil {
 		// buildJob (which calls buildContainers) rejected the spec — most
@@ -1193,13 +1228,11 @@ func (r *AgentRunReconciler) reconcileRunning(ctx context.Context, log logr.Logg
 			// override it with "Job not found".
 			fresh := &sympoziumv1alpha1.AgentRun{}
 			if getErr := r.statusReader().Get(ctx, client.ObjectKeyFromObject(agentRun), fresh); getErr == nil {
-				switch fresh.Status.Phase {
-				case sympoziumv1alpha1.AgentRunPhaseSucceeded,
-					sympoziumv1alpha1.AgentRunPhaseFailed,
-					sympoziumv1alpha1.AgentRunPhaseSkipped:
+				switch phase := fresh.Status.Phase; {
+				case phase.IsTerminal():
 					// Already terminal — don't override.
 					return ctrl.Result{}, nil
-				case sympoziumv1alpha1.AgentRunPhasePostRunning:
+				case phase == sympoziumv1alpha1.AgentRunPhasePostRunning:
 					// PostRun container is still executing — let the
 					// PostRunning reconcile path handle it.
 					return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
@@ -1486,10 +1519,7 @@ func (r *AgentRunReconciler) reconcileAwaitingDelegate(ctx context.Context, log 
 			}
 			// Sync delegate status from the actual child.
 			agentRun.Status.Delegates[i].Phase = childRun.Status.Phase
-			switch childRun.Status.Phase {
-			case sympoziumv1alpha1.AgentRunPhaseSucceeded, sympoziumv1alpha1.AgentRunPhaseFailed, sympoziumv1alpha1.AgentRunPhaseSkipped:
-				// Terminal.
-			default:
+			if !childRun.Status.Phase.IsTerminal() {
 				allTerminal = false
 			}
 			if childRun.Status.Phase == sympoziumv1alpha1.AgentRunPhaseFailed {
@@ -2804,8 +2834,25 @@ func (r *AgentRunReconciler) validatePolicy(ctx context.Context, agentRun *sympo
 // agentRunServiceAccountName returns the identity used only by this AgentRun.
 // AgentRun names already satisfy Kubernetes DNS-subdomain requirements.
 func agentRunServiceAccountName(agentRun *sympoziumv1alpha1.AgentRun) string {
+	if agentRun.Status.ServiceAccountName != "" {
+		return agentRun.Status.ServiceAccountName
+	}
+	return runServiceAccountName(restrictedRunAccountPrefix, agentRun)
+}
+
+// Run ServiceAccount prefixes. The chart's admission policy stops accounts
+// with the restricted prefix from creating workloads that reference Secrets;
+// only runs whose SympoziumPolicy allows skill Secret access get the trusted
+// prefix. The controller records the choice in status, which run authors
+// cannot write.
+const (
+	restrictedRunAccountPrefix = "sympozium-run-"
+	trustedRunAccountPrefix    = "sympozium-trusted-run-"
+)
+
+func runServiceAccountName(prefix string, agentRun *sympoziumv1alpha1.AgentRun) string {
 	const maxDNSSubdomainLength = 253
-	name := "sympozium-run-" + agentRun.Name
+	name := prefix + agentRun.Name
 	if len(name) <= maxDNSSubdomainLength {
 		return name
 	}
@@ -2869,6 +2916,20 @@ func (r *AgentRunReconciler) ensureNATSBridgeCredentials(ctx context.Context, ag
 // existing cloud workload-identity configuration continues to apply. The
 // shared account itself is never selected by an AgentRun pod or RoleBinding.
 func (r *AgentRunReconciler) ensureAgentServiceAccount(ctx context.Context, agentRun *sympoziumv1alpha1.AgentRun) error {
+	if agentRun.Status.ServiceAccountName == "" {
+		allowed, err := r.skillSecretAccessAllowed(ctx, agentRun)
+		if err != nil {
+			return err
+		}
+		prefix := restrictedRunAccountPrefix
+		if allowed {
+			prefix = trustedRunAccountPrefix
+		}
+		agentRun.Status.ServiceAccountName = runServiceAccountName(prefix, agentRun)
+		if err := r.Status().Update(ctx, agentRun); err != nil {
+			return fmt.Errorf("recording run service account: %w", err)
+		}
+	}
 	name := agentRunServiceAccountName(agentRun)
 	sa := &corev1.ServiceAccount{}
 	err := r.Get(ctx, client.ObjectKey{Name: name, Namespace: agentRun.Namespace}, sa)
@@ -2962,6 +3023,30 @@ func agentPodLabels(agentRun *sympoziumv1alpha1.AgentRun) map[string]string {
 	}
 }
 
+// withPolicyToolGating returns agentRun unchanged when its Agent has no
+// SympoziumPolicy tool gating, or a copy whose spec.toolPolicy has the
+// policy's rules applied (toolpolicy.WithGating). There is no mutating
+// webhook, so this is where a policy's tool rules reach the pod.
+func (r *AgentRunReconciler) withPolicyToolGating(ctx context.Context, agentRun *sympoziumv1alpha1.AgentRun) (*sympoziumv1alpha1.AgentRun, error) {
+	agent := &sympoziumv1alpha1.Agent{}
+	if err := r.Get(ctx, client.ObjectKey{Namespace: agentRun.Namespace, Name: agentRun.Spec.AgentRef}, agent); err != nil {
+		return nil, fmt.Errorf("resolving tool policy: agent %q: %w", agentRun.Spec.AgentRef, err)
+	}
+	if agent.Spec.PolicyRef == "" {
+		return agentRun, nil
+	}
+	policy := &sympoziumv1alpha1.SympoziumPolicy{}
+	if err := r.Get(ctx, client.ObjectKey{Namespace: agentRun.Namespace, Name: agent.Spec.PolicyRef}, policy); err != nil {
+		return nil, fmt.Errorf("resolving tool policy: policy %q: %w", agent.Spec.PolicyRef, err)
+	}
+	if policy.Spec.ToolGating == nil {
+		return agentRun, nil
+	}
+	gated := agentRun.DeepCopy()
+	gated.Spec.ToolPolicy = toolpolicy.WithGating(agentRun.Spec.ToolPolicy, policy.Spec.ToolGating)
+	return gated, nil
+}
+
 // buildAgentPodTemplate renders the pod template used by both AgentRun execution
 // backends: buildJob wraps it in a batchv1.Job, buildSandboxCR converts it into a
 // Sandbox CR.
@@ -2973,6 +3058,9 @@ func agentPodLabels(agentRun *sympoziumv1alpha1.AgentRun) map[string]string {
 // Returns an error when the spec is rejected at render time (unknown task.mode,
 // failed per-mode validation); the reconcile loop surfaces it on
 // AgentRun.status and marks the run Failed.
+//
+// Callers pass the run from withPolicyToolGating, so spec.toolPolicy already
+// carries the Agent's SympoziumPolicy tool rules; the builders stay pure.
 func (r *AgentRunReconciler) buildAgentPodTemplate(
 	ctx context.Context,
 	agentRun *sympoziumv1alpha1.AgentRun,
@@ -5274,7 +5362,22 @@ func (r *AgentRunReconciler) mirrorSkillConfigMaps(ctx context.Context, log logr
 // ensureSkillRBAC creates Role/ClusterRole and bindings for skill sidecars.
 // Resources are labelled with the AgentRun name for cleanup.
 func (r *AgentRunReconciler) ensureSkillRBAC(ctx context.Context, log logr.Logger, agentRun *sympoziumv1alpha1.AgentRun, sidecars []resolvedSidecar) error {
+	allowSecrets, err := r.skillSecretAccessAllowed(ctx, agentRun)
+	if err != nil {
+		return err
+	}
 	for _, sc := range sidecars {
+		if !allowSecrets {
+			restricted, err := withoutKeyAccess(sc.sidecar.RBAC)
+			if err != nil {
+				return fmt.Errorf("skill %s: %w", sc.skillPackName, err)
+			}
+			clusterRestricted, err := withoutKeyAccess(sc.sidecar.ClusterRBAC)
+			if err != nil {
+				return fmt.Errorf("skill %s: %w", sc.skillPackName, err)
+			}
+			sc.sidecar.RBAC, sc.sidecar.ClusterRBAC = restricted, clusterRestricted
+		}
 		// Namespace-scoped Role + RoleBinding
 		if len(sc.sidecar.RBAC) > 0 {
 			roleName := fmt.Sprintf("sympozium-skill-%s-%s", sc.skillPackName, agentRun.Name)
@@ -5394,6 +5497,61 @@ func (r *AgentRunReconciler) ensureSkillRBAC(ctx context.Context, log logr.Logge
 		}
 	}
 	return nil
+}
+
+// keyAccessResources are the core resources that reach model keys: the
+// Secrets themselves, and the environment of running agent pods.
+var keyAccessResources = map[string]bool{"secrets": true, "pods/exec": true, "pods/attach": true}
+
+// withoutKeyAccess drops key-reaching resources from a skill's requested
+// rules unless its Agent's policy allows Secret access. A rule granting every
+// core resource cannot be narrowed, so it is refused rather than trusted.
+func withoutKeyAccess(rules []sympoziumv1alpha1.RBACRule) ([]sympoziumv1alpha1.RBACRule, error) {
+	out := make([]sympoziumv1alpha1.RBACRule, 0, len(rules))
+	for _, rule := range rules {
+		core := slices.Contains(rule.APIGroups, "") || slices.Contains(rule.APIGroups, "*")
+		if !core {
+			out = append(out, rule)
+			continue
+		}
+		var kept []string
+		for _, resource := range rule.Resources {
+			if resource == "*" || resource == "pods/*" {
+				return nil, fmt.Errorf("requests all core resources (%q), which include Secrets; allow it with SympoziumPolicy spec.skillPolicy.allowSecretAccess", resource)
+			}
+			if !keyAccessResources[resource] {
+				kept = append(kept, resource)
+			}
+		}
+		if len(kept) > 0 {
+			rule.Resources = kept
+			out = append(out, rule)
+		}
+	}
+	return out, nil
+}
+
+// skillSecretAccessAllowed reports whether the run's Agent has a
+// SympoziumPolicy that opts its skills into Secret access.
+func (r *AgentRunReconciler) skillSecretAccessAllowed(ctx context.Context, agentRun *sympoziumv1alpha1.AgentRun) (bool, error) {
+	var agent sympoziumv1alpha1.Agent
+	if err := r.Get(ctx, client.ObjectKey{Namespace: agentRun.Namespace, Name: agentRun.Spec.AgentRef}, &agent); err != nil {
+		if errors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	if agent.Spec.PolicyRef == "" {
+		return false, nil
+	}
+	var policy sympoziumv1alpha1.SympoziumPolicy
+	if err := r.Get(ctx, client.ObjectKey{Namespace: agentRun.Namespace, Name: agent.Spec.PolicyRef}, &policy); err != nil {
+		if errors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	return policy.Spec.SkillPolicy != nil && policy.Spec.SkillPolicy.AllowSecretAccess, nil
 }
 
 // validateHarnessIsolation rejects pod-level privilege combinations that an
@@ -6019,6 +6177,62 @@ func (r *AgentRunReconciler) startPostRun(
 	return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 }
 
+const (
+	// defaultPostRunHookTimeout is the budget a postRun hook gets when it
+	// declares no timeout of its own. It matches the documented default on
+	// LifecycleHookContainer.Timeout.
+	defaultPostRunHookTimeout = 5 * time.Minute
+
+	// postRunMinTimeout floors the postRun budget at what it was before hook
+	// timeouts were honoured, so specs that declare none keep exactly the
+	// budget they have always had rather than silently losing half of it.
+	postRunMinTimeout = 10 * time.Minute
+
+	// postRunTimeoutGrace holds the controller-side backstop slightly behind
+	// the Job's own deadline so that, for a Job that actually started, the
+	// Job's ActiveDeadlineSeconds fires first and the failure arrives through
+	// the ordinary Failed path instead of the controller racing it to a delete.
+	postRunTimeoutGrace = 30 * time.Second
+)
+
+// postRunBudget returns how long the postRun Job may take in total. It is
+// applied twice: as the Job's ActiveDeadlineSeconds, and as a controller-side
+// backstop in reconcilePostRunning. Both measure from the Job's clock, never
+// the agent run's, so a gate gets its full budget however long the agent took.
+//
+// PostRun hooks run sequentially as init containers, so the budget is the sum
+// of their declared timeouts. Kubernetes has no per-init-container timeout, so
+// this bounds the Job as a whole: a hook that overruns eats into what is left
+// for the hooks after it rather than being killed individually.
+func postRunBudget(lifecycle *sympoziumv1alpha1.LifecycleHooks) time.Duration {
+	var total time.Duration
+	if lifecycle != nil {
+		for _, hook := range lifecycle.PostRun {
+			if hook.Timeout != nil && hook.Timeout.Duration > 0 {
+				total += hook.Timeout.Duration
+				continue
+			}
+			total += defaultPostRunHookTimeout
+		}
+	}
+	if total < postRunMinTimeout {
+		return postRunMinTimeout
+	}
+	return total
+}
+
+// postRunJobStart returns the instant a postRun Job's timeout is measured from.
+// Status.StartTime is what the Job controller uses for ActiveDeadlineSeconds,
+// so matching it keeps the two bounds consistent. CreationTimestamp is the
+// fallback for a Job that never starts (stuck on quota, or no Job controller in
+// envtest), so it still times out rather than holding the run forever.
+func postRunJobStart(job *batchv1.Job) time.Time {
+	if job.Status.StartTime != nil {
+		return job.Status.StartTime.Time
+	}
+	return job.CreationTimestamp.Time
+}
+
 // buildPostRunJob constructs a Job that runs the postRun lifecycle hook containers.
 // Each hook runs as a sequential init container, followed by a no-op final container.
 func (r *AgentRunReconciler) buildPostRunJob(
@@ -6040,7 +6254,7 @@ func (r *AgentRunReconciler) buildPostRunJob(
 	}
 
 	ttl := int32(300)
-	deadline := int64(600) // 10 min default for postRun
+	deadline := int64(postRunBudget(agentRun.Spec.Lifecycle).Seconds())
 	backoffLimit := int32(0)
 
 	readOnly := true
@@ -6286,13 +6500,15 @@ func (r *AgentRunReconciler) reconcilePostRunning(ctx context.Context, log logr.
 		}
 	}
 
-	// PostRun Job still running -- check timeout.
-	if agentRun.Status.StartedAt != nil {
-		elapsed := time.Since(agentRun.Status.StartedAt.Time)
-		// PostRun gets 10 minutes by default.
-		postRunTimeout := 10 * time.Minute
-		if elapsed > postRunTimeout {
-			log.Info("PostRun Job timed out", "elapsed", elapsed)
+	// PostRun Job still running -- check timeout. The clock is the postRun Job's
+	// own: anchoring to Status.StartedAt spent the budget before postRun began,
+	// so any run longer than the budget had its hooks killed on the first
+	// PostRunning reconcile and could never receive a gate verdict.
+	if anchor := postRunJobStart(&job); !anchor.IsZero() {
+		elapsed := time.Since(anchor)
+		budget := postRunBudget(agentRun.Spec.Lifecycle)
+		if elapsed > budget+postRunTimeoutGrace {
+			log.Info("PostRun Job timed out", "elapsed", elapsed, "budget", budget)
 			_ = r.Delete(ctx, &job, client.PropagationPolicy(metav1.DeletePropagationForeground))
 			if gated {
 				return r.resolveGate(ctx, log, agentRun, agentSucceeded, true)

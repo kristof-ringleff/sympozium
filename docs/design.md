@@ -1,5 +1,12 @@
 # Sympozium Design Document
 
+!!! note "Historical document"
+    This is the original design draft from February 2026, kept for its reasoning. Sympozium has
+    since diverged from it in many places: there is no OPA/Gatekeeper layer, memory is a
+    per-Agent SQLite server, and agents can also run in Celln microVMs, AgentHarness runtimes
+    and persistent sessions. For the system as it is today see [Architecture](architecture.md),
+    [Custom Resources](concepts/custom-resources.md) and the [design notes](design/index.md).
+
 **Status:** Draft
 **Date:** 2026-02-23
 **Authors:** Architecture Review
