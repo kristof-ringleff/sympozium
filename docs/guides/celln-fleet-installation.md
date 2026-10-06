@@ -326,12 +326,11 @@ because JSON contains the commas that separate the flag's pairs). With the
 single-backend flags use `--celln-fleet-model-parameters-file`. Through the
 API, send the object as `parameters`
 (`{"name":"qwen","provider":"llama-server","endpoint":"http://HOST:8080","allowInsecure":true,"parameters":{"chat_template_kwargs":{"enable_thinking":false}}}`).
-In the console, both add-a-fleet-backend forms (the Create Agent wizard's
-Provider step and an Agent's Harness tab) have **Advanced: model parameters**:
-tick **Disable thinking (reasoning models)** — offered for llama-server and
-for Custom with the OpenAI chat protocol — or write the JSON; the two edit
-the same object. `GET /api/v1/celln-platform/backends` returns each backend's
-`parameters`, and the console shows them next to the backend.
+The console no longer adds fleet backends; an Agent's own connection carries
+its model parameters instead (**Advanced: model parameters** in Create Agent →
+Celln, with **Disable thinking (reasoning models)** for llama-server and for
+Custom with the OpenAI chat protocol). `GET /api/v1/celln-platform/backends` returns each
+backend's `parameters`.
 
 Rules (Celln's own; the installer, the API and the console check them first
 and name the rule that is broken, and Celln checks again on every node):
@@ -395,7 +394,7 @@ sympozium install --celln-fleet-model-provider llama-server … \
 | --- | --- |
 | Installer | `max-output-tokens=N` in `--celln-fleet-backend`, or `--celln-fleet-model-max-output-tokens N` |
 | Chart values | `celln.fleet.backends[].maxOutputTokens` (or `celln.fleet.model.maxOutputTokens`) |
-| API / console | `maxOutputTokens` in `POST /api/v1/celln-platform/backends`; "Max output tokens per request" under **Advanced** in both add-a-fleet-backend forms |
+| API | `maxOutputTokens` in `POST /api/v1/celln-platform/backends` |
 
 Absent, `0` and `512` all mean the default, and a default backend carries
 nothing: its values, its entry in `FLEET_BACKENDS` and its
@@ -519,6 +518,31 @@ say so while it lasts. The Agent
 page's backend picker has the same form. A backend named at install cannot
 be added again, and a key already published for a name is never replaced.
 
+**With mediated model access** (the default; the cluster has the
+`celln-system/celln-mediated-routes` record), a keyed HTTPS backend added this
+way is mediation-only, exactly like an installer backend. Its key becomes the
+own key of the backend's starter Agent, `starter-<name>`, in the namespace the
+request names (`?namespace=team-a`, default `default`): a Secret
+`starter-<name>-model-key` annotated with that Agent as its owner, a
+ModelConnection and the Agent. The fleet's credential Secret gets only the
+mediation marker for the backend, so no node holds the key; the scope's policy
+offers the backend as an `auth: secret` route for that provider, model and
+origin, with no host-profile route and no shared tenant Agent; and once it is
+`ready` the starter Agent's namespace gets the runtime wrapper it runs on. If
+`starter-<name>-model-key` already belongs to another Agent, or holds a
+different key, the add is refused with `409` and nothing is published: pick
+another namespace. The answer and `GET` carry `mediated`, `starterAgent` and
+`starterNamespace` (so does `GET /api/v1/celln-platform/profiles` for the
+backend's profile), and when you pick that backend's model in Create Agent →
+Celln the wizard names that Agent, linking it when it is in your namespace.
+Every other Agent uses the backend with its own key.
+
+Two kinds of backend keep the fleet path even under mediation: a keyless one
+(for example `llama-server`), which has no key to protect, and a keyed one on
+plain HTTP or an explicit port, because a cluster Secret never crosses plain
+HTTP (`auth: secret` routes are HTTPS without a port). On a cluster that opted
+out of mediation every added backend publishes its key to the fleet as before.
+
 ## The toolbox
 
 Every run on the fleet borrows tools from the scope's package, and the
@@ -532,9 +556,10 @@ namespace's policy lends exactly those revisions. Two kinds live side by side:
   They are the only way a cell touches files or the network, through host
   brokers with the quotas the policy shows: every write-like operation is an
   approved effect, reads are not. The hosts the two HTTPS tools may reach are
-  the scope's `--celln-fleet-https-host` list (default: any public HTTPS host, never a private address); a
-  backend approved with `allow-insecure` may also post over plain HTTP to a
-  private host, for example a receiver inside the cluster.
+  the scope's `--celln-fleet-https-host` list (default: any public HTTPS host).
+  They never reach a private, loopback or link-local address, plain HTTP or
+  another port, whatever the backend's `allow-insecure` (which applies to the
+  model endpoint only). Mediated Agents get the same toolbox.
 - **Borrowed commands** are ordinary programs taken from container images
   pinned by digest in Celln's catalogue (`tools.toml`), for example busybox's
   grep, sed, awk, sort, uniq, wc, cut, head, tail, tr, base64, sha256sum and

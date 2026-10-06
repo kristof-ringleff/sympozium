@@ -254,6 +254,22 @@ export interface CellnPlatformProfile {
   sessionDefaults: EnduringLimits;
   /** The backend's key never reached the fleet: only Agents with their own key run on it (no shared agent). */
   mediationOnly?: boolean;
+  /**
+   * For a mediation-only backend, the starter Agent whose own key is the
+   * backend's provider key (an installer backend, or one added through the
+   * API under mediation). Names only; that key is never lent to another Agent.
+   */
+  starterAgent?: string;
+  starterNamespace?: string;
+  /**
+   * What an Agent with its own key selects to lend the starter toolbox: the
+   * backend's toolbox profile and wrapper, and exactly these tools in this
+   * order (Celln runs the toolbox for no other selection). Absent when the
+   * scope's package exports no toolbox: such an Agent then lends no tools.
+   */
+  toolboxProfile?: string;
+  toolboxWrapper?: string;
+  toolboxTools?: { name: string; revision: string }[];
 }
 
 export interface EnduringLimits {

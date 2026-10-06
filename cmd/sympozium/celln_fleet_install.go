@@ -633,11 +633,18 @@ func ensureStarterAgents(ctx context.Context, scope, starterNamespace string, re
 		if err != nil {
 			return nil, fmt.Errorf("backend %s: %w", b.Name, err)
 		}
-		runtime, err := cellnplatform.EnsureRuntimeWrapper(ctx, k8sClient, starterNamespace, cellninstall.PlatformProfileName(scope, b.Name))
+		// The starter Agent brings its own key: it lends the starter toolbox
+		// on the backend's toolbox runtime, or nothing on a package without
+		// one (the tool-free runtime serves no tools on the mediated path).
+		profile, tools, err := cellnplatform.OwnKeySelection(ctx, k8sClient, starterNamespace, cellninstall.PlatformProfileName(scope, b.Name))
 		if err != nil {
 			return nil, fmt.Errorf("starter Agent for backend %s: %w", b.Name, err)
 		}
-		if _, err := cellninstall.EnsureStarterAgent(ctx, k8sClient, cellninstall.StarterAgentOptions{Namespace: starterNamespace, Backend: b, Credential: credential, Runtime: runtime}); err != nil {
+		runtime, err := cellnplatform.EnsureRuntimeWrapper(ctx, k8sClient, starterNamespace, profile)
+		if err != nil {
+			return nil, fmt.Errorf("starter Agent for backend %s: %w", b.Name, err)
+		}
+		if _, err := cellninstall.EnsureStarterAgent(ctx, k8sClient, cellninstall.StarterAgentOptions{Namespace: starterNamespace, Backend: b, Credential: credential, Runtime: runtime, Tools: tools}); err != nil {
 			return nil, err
 		}
 		starters = append(starters, names.Agent)

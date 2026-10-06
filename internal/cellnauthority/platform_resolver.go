@@ -11,6 +11,7 @@ import (
 	"time"
 
 	api "github.com/sympozium-ai/sympozium/api/v1alpha1"
+	"github.com/sympozium-ai/sympozium/internal/cellnplatform"
 	"github.com/sympozium-ai/sympozium/internal/modelconnection"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -402,6 +403,18 @@ func evaluatePlatform(s platformSnapshot, request PlatformResolveRequest) (*Plat
 		return nil, deny(ReasonLimitRange, "task exceeds effective runtime limit")
 	}
 
+	// A toolbox runtime's closure lends exactly its recorded tools in that
+	// order, and Celln runs it only for that exact selection; say so here
+	// rather than as a node's closure mismatch after admission.
+	if cellnplatform.Toolbox(&s.Profile) {
+		want, err := cellnplatform.ToolboxTools(&s.Profile)
+		if err != nil {
+			return nil, deny(ReasonPolicyContracted, "%v", err)
+		}
+		if !slices.Equal(want, s.Run.Spec.CellnSelection.ClusterToolRefs) {
+			return nil, deny(ReasonToolOrder, "runtime profile %q is a toolbox: a run on it selects exactly its %d tools in catalogue order (a run lending no tools uses the backend's own runtime)", s.Profile.Name, len(want))
+		}
+	}
 	tools := make([]DecisionToolBinding, 0, len(s.Tools))
 	for _, tool := range s.Tools {
 		if err := validateClusterTool(tool); err != nil {
@@ -437,20 +450,16 @@ func evaluatePlatform(s platformSnapshot, request PlatformResolveRequest) (*Plat
 	if err != nil {
 		return nil, err
 	}
-	// A host-profile route runs on the node's own broker, which serves every
-	// run-artifact operation for any lifecycle. The scoped artifact contract
-	// (celln.scoped-artifacts/v1) behind a mediated route is narrower.
-	if route.Auth != "host-profile" {
+	// A host-profile route runs on the node's own broker. A mediated route
+	// runs on the scoped receiver, which serves the same starter toolbox
+	// (ScopedArtifactsV2: all six run-data operations, one-shot and enduring;
+	// ScopedHTTPS: the public-only web tools) once the node advertises it.
+	// Either way the broker rides the model transport: a model-free run has
+	// none, so it cannot carry brokered tools.
+	if route.Auth != "host-profile" && route.Provider == "none" {
 		for _, tool := range tools {
-			a := tool.Limits.Artifacts
-			if a == nil {
-				continue
-			}
-			if lifecycle != "enduring" {
-				return nil, deny(ReasonLifecycle, "scoped artifacts require mediated enduring execution")
-			}
-			if a.Operation != "read" && a.Operation != "write" {
-				return nil, deny(ReasonToolUnknown, "scoped artifacts support only read and write, not %q", a.Operation)
+			if tool.Limits.Artifacts != nil || tool.Limits.HTTPS != nil {
+				return nil, deny(ReasonRouteMismatch, "brokered tool %q requires a model route", tool.Name)
 			}
 		}
 	}
