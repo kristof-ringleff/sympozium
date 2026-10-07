@@ -28,8 +28,12 @@ Components:
   nothing under `helm template` and client-side dry runs, so the note stays
   hidden there. semverCompare fails the render on a version it cannot parse,
   hence the regexMatch guard.
+
+  $memoryVersioningSince must be the first release that contains the
+  migration. If another release ships before this change does, bump it:
+  an upgrade from a version at or above it never shows the note.
 */}}
-{{- $memoryVersioningSince := "0.11.0" }}
+{{- $memoryVersioningSince := "0.11.4" }}
 {{- $prevVersion := "" }}
 {{- if .Release.IsUpgrade }}
 {{- with lookup "apps/v1" "Deployment" (include "sympozium.namespace" .) "sympozium-controller-manager" }}
