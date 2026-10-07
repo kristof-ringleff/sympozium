@@ -6,10 +6,12 @@ import (
 	"testing"
 
 	"github.com/go-logr/logr"
+	batchv1 "k8s.io/api/batch/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	sympoziumv1alpha1 "github.com/sympozium-ai/sympozium/api/v1alpha1"
+	"github.com/sympozium-ai/sympozium/internal/controller/taskmodes"
 )
 
 // ── the harness image allowlist, controller side ────────────────────────────
@@ -135,5 +137,56 @@ func TestReconcilePending_HarnessImageRejectionFailsTheRun(t *testing.T) {
 	}
 	if stored.Status.JobName != "" {
 		t.Errorf("a Job was created for a disallowed harness image: %q", stored.Status.JobName)
+	}
+}
+
+// A run that inherits its harness from Agent.spec.runtimeRef keeps a string task
+// in spec; the harness task exists only in memory. Recording the run's
+// ServiceAccount in status must not reload the stored spec, or the pod is built
+// as a native agent-runner while status still names the harness.
+func TestReconcilePending_InheritedRuntimeRefSurvivesServiceAccountStep(t *testing.T) {
+	agent := parityAgent()
+	agent.Spec.PolicyRef = "harness-ok"
+	agent.Spec.RuntimeRef = "my-harness"
+	policy := policyWithRegistries("harness-ok")
+	runtime := runtimeSpec(runtimeTestImage)
+	runtime.Name = "my-harness"
+	runtime.Namespace = "default"
+	runtime.Spec.ContractVersion = taskmodes.HarnessContractVersion
+	runtime.Status.Conditions = []metav1.Condition{{
+		Type: sympoziumv1alpha1.AgentRuntimeReadyCondition, Status: metav1.ConditionTrue, Reason: "Ready",
+	}}
+
+	run := parityRun()
+	r := newAgentRunTestReconciler(t, run, agent, policy, runtime)
+
+	if _, err := r.reconcilePending(context.Background(), logr.Discard(), run); err != nil {
+		t.Fatalf("reconcilePending returned error: %v", err)
+	}
+
+	var stored sympoziumv1alpha1.AgentRun
+	if err := r.Client.Get(context.Background(), client.ObjectKeyFromObject(run), &stored); err != nil {
+		t.Fatalf("get stored run: %v", err)
+	}
+	if stored.Status.Error != "" {
+		t.Fatalf("run failed: %s", stored.Status.Error)
+	}
+	if stored.Status.ServiceAccountName == "" {
+		t.Fatal("the ServiceAccount step did not record status.serviceAccountName")
+	}
+	if !stored.Spec.Task.IsString() {
+		t.Fatal("the normalized harness task was persisted to spec")
+	}
+
+	var job batchv1.Job
+	if err := r.Client.Get(context.Background(), client.ObjectKey{Name: stored.Status.JobName, Namespace: run.Namespace}, &job); err != nil {
+		t.Fatalf("get job %q: %v", stored.Status.JobName, err)
+	}
+	agentContainer := containerByName(job.Spec.Template.Spec.Containers, "agent")
+	if agentContainer == nil {
+		t.Fatal("job has no agent container")
+	}
+	if agentContainer.Image != runtimeTestImage {
+		t.Errorf("agent image = %q, want the inherited harness image %q", agentContainer.Image, runtimeTestImage)
 	}
 }

@@ -2897,10 +2897,16 @@ func (r *AgentRunReconciler) ensureAgentServiceAccount(ctx context.Context, agen
 		if allowed {
 			prefix = trustedRunAccountPrefix
 		}
-		agentRun.Status.ServiceAccountName = runServiceAccountName(prefix, agentRun)
-		if err := r.Status().Update(ctx, agentRun); err != nil {
+		// Update a copy: Status().Update overwrites its argument with the stored
+		// object, which would discard the spec that reconcilePending resolved in
+		// memory (the harness task, the modelRef endpoint).
+		record := agentRun.DeepCopy()
+		record.Status.ServiceAccountName = runServiceAccountName(prefix, agentRun)
+		if err := r.Status().Update(ctx, record); err != nil {
 			return fmt.Errorf("recording run service account: %w", err)
 		}
+		agentRun.Status.ServiceAccountName = record.Status.ServiceAccountName
+		agentRun.ResourceVersion = record.ResourceVersion
 	}
 	name := agentRunServiceAccountName(agentRun)
 	sa := &corev1.ServiceAccount{}
