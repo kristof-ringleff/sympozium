@@ -30,17 +30,28 @@ Components:
   hence the regexMatch guard.
 
   $memoryVersioningSince must be the first release that contains the
-  migration. If another release ships before this change does, bump it:
-  an upgrade from a version at or above it never shows the note.
+  migration: an upgrade from a version at or above it never shows the note.
+  It is written as the next-release placeholder, which the release workflow
+  replaces with that release's version (hack/stamp-release-version.sh). Until
+  then the chart is an unreleased build, and every upgrade shows the note.
 */}}
-{{- $memoryVersioningSince := "0.11.4" }}
+{{- $memoryVersioningSince := "__NEXT_RELEASE_VERSION__" }}
+{{- $semver := "^[0-9]+\\.[0-9]+\\.[0-9]+$" }}
 {{- $prevVersion := "" }}
 {{- if .Release.IsUpgrade }}
 {{- with lookup "apps/v1" "Deployment" (include "sympozium.namespace" .) "sympozium-controller-manager" }}
 {{- $prevVersion = trimPrefix (printf "%s-" $.Chart.Name) (index (.metadata.labels | default dict) "helm.sh/chart" | default "") }}
 {{- end }}
 {{- end }}
-{{- if and (regexMatch "^[0-9]+\\.[0-9]+\\.[0-9]+$" $prevVersion) (semverCompare (printf "<%s" $memoryVersioningSince) $prevVersion) }}
+{{- $showMemoryNote := false }}
+{{- if regexMatch $semver $prevVersion }}
+{{- if not (regexMatch $semver $memoryVersioningSince) }}
+{{- $showMemoryNote = true }}
+{{- else if semverCompare (printf "<%s" $memoryVersioningSince) $prevVersion }}
+{{- $showMemoryNote = true }}
+{{- end }}
+{{- end }}
+{{- if $showMemoryNote }}
 
 ⚠️  Memory upgrade: on first start, each memory server copies its SQLite
     database (/data/memory.db) to /data/memory.v2.db, migrates the copy to
