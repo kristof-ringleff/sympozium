@@ -215,6 +215,18 @@ spec:
                 required:
                 - required
                 type: object
+              skillPolicy:
+                description: SkillPolicy governs what skill sidecars of this policy's
+                  Agents may do.
+                properties:
+                  allowSecretAccess:
+                    description: |-
+                      AllowSecretAccess keeps the secrets, pods/exec and pods/attach
+                      permissions a SkillPack requests, and lets the run create workloads
+                      that reference Secrets. Off by default: with it, an agent driving such
+                      a skill can read every model key in its namespace.
+                    type: boolean
+                type: object
               subagentPolicy:
                 description: SubagentPolicy defines sub-agent depth and concurrency
                   limits.
@@ -234,8 +246,12 @@ spec:
                 properties:
                   defaultAction:
                     default: allow
-                    description: DefaultAction is the default action for unmatched
-                      tools (allow, deny, ask).
+                    description: |-
+                      DefaultAction applies to tools no rule names. With deny, a run may use
+                      only the tools a rule allows.
+                    enum:
+                    - allow
+                    - deny
                     type: string
                   rules:
                     description: Rules is the list of tool-specific rules.
@@ -243,8 +259,10 @@ spec:
                       description: ToolGatingRule defines a rule for a specific tool.
                       properties:
                         action:
-                          description: Action is the action to take (allow, deny,
-                            ask).
+                          description: Action is allow or deny.
+                          enum:
+                          - allow
+                          - deny
                           type: string
                         tool:
                           description: Tool is the tool name this rule applies to.

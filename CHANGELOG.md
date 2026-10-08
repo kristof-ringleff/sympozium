@@ -1,5 +1,72 @@
 # Changelog
 
+## [0.11.4](https://github.com/sympozium-ai/sympozium/compare/v0.11.3...v0.11.4) (2026-10-07)
+
+
+### Bug Fixes
+
+* **apiserver:** write the google provider key as OPENAI_API_KEY ([#660](https://github.com/sympozium-ai/sympozium/issues/660)) ([5eb9c52](https://github.com/sympozium-ai/sympozium/commit/5eb9c525d34174346ec3053faf0f246bbf4e4ffc))
+* **controller:** keep the resolved spec when recording the run ServiceAccount ([#652](https://github.com/sympozium-ai/sympozium/issues/652)) ([71c6f11](https://github.com/sympozium-ai/sympozium/commit/71c6f111248e7286334a4100f21501943973742c))
+
+## [0.11.3](https://github.com/sympozium-ai/sympozium/compare/v0.11.2...v0.11.3) (2026-10-06)
+
+
+### Bug Fixes
+
+* **gateway:** a run that never registered can still be closed ([#658](https://github.com/sympozium-ai/sympozium/issues/658)) ([16908d4](https://github.com/sympozium-ai/sympozium/commit/16908d4b09975d992da4aa07e672f89cef67b604))
+
+## [0.11.2](https://github.com/sympozium-ai/sympozium/compare/v0.11.1...v0.11.2) (2026-10-06)
+
+
+### Bug Fixes
+
+* **controller:** mediated Celln runs claim their Agent's key ([#657](https://github.com/sympozium-ai/sympozium/issues/657)) ([034057e](https://github.com/sympozium-ai/sympozium/commit/034057e1f7a816a58fdb4b8f07d7cfa1bfd12aaf))
+* **install:** never uninstall a release that was ever deployed ([#655](https://github.com/sympozium-ai/sympozium/issues/655)) ([633eb0b](https://github.com/sympozium-ai/sympozium/commit/633eb0b40ab44f572d1e32c2b061c87f0168cb5a))
+
+## [0.11.1](https://github.com/sympozium-ai/sympozium/compare/v0.11.0...v0.11.1) (2026-10-06)
+
+
+### Features
+
+* mediated Agents get the full toolbox; P3 failure suite and the fixes it found ([#653](https://github.com/sympozium-ai/sympozium/issues/653)) ([6b7138e](https://github.com/sympozium-ai/sympozium/commit/6b7138ed83b79a3ada489996622aa5893c4d80ef))
+
+## [0.11.0](https://github.com/sympozium-ai/sympozium/compare/v0.10.88...v0.11.0) (2026-10-05)
+
+
+### ⚠ BREAKING CHANGES
+
+* two Agents can no longer share a key Secret, and a run can no longer name a Secret its Agent does not grant in spec.authRefs.
+* **policy:** SympoziumPolicy toolGating is now enforced, so agents on a policy lose the tools it denies; the built-in restrictive policy denies execute_command. Policies using `ask` fail validation; use allow or deny.
+
+### Features
+
+* **celln:** scoped artifact authority and installed development proof ([#636](https://github.com/sympozium-ai/sympozium/issues/636)) ([939f383](https://github.com/sympozium-ai/sympozium/commit/939f383745227768e6dfae0b635a1a7ab8a359be))
+* **chart:** bundle PostgreSQL for mediated model access ([#647](https://github.com/sympozium-ai/sympozium/issues/647)) ([70f360d](https://github.com/sympozium-ai/sympozium/commit/70f360d23e4bb27d4d6692f910e5d04393476b3c))
+* one key per Agent, mediated by default, on any number of nodes ([#650](https://github.com/sympozium-ai/sympozium/issues/650)) ([f7b474d](https://github.com/sympozium-ai/sympozium/commit/f7b474db4c81fb318f32c958791c1cc34d7dfc91))
+
+
+### Bug Fixes
+
+* **policy:** enforce SympoziumPolicy tool gating; docs: compare with Google AX and Agent Substrate ([#631](https://github.com/sympozium-ai/sympozium/issues/631)) ([c4a4c95](https://github.com/sympozium-ai/sympozium/commit/c4a4c9535a5898a31ec363a5b3003ddcba318896))
+
+## [0.10.88](https://github.com/sympozium-ai/sympozium/compare/v0.10.87...v0.10.88) (2026-10-04)
+
+
+### Features
+
+* **cli:** add `sympozium update` and `sympozium upgrade` ([664bcfe](https://github.com/sympozium-ai/sympozium/commit/664bcfe6ceda128e194bceb2af2f67f242ee5e4f))
+* **cli:** add `sympozium update` and `sympozium upgrade` ([9ecfd9a](https://github.com/sympozium-ai/sympozium/commit/9ecfd9a3302315367afa5fb9b79000090a9a9ec3))
+
+
+### Bug Fixes
+
+* **apiserver:** write OpenAI-compatible provider keys as OPENAI_API_KEY ([#638](https://github.com/sympozium-ai/sympozium/issues/638)) ([f0f514c](https://github.com/sympozium-ai/sympozium/commit/f0f514cdb30c967e6cd363b0d2dc3a50defbd7b5)), closes [#627](https://github.com/sympozium-ai/sympozium/issues/627)
+* **celln:** propagate dispatcher pod tolerations ([#632](https://github.com/sympozium-ai/sympozium/issues/632)) ([1dff955](https://github.com/sympozium-ai/sympozium/commit/1dff955421e2c20ba6d39e022803c7a51723d399))
+* **channel:** reject empty Discord chatId and log every delivery ([#644](https://github.com/sympozium-ai/sympozium/issues/644)) ([b8bd12d](https://github.com/sympozium-ai/sympozium/commit/b8bd12db65e9ca9c6a62601a3ee9973b99e9fb44)), closes [#330](https://github.com/sympozium-ai/sympozium/issues/330)
+* **channel:** reply on agent failure and stop cross-instance outbound… ([#581](https://github.com/sympozium-ai/sympozium/issues/581)) ([82117f1](https://github.com/sympozium-ai/sympozium/commit/82117f14126cf3b4b856520455096ae6380292bb))
+* **controller:** measure the postRun timeout from the postRun Job, not the agent run ([#589](https://github.com/sympozium-ai/sympozium/issues/589)) ([574610a](https://github.com/sympozium-ai/sympozium/commit/574610a7b3473aeeb658d9707705f9d68fe3b564))
+* **harness:** mount /ipc/control read-only so adapters can honour preRun skips ([#633](https://github.com/sympozium-ai/sympozium/issues/633)) ([2483f43](https://github.com/sympozium-ai/sympozium/commit/2483f433555785ab57e99c4d49828a56807e1447))
+
 ## [0.10.87](https://github.com/sympozium-ai/sympozium/compare/v0.10.86...v0.10.87) (2026-09-20)
 
 

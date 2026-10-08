@@ -1,11 +1,15 @@
 // A native Celln Agent owns its model backend: a namespaced ModelConnection
-// backed by a Secret in the Agent's namespace, matched exactly against a
-// provider route the operator declared (docs/guides/celln-mediated-model-access.md).
+// backed by a Secret in the Agent's namespace, matched against a provider
+// route the operator declared (exact origin; exact model, or any model when the
+// route declares ["*"]) (docs/guides/celln-mediated-model-access.md).
 // Nothing here ever keeps an API key: it is handed to the API once and dropped.
 import { ApiError, api } from "@/lib/api";
 import type { CellnMediatedRoute, CellnPlatformProfile, EnduringLimits, ModelConnection } from "@/lib/api";
 import { turnOutputTokens, type ModelParameters } from "@/lib/model-parameters";
 import { TURN_MODEL_REQUESTS } from "@/lib/agent-execution";
+import { routeAllowsModel } from "@/lib/celln-routes";
+
+export { routeAllowsModel, routeModelsLabel, validModelName } from "@/lib/celln-routes";
 
 /** Create a Secret from a pasted key, or name one that already holds it. */
 export type KeyChoice = { mode: "create"; apiKey: string } | { mode: "existing"; secretName: string };
@@ -15,6 +19,14 @@ export const GUIDE_URL = "https://github.com/sympozium-ai/sympozium/blob/main/do
 /** Stable identity of a declared route, for select values. */
 export function routeId(route: CellnMediatedRoute): string {
   return [route.policy || "", route.provider, route.protocol, route.auth || "secret", ...route.endpointOrigins].join("|");
+}
+
+const SUGGESTED_MODELS: Record<string, string> = { openai: "gpt-4o", anthropic: "claude-sonnet-4-20250514", deepseek: "deepseek-chat" };
+
+/** The model a route starts with: its only declared model, a well-known default for an any-model route, or nothing to choose. */
+export function initialModelFor(route: CellnMediatedRoute): string {
+  if (route.anyModel) return SUGGESTED_MODELS[route.provider] || "";
+  return route.models.length === 1 ? route.models[0] : "";
 }
 
 /** The standard request path of a protocol; an operator's gateway may differ. */
@@ -68,7 +80,7 @@ export function ownKeyConnectionSpec(selection: OwnKeySelection, secretRef?: str
 export function routeForConnection(connection: ModelConnection, model: string, routes: CellnMediatedRoute[]): CellnMediatedRoute | undefined {
   let origin = "";
   try { origin = new URL(connection.spec.endpoint).origin; } catch { /* matched as no route */ }
-  return routes.find((route) => (route.auth === "none") === !connection.spec.secretRef && route.provider === connection.spec.provider && route.protocol === connection.spec.protocol && route.endpointOrigins.includes(origin) && route.models.includes(model));
+  return routes.find((route) => (route.auth === "none") === !connection.spec.secretRef && route.provider === connection.spec.provider && route.protocol === connection.spec.protocol && route.endpointOrigins.includes(origin) && routeAllowsModel(route, model));
 }
 
 /**
@@ -121,8 +133,21 @@ export class OwnKeyError extends Error {
 }
 
 /**
+ * What an Agent with its own key runs on and lends: the backend's toolbox and
+ * exactly its tools, in order, when the scope publishes one; otherwise the
+ * backend's own runtime and no tools (on the gateway-mediated path that
+ * runtime lends none).
+ */
+export function ownKeySelection(profile: CellnPlatformProfile): { profile: string; wrapper: string; tools: { name: string; revision: string }[] } {
+  if (profile.toolboxProfile && profile.toolboxWrapper && profile.toolboxTools?.length) {
+    return { profile: profile.toolboxProfile, wrapper: profile.toolboxWrapper, tools: profile.toolboxTools.map((tool) => ({ ...tool })) };
+  }
+  return { profile: profile.name, wrapper: profile.wrapper, tools: [] };
+}
+
+/**
  * Saves the Agent's Secret (when pasted) and ModelConnection, then makes sure
- * the namespace has the fleet's runtime wrapper. Every call is idempotent, so
+ * the namespace has the fleet's runtime wrapper (ownKeySelection's). Every call is idempotent, so
  * a retry after a failure repeats nothing harmful. Throws OwnKeyError naming
  * what exists and what does not.
  */
@@ -134,7 +159,7 @@ export async function prepareOwnKeyBackend(input: { connectionName: string; sele
   const steps: OwnKeyStep[] = [
     ...(!keyless ? [{ step: "secret" as const, object: `Secret ${secretName}`, state: creating ? "not-started" as const : "done" as const, note: creating ? undefined : "existing Secret, linked" }] : []),
     { step: "connection", object: `ModelConnection ${connectionName}`, state: "not-started" },
-    { step: "runtime", object: `AgentRuntime ${profile.wrapper}`, state: "not-started" },
+    { step: "runtime", object: `AgentRuntime ${ownKeySelection(profile).wrapper}`, state: "not-started" },
     ...(input.agentName ? [{ step: "agent" as const, object: `Agent ${input.agentName}`, state: "not-started" as const }] : []),
   ];
   const mark = (step: OwnKeyStepName, state: OwnKeyStepState, note?: string) => {
@@ -171,7 +196,7 @@ export async function prepareOwnKeyBackend(input: { connectionName: string; sele
   input.onConnectionSaved?.(connection);
 
   try {
-    const wrappers = await api.cellnPlatform.ensureRuntime(profile.name);
+    const wrappers = await api.cellnPlatform.ensureRuntime(ownKeySelection(profile).profile);
     const entry = steps.find((candidate) => candidate.step === "runtime");
     if (entry) entry.object = `AgentRuntime ${wrappers.runtime}`;
     mark("runtime", "done", wrappers.created.includes(wrappers.runtime) ? "created" : "already there");

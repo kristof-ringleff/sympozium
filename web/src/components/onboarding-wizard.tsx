@@ -49,9 +49,10 @@ import { CellnKeyStep, CellnModelStep, CellnRouteStep, OwnKeyProgress } from "@/
 import { useCapabilities, useModels, useCellnMediation, useCellnPlatformProfiles } from "@/hooks/use-api";
 import { persistentHarnesses, persistentHarnessName } from "@/lib/persistent-harness";
 import { modelConnectionName, modelConnectionEndpoint, describeEnduringLimits } from "@/lib/agent-execution";
-import { OwnKeyError, ownKeyConnectionSpec, defaultEndpointPath, enduringForOutputTokens, keyChoiceReady, managedSecretName, prepareOwnKeyBackend, profileForRoute, type KeyChoice, type OwnKeyStep } from "@/lib/celln-own-key";
+import { OwnKeyError, ownKeyConnectionSpec, defaultEndpointPath, initialModelFor, routeAllowsModel, enduringForOutputTokens, keyChoiceReady, managedSecretName, prepareOwnKeyBackend, profileForRoute, ownKeySelection, type KeyChoice, type OwnKeyStep } from "@/lib/celln-own-key";
 import { parseMaxOutputTokens, parseModelParameters } from "@/lib/model-parameters";
-import { api } from "@/lib/api";
+import { api, getNamespace } from "@/lib/api";
+import { Link } from "react-router-dom";
 import type { WizardExecution } from "@/lib/agent-execution";
 import type { AgentRuntime, SympoziumPolicy, CellnSelection, CellnMediatedRoute, ModelConnection } from "@/lib/api";
 import {
@@ -300,8 +301,8 @@ function stepsForMode(
         "plane",
         // A Celln Agent owns its model backend: the operator's declared
         // provider, this Agent's key and one of the route's models. Its runtime
-        // is the fleet's, and the mediated path is chat only, so there is no
-        // runtime, tool or SkillPack to choose.
+        // and starter toolbox are the fleet's (lent by the policy), so there is
+        // no runtime, tool or SkillPack to choose.
         ...(celln
           ? ["provider", "apikey", "model"]
           : [...(runtimeImplicit ? [] : ["runtime"]), "skills", "provider", "apikey", "model", "heartbeat", "channels"]),
@@ -693,7 +694,7 @@ export function OnboardingWizard({
     // A key or Secret chosen for another provider is not carried over.
     setCellnKey({ mode: "create", apiKey: "" });
     setCellnFailure(null);
-    setForm((current) => ({ ...current, provider: route.provider, model: route.models.length === 1 ? route.models[0] : "" }));
+    setForm((current) => ({ ...current, provider: route.provider, model: initialModelFor(route) }));
   }
   const compatibleRuntime = celln ? !!cellnProfile : !form.runtimeRef || !!selectedRuntime?.spec.image;
   // Provider choices come from the shared creation model so the Run dialog and
@@ -814,7 +815,7 @@ export function OnboardingWizard({
           return !!form.secretName || !!form.awsRegion;
         return !!form.secretName || !!form.apiKey;
       case "model":
-        if (celln) return !!cellnRoute && cellnRoute.models.includes(form.model) && cellnRoute.endpointOrigins.includes(cellnOrigin) && cellnPath.startsWith("/") && !cellnParsedParameters.error && !cellnParsedTokens.error;
+        if (celln) return !!cellnRoute && routeAllowsModel(cellnRoute, form.model) && cellnRoute.endpointOrigins.includes(cellnOrigin) && cellnPath.startsWith("/") && !cellnParsedParameters.error && !cellnParsedTokens.error;
         return !!form.model;
       case "skills":
         return !form.runtimeRef || !form.skills.some((skill) => harnessIncompatibleSkills.includes(skill));
@@ -913,7 +914,13 @@ export function OnboardingWizard({
         runtimeRef: prepared.runtime,
         executionLifecycle: "enduring",
         borrowedTools: [],
-        clusterTools: undefined,
+        // The starter toolbox, exactly as the backend's toolbox runtime
+        // lends it (every tool, in order); nothing when the scope's package
+        // has no toolbox, since the mediated path then serves no tools.
+        clusterTools: (() => {
+          const { tools } = ownKeySelection(cellnProfile);
+          return tools.length ? tools : undefined;
+        })(),
         enduringDefaults: cellnEnduring,
       });
     } catch (err) {
@@ -1211,7 +1218,7 @@ export function OnboardingWizard({
                 <div className="space-y-2 rounded-md border p-3">
                   <Label>Enduring Celln parent</Label>
                   <p className="text-xs text-muted-foreground">
-                    This Agent owns its model backend: next you choose a provider the operator declared for this namespace, give the Agent its own key, and pick one of the declared models. Nothing is shared with another Agent. The conversation is chat only: SkillPacks, borrowed tools, channels and heartbeats are not part of a Celln Agent. {capabilities?.celln?.available ? capabilities.celln.reason : `Celln readiness: ${capabilities?.celln?.state || "unknown"} — ${capabilities?.celln?.reason || "not confirmed"}.`}
+                    This Agent owns its model backend: next you choose a provider the operator declared for this namespace, give the Agent its own key, and pick one of the declared models. Nothing is shared with another Agent. It gets the fleet's starter toolbox (run workspace files and public HTTPS web tools); SkillPacks, borrowed tools, channels and heartbeats are not part of a Celln Agent. {capabilities?.celln?.available ? capabilities.celln.reason : `Celln readiness: ${capabilities?.celln?.state || "unknown"} — ${capabilities?.celln?.reason || "not confirmed"}.`}
                   </p>
                 </div>
               )}
@@ -1232,6 +1239,15 @@ export function OnboardingWizard({
         )}
         {step === "provider" && celln && cellnRoute && !cellnProfile && !platformProfiles.isLoading && (
           <p role="alert" className="text-xs text-red-400">No fleet runtime profile of policy <code>{cellnRoute.policy}</code> is offered to this namespace, so an Agent on this provider could not run. Ask the operator to check the policy with <code>sympozium doctor</code>.</p>
+        )}
+        {step === "provider" && celln && cellnProfile?.mediationOnly && (
+          <p className="text-xs text-muted-foreground" data-testid="celln-starter-agent-note">
+            Fleet backend <code>{cellnProfile.backend}</code> holds no key on any node: under mediated model access its provider key is the own key of its starter Agent
+            {cellnProfile.starterAgent ? (
+              <> {cellnProfile.starterNamespace === getNamespace() ? <Link to={`/agents/${cellnProfile.starterAgent}`} className="underline" data-testid="celln-starter-agent-link">{cellnProfile.starterAgent}</Link> : <code>{cellnProfile.starterAgent}</code>} in namespace <code>{cellnProfile.starterNamespace}</code></>
+            ) : null}
+            , and no other Agent may use it. Use that Agent, or give this one its own key below.
+          </p>
         )}
         {step === "provider" && !celln && (
           <div className="space-y-4">
@@ -2075,14 +2091,14 @@ export function OnboardingWizard({
                     ? <>a new Secret <code>{cellnSecretName}</code> holding <code>{cellnRoute.secretKey}</code></>
                     : <>existing Secret <code>{cellnKey.secretName}</code> (<code>{cellnRoute.secretKey}</code>)</>}</p>
                   <p>Model connection: <code>{modelConnectionName(form.name)}</code>{cellnParsedTokens.maxOutputTokens ? `, up to ${cellnParsedTokens.maxOutputTokens} output tokens per request` : ""}{cellnParsedParameters.parameters ? ", with model parameters" : ""}</p>
-                  <p>Runtime: <code>{cellnProfile?.wrapper}</code> (the fleet's; created in this namespace if missing)</p>
-                  {cellnEnduring && <p className="text-muted-foreground">One conversation: {describeEnduringLimits(cellnEnduring)}. Chat only; context is lost with the parent.</p>}
+                  <p>Runtime: <code>{cellnProfile && ownKeySelection(cellnProfile).wrapper}</code> (the fleet's; created in this namespace if missing)</p>
+                  {cellnEnduring && <p className="text-muted-foreground">One conversation: {describeEnduringLimits(cellnEnduring)}. Starter tools: {(cellnProfile ? ownKeySelection(cellnProfile).tools : []).map((tool) => tool.name).join(", ") || "none"}. Context and workspace files are lost with the parent.</p>}
                 </div>}
               </div>}
               {mode === "agent" && (
                 <div className="flex justify-between gap-4">
                   <span className="text-muted-foreground">Execution</span>
-                  <span className="font-mono text-right">{celln ? cellnProfile?.wrapper || "Celln fleet runtime" : form.runtimeRef || "Built-in Agent runner"}</span>
+                  <span className="font-mono text-right">{celln ? (cellnProfile && ownKeySelection(cellnProfile).wrapper) || "Celln fleet runtime" : form.runtimeRef || "Built-in Agent runner"}</span>
                 </div>
               )}
               {mode === "persona" && targetName && (
@@ -2226,7 +2242,7 @@ export function OnboardingWizard({
                   ? celln && cellnRoute
                     // Names only: the Secret is referenced, the key never appears.
                     ? instanceYamlFromWizard(
-                        { ...form, runtimeRef: cellnProfile?.wrapper, secretName: cellnSecretName, enduringDefaults: cellnEnduring },
+                        { ...form, runtimeRef: cellnProfile && ownKeySelection(cellnProfile).wrapper, secretName: cellnSecretName, enduringDefaults: cellnEnduring },
                         ownKeyConnectionSpec({ route: cellnRoute, origin: cellnOrigin, path: cellnPath, model: form.model, parameters: cellnParsedParameters.parameters, maxOutputTokens: cellnParsedTokens.maxOutputTokens }, cellnSecretName),
                       )
                     : instanceYamlFromWizard(form)

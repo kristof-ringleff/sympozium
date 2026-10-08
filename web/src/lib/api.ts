@@ -206,6 +206,8 @@ export interface CellnMediatedRoute {
   provider: string;
   protocol: "openai-chat" | "anthropic-messages";
   models: string[];
+  /** The route declares models ["*"]: any model name of this provider at these exact origins. */
+  anyModel?: boolean;
   endpointOrigins: string[];
   /** The execution policy carrying the route; absent on a pending one. */
   policy?: string;
@@ -250,6 +252,24 @@ export interface CellnPlatformProfile {
   /** The policy's per-parent maxima and the budget a new conversation should ask for. */
   ceilings: EnduringLimits;
   sessionDefaults: EnduringLimits;
+  /** The backend's key never reached the fleet: only Agents with their own key run on it (no shared agent). */
+  mediationOnly?: boolean;
+  /**
+   * For a mediation-only backend, the starter Agent whose own key is the
+   * backend's provider key (an installer backend, or one added through the
+   * API under mediation). Names only; that key is never lent to another Agent.
+   */
+  starterAgent?: string;
+  starterNamespace?: string;
+  /**
+   * What an Agent with its own key selects to lend the starter toolbox: the
+   * backend's toolbox profile and wrapper, and exactly these tools in this
+   * order (Celln runs the toolbox for no other selection). Absent when the
+   * scope's package exports no toolbox: such an Agent then lends no tools.
+   */
+  toolboxProfile?: string;
+  toolboxWrapper?: string;
+  toolboxTools?: { name: string; revision: string }[];
 }
 
 export interface EnduringLimits {

@@ -42,7 +42,7 @@ func (d restrictedDialer) DialContext(ctx context.Context, network, address stri
 		return nil, fail(ReasonProviderUnavailable, 502, err)
 	}
 	for _, ip := range ips {
-		if (d.privateOnly && !(ip.IsLoopback() || ip.IsPrivate())) || (forbiddenIP(ip) && !d.allowPrivate) {
+		if (d.privateOnly && !(ip.IsLoopback() || ip.IsPrivate() || sharedAddressSpace(ip))) || (forbiddenIP(ip) && !d.allowPrivate) {
 			return nil, fail(ReasonDestination, 403, nil)
 		}
 	}
@@ -79,6 +79,14 @@ func clientForEndpoint(endpoint string, allowPrivate bool, maxDuration time.Dura
 		Timeout:       maxDuration,
 		CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return fmt.Errorf("provider redirects are disabled") },
 	}, nil
+}
+
+// privateReachable decides whether a provider call may go to a private
+// address (and trust the operator's provider CA). An operator-listed origin is
+// reachable over HTTPS; plain HTTP to it also needs the connection's own
+// allowInsecure. Unlisted private addresses never are.
+func privateReachable(endpoint string, allowInsecure bool, allowed map[string]bool) bool {
+	return privateOriginAllowed(endpoint, allowed) && (allowInsecure || strings.HasPrefix(strings.ToLower(endpoint), "https://"))
 }
 
 func privateOriginAllowed(endpoint string, allowed map[string]bool) bool {

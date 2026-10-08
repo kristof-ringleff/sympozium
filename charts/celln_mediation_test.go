@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"slices"
 	"strings"
@@ -53,12 +54,13 @@ type mediationRender struct {
 	roles           map[string]rbacv1.Role
 	roleBindings    map[string]rbacv1.RoleBinding
 	clusterBindings map[string]bool
+	statefulSets    map[string]appsv1.StatefulSet
 }
 
 func decodeMediation(t *testing.T, raw []byte) mediationRender {
 	t.Helper()
 	out := mediationRender{fleetRender: decodeFleet(t, raw), configMaps: map[string]corev1.ConfigMap{}, secrets: map[string]bool{}, policies: map[string]networkingv1.NetworkPolicy{},
-		clusterRoles: map[string]rbacv1.ClusterRole{}, roles: map[string]rbacv1.Role{}, roleBindings: map[string]rbacv1.RoleBinding{}, clusterBindings: map[string]bool{}}
+		clusterRoles: map[string]rbacv1.ClusterRole{}, roles: map[string]rbacv1.Role{}, roleBindings: map[string]rbacv1.RoleBinding{}, clusterBindings: map[string]bool{}, statefulSets: map[string]appsv1.StatefulSet{}}
 	for _, document := range bytes.Split(raw, []byte("\n---")) {
 		var meta struct {
 			Kind     string `json:"kind"`
@@ -85,6 +87,10 @@ func decodeMediation(t *testing.T, raw []byte) mediationRender {
 			strict(&appsv1.Deployment{})
 		case "DaemonSet":
 			strict(&appsv1.DaemonSet{})
+		case "StatefulSet":
+			var o appsv1.StatefulSet
+			strict(&o)
+			out.statefulSets[key] = o
 		case "Secret":
 			out.secrets[key] = true
 		case "NetworkPolicy":
@@ -159,10 +165,21 @@ func TestMediationRecordsTheDeclaredRoutes(t *testing.T) {
 		}
 		return record
 	}
-	// Enabled with nothing declared: the record exists (mediation is on) and
-	// offers nothing. No provider is on by default.
-	if got := read(t, mediationValues()); got.MediateBackends || len(got.Routes) != 0 {
-		t.Fatalf("a provider is on by default: %+v", got)
+	// Enabled with nothing declared: the record carries the built-in routes
+	// (any model of the well-known hosted providers, the Agent's own key),
+	// exactly the ones cellninstall.DefaultMediatedRoutes names.
+	if got := read(t, mediationValues()); got.MediateBackends || !reflect.DeepEqual(got.Routes, cellninstall.DefaultMediatedRoutes()) {
+		t.Fatalf("defaults = %+v, want %+v", got.Routes, cellninstall.DefaultMediatedRoutes())
+	}
+	// Switched off, the record exists (mediation is on) and offers nothing.
+	if got := read(t, append(mediationValues(), "celln.mediation.defaultRoutes=false")); got.MediateBackends || len(got.Routes) != 0 {
+		t.Fatalf("defaultRoutes=false still offers %+v", got)
+	}
+	// A declared route replaces the defaults entirely, and the any-model
+	// token is recorded as declared.
+	anyModel := append(mediationValues(), route(0, "anthropic", "anthropic-messages", "*", "https://api.anthropic.com")...)
+	if got := read(t, anyModel); len(got.Routes) != 1 || !slices.Equal(got.Routes[0].Models, []string{"*"}) || got.Routes[0].Provider != "anthropic" {
+		t.Fatalf("any-model route recorded as %+v", got.Routes)
 	}
 	declared := []cellninstall.MediatedRoute{
 		{Provider: "anthropic", Protocol: "anthropic-messages", Models: []string{"claude-sonnet-5", "claude.opus:5"}, EndpointOrigins: []string{"https://api.anthropic.com"}},
@@ -333,7 +350,22 @@ func TestMediationWiresControllerDispatchersAndGatewayConsistently(t *testing.T)
 	if v := volume(t, owner, "scoped-trust"); v.ConfigMap == nil || v.ConfigMap.Name != "celln-mediation-trust" {
 		t.Fatalf("node trust: %+v", v)
 	}
-	edge := container(t, owner.Containers, "scoped-receiver")
+	for _, c := range owner.Containers {
+		if c.Name == "scoped-receiver" {
+			t.Fatal("the scoped TLS edge belongs on the router, which forwards to the owning node")
+		}
+	}
+	// Router: forwards /v1/scoped/* to the node that prepared each operation,
+	// with the same operator token the dispatchers verify, behind its TLS edge.
+	router := r.deployments["celln-router"].Spec.Template.Spec
+	routerArgs := strings.Join(container(t, router.Containers, "router").Args, " ")
+	if !strings.Contains(routerArgs, "--scoped-token-file /etc/celln/scoped/operator-token") {
+		t.Fatalf("router does not forward scoped requests: %s", routerArgs)
+	}
+	if v := volume(t, router, "scoped-operator"); v.Secret == nil || v.Secret.SecretName != "celln-mediation-node" || len(v.Secret.Items) != 1 || v.Secret.Items[0].Key != "operator-token" {
+		t.Fatalf("router operator token volume: %+v", v.Secret)
+	}
+	edge := container(t, router.Containers, "scoped-receiver")
 	restricted(t, edge)
 	if edge.SecurityContext.SeccompProfile == nil || edge.SecurityContext.SeccompProfile.Type != corev1.SeccompProfileTypeRuntimeDefault {
 		t.Fatal("receiver edge lacks the RuntimeDefault seccomp profile")
@@ -342,7 +374,7 @@ func TestMediationWiresControllerDispatchersAndGatewayConsistently(t *testing.T)
 		t.Fatalf("receiver edge image/command: %s %v", edge.Image, edge.Command)
 	}
 	edgeArgs := strings.Join(edge.Args, " ")
-	for _, arg := range []string{"--scoped-receiver", "--listen 0.0.0.0:9443", "--backend http://127.0.0.1:8787", "--tls-cert /etc/celln/receiver-tls/tls.crt", "--tls-key /etc/celln/receiver-tls/tls.key"} {
+	for _, arg := range []string{"--scoped-receiver", "--listen 0.0.0.0:9443", "--backend http://127.0.0.1:8788", "--tls-cert /etc/celln/receiver-tls/tls.crt", "--tls-key /etc/celln/receiver-tls/tls.key"} {
 		if !strings.Contains(edgeArgs, arg) {
 			t.Fatalf("receiver edge lacks %q: %s", arg, edgeArgs)
 		}
@@ -351,7 +383,7 @@ func TestMediationWiresControllerDispatchersAndGatewayConsistently(t *testing.T)
 		t.Fatalf("receiver edge mounts more than its certificate: %+v", edge.VolumeMounts)
 	}
 	service := r.services["celln-scoped-receiver"]
-	if service.Namespace != "celln-system" || service.Spec.Selector["app.kubernetes.io/name"] != "celln-node" || service.Spec.Ports[0].Port != 9443 || service.Spec.Ports[0].TargetPort.StrVal != "scoped-https" || edge.Ports[0].Name != "scoped-https" {
+	if service.Namespace != "celln-system" || service.Spec.Selector["app.kubernetes.io/name"] != "celln-router" || service.Spec.Ports[0].Port != 9443 || service.Spec.Ports[0].TargetPort.StrVal != "scoped-https" || edge.Ports[0].Name != "scoped-https" {
 		t.Fatalf("receiver Service: %+v", service.Spec)
 	}
 
@@ -421,8 +453,12 @@ func TestMediationWiresControllerDispatchersAndGatewayConsistently(t *testing.T)
 		t.Fatal("gateway does not admit the fleet dispatchers and the controller")
 	}
 	nodePolicy := r.policies["celln-system/celln-node-ingress"]
-	if !admits(nodePolicy, "sympozium-system", "control-plane", "controller-manager", 9443) || admits(nodePolicy, "sympozium-system", "control-plane", "controller-manager", 8787) {
-		t.Fatal("the controller must reach the receiver's TLS edge and not the plaintext dispatcher")
+	if admits(nodePolicy, "sympozium-system", "control-plane", "controller-manager", 9443) || admits(nodePolicy, "sympozium-system", "control-plane", "controller-manager", 8787) {
+		t.Fatal("the controller reaches the nodes only through the router")
+	}
+	routerPolicy := r.policies["celln-system/celln-router-ingress"]
+	if !admits(routerPolicy, "sympozium-system", "control-plane", "controller-manager", 9443) {
+		t.Fatal("the controller must reach the router's scoped TLS edge")
 	}
 	if !admits(nodePolicy, "celln-system", "app.kubernetes.io/name", "celln-router", 8787) || admits(nodePolicy, "celln-system", "app.kubernetes.io/name", "celln-router", 9443) {
 		t.Fatal("router ingress changed")
@@ -481,11 +517,10 @@ func TestMediationRefusesIncompleteOrInconsistentInput(t *testing.T) {
 		"no gateway secret":   {append(slices.Clone(full), "celln.mediation.gatewaySecret="), "celln.mediation.gatewaySecret must name"},
 		"no node secret":      {append(slices.Clone(full), "celln.mediation.nodeSecret="), "celln.mediation.nodeSecret must name"},
 		"no trust":            {append(slices.Clone(full), "celln.mediation.trustConfigMap="), "celln.mediation.trustConfigMap must name"},
-		"no database":         {without(full, "modelGateway.database.secretName"), "celln.mediation requires modelGateway.database.secretName"},
+		"tagged bundled db":   {append(without(full, "modelGateway.database.secretName"), "modelGateway.database.bundled.image=postgres:17"), "modelGateway.database.bundled.image must be pinned by sha256 digest"},
 		"no database key":     {append(slices.Clone(full), "modelGateway.database.key="), "modelGateway.database.key must name"},
 		"no gateway image":    {without(full, "modelGateway.image"), "modelGateway.image requires an immutable image digest"},
 		"tagged image":        {append(without(full, "modelGateway.image"), "modelGateway.image=registry.example/model-gateway:latest"), "modelGateway.image must be pinned by sha256 digest"},
-		"no egress":           {without(full, "modelGateway.egress"), "modelGateway.egress must explicitly declare"},
 		"claim as well":       {append(slices.Clone(full), "modelGateway.configurationClaim=reviewed"), "unset modelGateway.configurationClaim"},
 		"plaintext receiver":  {append(slices.Clone(full), "celln.mediation.receiver.url=http://node-a:8787"), "celln.mediation.receiver.url must be an origin-only HTTPS URL"},
 		"receiver with path":  {append(slices.Clone(full), "celln.mediation.receiver.url=https://node-a:9443/v1/scoped"), "celln.mediation.receiver.url must be an origin-only HTTPS URL"},
@@ -495,24 +530,28 @@ func TestMediationRefusesIncompleteOrInconsistentInput(t *testing.T) {
 		"duplicate namespace": {append(slices.Clone(full), "modelGateway.namespaces[0]=team-a", "modelGateway.namespaces[1]=team-a"), "modelGateway.namespaces must be unique namespace names"},
 		// Declared routes are inert without mediation, and saying so beats
 		// silently admitting nothing.
-		"routes while disabled":         {append(without(append(slices.Clone(full), route(0, "anthropic", "anthropic-messages", "claude-a", "https://api.anthropic.com")...), "celln.mediation.enabled"), "celln.mediation.enabled=false"), "require celln.mediation.enabled"},
-		"backends while disabled":       {append(fleetValues(), "celln.mediation.mediateBackends=true"), "require celln.mediation.enabled"},
-		"routes without any fleet":      {route(0, "anthropic", "anthropic-messages", "claude-a", "https://api.anthropic.com"), "require celln.mediation.enabled"},
-		"route: no provider":            {append(slices.Clone(full), route(0, "", "openai-chat", "gpt", "https://api.openai.com")...), "routes[0].provider must be"},
-		"route: unknown protocol":       {append(slices.Clone(full), route(0, "google", "gemini", "g", "https://g.example")...), "routes[0].protocol must be openai-chat or anthropic-messages"},
-		"route: no model":               {append(slices.Clone(full), "celln.mediation.routes[0].provider=openai", "celln.mediation.routes[0].protocol=openai-chat", "celln.mediation.routes[0].endpointOrigins[0]=https://api.openai.com"), "routes[0].models must list 1-32 exact model names"},
-		"route: empty model":            {append(slices.Clone(full), route(0, "openai", "openai-chat", "", "https://api.openai.com")...), "must be an exact model name"},
-		"route: wildcard model":         {append(slices.Clone(full), route(0, "openai", "openai-chat", "gpt-*", "https://api.openai.com")...), "there is no wildcard"},
-		"route: repeated model":         {append(append(slices.Clone(full), route(0, "openai", "openai-chat", "gpt", "https://api.openai.com")...), "celln.mediation.routes[0].models[1]=gpt"), "must not repeat a model"},
-		"route: no origin":              {append(slices.Clone(full), "celln.mediation.routes[0].provider=openai", "celln.mediation.routes[0].protocol=openai-chat", "celln.mediation.routes[0].models[0]=gpt"), "routes[0].endpointOrigins must list 1-16 HTTPS origins"},
-		"route: plain HTTP origin":      {append(slices.Clone(full), route(0, "openai", "openai-chat", "gpt", "http://api.openai.com")...), "a Secret never crosses plain HTTP"},
-		"route: origin with a port":     {append(slices.Clone(full), route(0, "openai", "openai-chat", "gpt", "https://api.openai.com:8443")...), "without port, path or credentials"},
-		"route: origin with a path":     {append(slices.Clone(full), route(0, "openai", "openai-chat", "gpt", "https://api.openai.com/v1")...), "without port, path or credentials"},
-		"route: origin with a user":     {append(slices.Clone(full), route(0, "openai", "openai-chat", "gpt", "https://key@api.openai.com")...), "without port, path or credentials"},
-		"route: wildcard origin":        {append(slices.Clone(full), route(0, "openai", "openai-chat", "gpt", "*")...), "without port, path or credentials"},
-		"route: second one is checked":  {append(append(slices.Clone(full), route(0, "openai", "openai-chat", "gpt", "https://api.openai.com")...), route(1, "anthropic", "anthropic-messages", "*", "https://api.anthropic.com")...), "routes[1].models"},
-		"route: misspelled field":       {append(append(slices.Clone(full), route(0, "openai", "openai-chat", "gpt", "https://api.openai.com")...), "celln.mediation.routes[0].origins[0]=https://api.openai.com"), "routes[0].origins is not a route field"},
-		"mediateBackends: not a switch": {append(slices.Clone(full), "celln.mediation.mediateBackends=some"), "celln.mediation.mediateBackends must be true or false"},
+		"routes while disabled":          {append(without(append(slices.Clone(full), route(0, "anthropic", "anthropic-messages", "claude-a", "https://api.anthropic.com")...), "celln.mediation.enabled"), "celln.mediation.enabled=false"), "require celln.mediation.enabled"},
+		"backends while disabled":        {append(fleetValues(), "celln.mediation.mediateBackends=true"), "require celln.mediation.enabled"},
+		"routes without any fleet":       {route(0, "anthropic", "anthropic-messages", "claude-a", "https://api.anthropic.com"), "require celln.mediation.enabled"},
+		"route: no provider":             {append(slices.Clone(full), route(0, "", "openai-chat", "gpt", "https://api.openai.com")...), "routes[0].provider must be"},
+		"route: unknown protocol":        {append(slices.Clone(full), route(0, "google", "gemini", "g", "https://g.example")...), "routes[0].protocol must be openai-chat or anthropic-messages"},
+		"route: no model":                {append(slices.Clone(full), "celln.mediation.routes[0].provider=openai", "celln.mediation.routes[0].protocol=openai-chat", "celln.mediation.routes[0].endpointOrigins[0]=https://api.openai.com"), "routes[0].models must list 1-32 exact model names"},
+		"route: empty model":             {append(slices.Clone(full), route(0, "openai", "openai-chat", "", "https://api.openai.com")...), "must be an exact model name"},
+		"route: wildcard model":          {append(slices.Clone(full), route(0, "openai", "openai-chat", "gpt-*", "https://api.openai.com")...), "the only pattern is a lone"},
+		"route: any model beside a name": {append(append(slices.Clone(full), route(0, "openai", "openai-chat", "*", "https://api.openai.com")...), "celln.mediation.routes[0].models[1]=gpt-5"), "the only pattern is a lone"},
+		"route: name beside any model":   {append(append(slices.Clone(full), route(0, "openai", "openai-chat", "gpt-5", "https://api.openai.com")...), "celln.mediation.routes[0].models[1]=*"), "the only pattern is a lone"},
+		"route: any model, any origin":   {append(slices.Clone(full), route(0, "openai", "openai-chat", "*", "*")...), "without port, path or credentials"},
+		"defaultRoutes: not a switch":    {append(slices.Clone(full), "celln.mediation.defaultRoutes=some"), "celln.mediation.defaultRoutes must be true or false"},
+		"route: repeated model":          {append(append(slices.Clone(full), route(0, "openai", "openai-chat", "gpt", "https://api.openai.com")...), "celln.mediation.routes[0].models[1]=gpt"), "must not repeat a model"},
+		"route: no origin":               {append(slices.Clone(full), "celln.mediation.routes[0].provider=openai", "celln.mediation.routes[0].protocol=openai-chat", "celln.mediation.routes[0].models[0]=gpt"), "routes[0].endpointOrigins must list 1-16 HTTPS origins"},
+		"route: plain HTTP origin":       {append(slices.Clone(full), route(0, "openai", "openai-chat", "gpt", "http://api.openai.com")...), "a Secret never crosses plain HTTP"},
+		"route: origin with a port":      {append(slices.Clone(full), route(0, "openai", "openai-chat", "gpt", "https://api.openai.com:8443")...), "without port, path or credentials"},
+		"route: origin with a path":      {append(slices.Clone(full), route(0, "openai", "openai-chat", "gpt", "https://api.openai.com/v1")...), "without port, path or credentials"},
+		"route: origin with a user":      {append(slices.Clone(full), route(0, "openai", "openai-chat", "gpt", "https://key@api.openai.com")...), "without port, path or credentials"},
+		"route: wildcard origin":         {append(slices.Clone(full), route(0, "openai", "openai-chat", "gpt", "*")...), "without port, path or credentials"},
+		"route: second one is checked":   {append(append(slices.Clone(full), route(0, "openai", "openai-chat", "gpt", "https://api.openai.com")...), route(1, "anthropic", "anthropic-messages", "claude-*", "https://api.anthropic.com")...), "routes[1].models"},
+		"route: misspelled field":        {append(append(slices.Clone(full), route(0, "openai", "openai-chat", "gpt", "https://api.openai.com")...), "celln.mediation.routes[0].origins[0]=https://api.openai.com"), "routes[0].origins is not a route field"},
+		"mediateBackends: not a switch":  {append(slices.Clone(full), "celln.mediation.mediateBackends=some"), "celln.mediation.mediateBackends must be true or false"},
 	} {
 		raw, err := renderNativeParent(t, tc.values)
 		if err == nil {
@@ -623,5 +662,102 @@ func TestMediationPassesTheParentRequestOnlyWhenTheNodeHasOne(t *testing.T) {
 		if out := run(); !strings.Contains(out, "--scoped-parent-request-file\n"+file+"\n") {
 			t.Fatalf("%s: flag not passed for a present file:\n%s", name, out)
 		}
+	}
+}
+
+// Without an operator database the chart runs its own PostgreSQL, reachable
+// only from the gateway, and the gateway migrates it before starting.
+func TestMediationBundlesADatabaseWhenNoneIsNamed(t *testing.T) {
+	const db = "test-sympozium-model-gateway-db"
+	r := decodeMediation(t, mustRender(t, without(mediationValues(), "modelGateway.database.secretName")))
+
+	set, ok := r.statefulSets["sympozium-system/"+db]
+	if !ok {
+		t.Fatal("no bundled PostgreSQL StatefulSet")
+	}
+	pod := set.Spec.Template.Spec
+	if pod.SecurityContext == nil || pod.SecurityContext.RunAsNonRoot == nil || !*pod.SecurityContext.RunAsNonRoot || pod.SecurityContext.SeccompProfile == nil {
+		t.Fatal("the database pod must run non-root with a seccomp profile")
+	}
+	postgres := container(t, pod.Containers, "postgres")
+	// The alpine image's postgres user owns the data directory, so uid 70
+	// rather than the control plane's 65532; otherwise as restricted.
+	if sc := postgres.SecurityContext; sc == nil || sc.RunAsNonRoot == nil || !*sc.RunAsNonRoot || sc.RunAsUser == nil || *sc.RunAsUser != 70 || sc.AllowPrivilegeEscalation == nil || *sc.AllowPrivilegeEscalation ||
+		sc.ReadOnlyRootFilesystem == nil || !*sc.ReadOnlyRootFilesystem || sc.Capabilities == nil || len(sc.Capabilities.Drop) != 1 || sc.Capabilities.Drop[0] != "ALL" {
+		t.Fatalf("postgres is not non-root, read-only, drop ALL: %+v", sc)
+	}
+	if !strings.Contains(postgres.Image, "@sha256:") {
+		t.Fatalf("database image not digest-pinned: %s", postgres.Image)
+	}
+	if len(set.Spec.VolumeClaimTemplates) != 1 {
+		t.Fatal("the database must keep its data on a PVC")
+	}
+	if !r.secrets["sympozium-system/"+db] {
+		t.Fatal("no generated database Secret")
+	}
+
+	gateway := r.deployments["test-sympozium-model-gateway"].Spec.Template.Spec
+	if v := volume(t, gateway, "operator"); !slices.ContainsFunc(v.Projected.Sources, func(p corev1.VolumeProjection) bool {
+		return p.Secret != nil && p.Secret.Name == db && p.Secret.Items[0].Key == "database-url"
+	}) {
+		t.Fatal("the gateway does not read the bundled database URL")
+	}
+	migrate := container(t, gateway.InitContainers, "migrate")
+	restricted(t, migrate)
+	if gateway.InitContainers[0].Name != "private-files" {
+		t.Fatal("migrate must run after the private files are copied")
+	}
+	migrations := r.configMaps["sympozium-system/test-sympozium-model-gateway-migrations"].Data
+	for _, file := range []string{"002_celln_model_budget.sql", "003_celln_model_gateway.sql"} {
+		want, err := os.ReadFile(filepath.Join("..", "migrations", file))
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Splitting the render on "\n---" drops the last key's final newline.
+		if strings.TrimRight(migrations[file], "\n") != strings.TrimRight(string(want), "\n") {
+			t.Fatalf("chart migration %s differs from migrations/; run make helm-sync", file)
+		}
+	}
+
+	reaches := func(policy networkingv1.NetworkPolicy, name string) bool {
+		for _, rule := range policy.Spec.Egress {
+			for _, peer := range rule.To {
+				if peer.PodSelector != nil && peer.PodSelector.MatchLabels["app.kubernetes.io/name"] == name {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	if !reaches(r.policies["sympozium-system/test-sympozium-model-gateway"], db) {
+		t.Fatal("the gateway's egress does not reach the bundled database")
+	}
+	dbPolicy := r.policies["sympozium-system/"+db]
+	if len(dbPolicy.Spec.Ingress) != 1 || dbPolicy.Spec.Ingress[0].From[0].PodSelector.MatchLabels["app.kubernetes.io/name"] != "test-sympozium-model-gateway" || len(dbPolicy.Spec.Egress) != 0 {
+		t.Fatalf("the database must admit only the gateway and reach nothing: %+v", dbPolicy.Spec)
+	}
+
+	// An operator database replaces all of it.
+	own := decodeMediation(t, mustRender(t, mediationValues()))
+	if len(own.statefulSets) != 0 || own.secrets["sympozium-system/"+db] {
+		t.Fatal("a bundled database rendered beside the operator's")
+	}
+	for _, c := range own.deployments["test-sympozium-model-gateway"].Spec.Template.Spec.InitContainers {
+		if c.Name == "migrate" {
+			t.Fatal("the chart migrates an operator database")
+		}
+	}
+}
+
+// With no egress list the gateway may reach any provider; a list restricts it.
+func TestGatewayEgressIsOpenUnlessRestricted(t *testing.T) {
+	const key = "sympozium-system/test-sympozium-model-gateway"
+	open := decodeMediation(t, mustRender(t, without(mediationValues(), "modelGateway.egress"))).policies[key]
+	if len(open.Spec.Egress) != 1 || len(open.Spec.Egress[0].To) != 0 || len(open.Spec.Egress[0].Ports) != 0 {
+		t.Fatalf("an empty egress list must allow any destination: %+v", open.Spec.Egress)
+	}
+	listed := decodeMediation(t, mustRender(t, mediationValues())).policies[key]
+	if len(listed.Spec.Egress) != 1 || len(listed.Spec.Egress[0].Ports) != 1 || listed.Spec.Egress[0].Ports[0].Port.IntVal != 443 {
+		t.Fatalf("a declared egress list must be used as given: %+v", listed.Spec.Egress)
 	}
 }

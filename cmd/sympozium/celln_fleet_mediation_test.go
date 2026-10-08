@@ -26,7 +26,9 @@ func TestParseMediatedRoutes(t *testing.T) {
 		{name: "no provider", specs: []string{"protocol=openai-chat,origin=https://api.openai.com,models=gpt"}, refused: "provider"},
 		{name: "unknown protocol", specs: []string{"provider=google,protocol=gemini,origin=https://g.example,models=g"}, refused: "protocol must be openai-chat or anthropic-messages"},
 		{name: "no model", specs: []string{"provider=openai,protocol=openai-chat,origin=https://api.openai.com"}, refused: "1-32 models"},
-		{name: "wildcard model", specs: []string{"provider=openai,protocol=openai-chat,origin=https://api.openai.com,models=gpt-*"}, refused: "no wildcard"},
+		{name: "wildcard model", specs: []string{"provider=openai,protocol=openai-chat,origin=https://api.openai.com,models=gpt-*"}, refused: "no other pattern"},
+		{name: "any model beside a name", specs: []string{"provider=openai,protocol=openai-chat,origin=https://api.openai.com,models=*+gpt-5"}, refused: "no other pattern"},
+		{name: "any model", specs: []string{"provider=openai,protocol=openai-chat,origin=https://api.openai.com,models=*"}, want: []cellninstall.MediatedRoute{{Provider: "openai", Protocol: "openai-chat", Models: []string{"*"}, EndpointOrigins: []string{"https://api.openai.com"}}}},
 		{name: "empty model in the list", specs: []string{"provider=openai,protocol=openai-chat,origin=https://api.openai.com,models=gpt+"}, refused: "exact identifiers"},
 		{name: "plain HTTP origin", specs: []string{"provider=openai,protocol=openai-chat,origin=http://api.openai.com,models=gpt"}, refused: "a Secret never crosses plain HTTP"},
 		{name: "origin with a port", specs: []string{"provider=openai,protocol=openai-chat,origin=https://api.openai.com:8443,models=gpt"}, refused: "without port, path or credentials"},
@@ -68,6 +70,7 @@ func TestFleetMediationValues(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
 		backends bool
+		auto     bool
 		specs    []string
 		set      []string
 		want     []string
@@ -82,10 +85,13 @@ func TestFleetMediationValues(t *testing.T) {
 		{name: "backends without mediation", backends: true, refused: "which this install does not enable"},
 		{name: "an invalid route is refused for its own reason first", specs: []string{"provider=openai,protocol=openai-chat,origin=http://api.openai.com,models=gpt"}, refused: "plain HTTP"},
 		{name: "two sources of routes", specs: []string{route}, set: append([]string{"celln.mediation.routes[0].provider=openai"}, enabled...), refused: "not both"},
+		// The installer's default mediation enables it without any --set.
+		{name: "a route under default mediation", auto: true, specs: []string{route}, want: []string{`celln.mediation.routes[0].provider=anthropic`, `celln.mediation.routes[0].protocol=anthropic-messages`, `celln.mediation.routes[0].models[0]=claude\-sonnet\-5`, `celln.mediation.routes[0].endpointOrigins[0]=https\:\/\/api\.anthropic\.com`}},
+		{name: "two sources under default mediation", auto: true, specs: []string{route}, set: []string{"celln.mediation.routes[0].provider=openai"}, refused: "not both"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := cellnFleetFlags{mediateBackends: tc.backends, mediatedRouteSpecs: tc.specs}
-			got, err := f.mediationValues(tc.set)
+			got, err := f.mediationValues(tc.set, tc.auto)
 			if tc.refused != "" {
 				if err == nil || !strings.Contains(err.Error(), tc.refused) {
 					t.Fatalf("refusal = %v, want one mentioning %q", err, tc.refused)

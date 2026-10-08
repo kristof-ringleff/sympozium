@@ -9,16 +9,29 @@ Sympozium enforces defence-in-depth at every layer — from network isolation to
 | **Network** | `NetworkPolicy` deny-all egress on agent pods | Only the IPC bridge can reach NATS; agents cannot reach the internet or other pods |
 | **Pod sandbox** | `SecurityContext` — `runAsNonRoot`, UID 1000, read-only root filesystem | Every agent and sidecar container runs with least privilege |
 | **Kernel isolation** | [Agent Sandbox CRD](agent-sandbox.md) (optional) — gVisor/Kata via `kubernetes-sigs/agent-sandbox` | When enabled, agent pods run inside a user-space kernel (gVisor) or lightweight VM (Kata), isolating them from the host kernel |
-| **Admission control** | `SympoziumPolicy` admission webhook | Feature and tool gates enforced before the pod is created |
+| **Admission control** | `SympoziumPolicy` admission webhook | Feature gates, image and resource limits checked before the run is admitted |
+| **Tool gating** | `SympoziumPolicy` `toolGating`, applied by the controller | The policy's allow/deny rules are merged into every Job and agent-sandbox run's tool policy; the agent runner and skill tool server only expose the tools that survive |
 | **Skill RBAC** | Ephemeral `Role`/`ClusterRole` per AgentRun | Each skill declares exactly the API permissions it needs — the controller auto-provisions them at run start and revokes them on completion |
 | **RBAC lifecycle** | `ownerReference` (namespace) + label-based cleanup (cluster) | Namespace RBAC is garbage-collected by Kubernetes. Cluster RBAC is cleaned up by the controller on AgentRun completion and deletion |
 | **Controller privilege** | Dedicated `sympozium-manager` ClusterRole | The controller has RBAC delegation permissions to provision skill roles. The API server has a **separate, scoped** `sympozium-apiserver` ClusterRole with no RBAC delegation or `pods/exec` access |
 | **Auth secret isolation** | Individual `secretKeyRef` per provider key | Auth secrets are mounted as individual env vars (e.g. `OPENAI_API_KEY`) rather than wholesale `envFrom`, preventing leakage of unrelated secret keys |
+| **One key per Agent** | `sympozium.ai/model-key-owner` on the key Secret | A model key belongs to one Agent, or to one Ensemble's members. A run may use only its own Agent's key, whatever it names. See [Model keys](#model-keys) |
 | **Image allowlist** | `ImagePolicy.allowedRegistries` in `SympoziumPolicy` | Lifecycle hook, sandbox, skill sidecar and harness images can be restricted to approved registries. Matched by **string prefix**, so end each entry at a `/`, a full tag or a digest — `ghcr.io/acme` also admits `ghcr.io/acmecorp-evil/…`. No `policyRef`, no `imagePolicy`, or an empty list all mean no restriction |
 | **Lifecycle RBAC bounds** | `LifecyclePolicy.deniedResources` in `SympoziumPolicy` | Prevents lifecycle hooks from requesting RBAC access to sensitive resources (e.g. `secrets`, `clusterroles`) |
 | **Env var denylist** | Admission webhook validation | Blocks `spec.env` overrides of dangerous variables (`PATH`, `LD_PRELOAD`, `HOME`, etc.) |
 | **Model integrity** | SHA256 checksum verification | Model downloads can specify a `sha256` hash; the download job verifies integrity before loading |
 | **Multi-tenancy** | Namespaced CRDs + Kubernetes RBAC | Agents, runs, and policies are namespace-scoped; standard K8s RBAC controls who can create them |
+
+## Model keys
+
+Every Agent uses its own model key. Sub-agents share their parent's key: runs an Agent spawns run as that Agent, and the members of an Ensemble share the Ensemble's key. No other sharing is allowed.
+
+- **Ownership is recorded on the Secret.** The first time a run of an Agent uses a key that the Agent lists in `spec.authRefs`, the controller records the owner in the Secret's `sympozium.ai/model-key-owner` annotation: `Agent/<name>`, or `Ensemble/<name>` for an Ensemble member. Membership needs the Ensemble's controller reference as well as the label, so labelling an Agent by hand does not join a team.
+- **Every credential a run names is checked**: `spec.model.authSecretRef`, `providerHeadersSecretRef`, and the Secret behind a `ModelConnection`. This applies to Job, agent-sandbox, harness, HarnessSession and Celln runs. A key owned by another Agent, or one the Agent does not grant, fails the run before any pod or cell starts. The admission webhook gives the same answer early.
+- **The model gateway re-checks on every call.** For mediated Celln runs, the gateway confirms the decision's Agent still exists (same UID) and still owns the Secret before it reads the key. A key claimed by another owner stops working mid-run.
+- **The console** does not offer another Agent's key, and creating an Agent on one returns `409 Conflict`.
+- **Skills cannot reach keys.** Skill sidecars lose the `secrets`, `pods/exec` and `pods/attach` permissions their SkillPacks request, and a ValidatingAdmissionPolicy stops a run's account (`sympozium-run-*`) from creating any pod or workload that mounts a Secret or reads one into its environment. A skill rule that grants every core resource (`*`) is refused. To give an Agent's skills Secret access anyway, set `spec.skillPolicy.allowSecretAccess: true` on its SympoziumPolicy; its runs then use a `sympozium-trusted-run-*` account. Doing so lets that agent read every key in its namespace. The bundled Kubernetes MCP server no longer reads Secrets.
+- **Re-using a key.** When the owning Agent or Ensemble is deleted, its claim goes stale, and the next Agent that grants the key takes it over. To move a key deliberately, delete or edit the annotation.
 
 ## Ephemeral Skill RBAC
 
@@ -40,13 +53,25 @@ AgentRun completes/deleted
 
 ## Policies
 
-`SympoziumPolicy` resources gate what tools and features an agent can use. They are enforced by an admission webhook **before the pod is created** — not at runtime.
+`SympoziumPolicy` resources gate what tools and features an agent can use.
+Feature gates and limits are checked by the admission webhook when a run is
+created. Tool gating is applied by the controller when it builds the run's pod:
+the policy's `deny` rules are added to the run's own `spec.toolPolicy`, and with
+`defaultAction: deny` only the tools a rule allows remain. The agent never sees
+a filtered-out tool. A run that explicitly allows a tool the policy denies is
+rejected at admission.
+
+Tool rules are `allow` or `deny`; there is no per-call human approval. To hold
+an agent's output until a person approves or rejects it, use a
+[response gate](lifecycle-hooks.md#manual-human-in-the-loop-approval).
+Celln runs are not covered by `toolGating`: their tools come from the reviewed
+Celln catalogue and its grants.
 
 | Policy | Who it is for | Key rules |
 |--------|---------------|-----------|
-| **Permissive** | Dev clusters, demos | All tools allowed, no approval needed, generous resource limits |
-| **Default** | General use | `execute_command` requires approval, everything else allowed |
-| **Restrictive** | Production, security | All tools denied by default, must be explicitly allowed, sandbox required |
+| **Permissive** | Dev clusters, demos | All tools allowed, generous resource limits |
+| **Network-isolated** | Agents that must not reach the network | All tools allowed except `fetch_url`; deny-all network policy |
+| **Restrictive** | Production, security | All tools denied by default; only `read_file` and `list_directory` allowed; sandbox required |
 
 ### Policy Fields
 
@@ -54,7 +79,7 @@ AgentRun completes/deleted
 |-------|---------|
 | `sandboxPolicy` | Sandbox enforcement, resource limits, seccomp profiles |
 | `subagentPolicy` | Max nesting depth and concurrency for sub-agents |
-| `toolGating` | Per-tool allow/deny/ask rules |
+| `toolGating` | `defaultAction` and per-tool `allow`/`deny` rules |
 | `featureGates` | Toggle code-execution, sub-agents, browser-automation, file-access |
 | `networkPolicy` | Deny-all, DNS, event bus egress rules |
 | `modelPolicy` | Restrict which model names/namespaces can be used |

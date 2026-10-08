@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"regexp"
 	"slices"
 	"time"
@@ -20,6 +21,17 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
+
+// scopedUncertainExpired reports a run whose owner has reported its context
+// unavailable for longer than scopedUncertainGrace.
+func scopedUncertainExpired(run *api.AgentRun, now time.Time) bool {
+	c := meta.FindStatusCondition(run.Status.Conditions, "CellnScopedExecution")
+	return c != nil && c.Status == metav1.ConditionUnknown && c.Reason == "NativeOwnerUncertain" && now.Sub(c.LastTransitionTime.Time) > scopedUncertainGrace
+}
+
+// scopedUncertainGrace is how long an owner may report its context
+// unavailable before the run ends.
+var scopedUncertainGrace = 2 * time.Minute
 
 const scopedOutcomeUnconfirmed = "Scoped execution outcome is uncertain. The controller will only read or clean up the original prepared owner; it will not create replacement authority. Ask an administrator to inspect the configured receiver and gateway."
 
@@ -245,6 +257,23 @@ func (r *AgentRunReconciler) reconcilePendingScoped(ctx context.Context, log log
 		}
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
+	// The run's own key must be its Agent's, claimed before the gateway is
+	// asked to serve it: the gateway refuses a key its Agent does not own.
+	if run.Status.CellnScoped == nil {
+		var agent api.Agent
+		if err := r.Get(ctx, client.ObjectKey{Namespace: run.Namespace, Name: run.Spec.AgentRef}, &agent); err != nil {
+			if apierrors.IsNotFound(err) {
+				return ctrl.Result{}, r.failRun(ctx, run, fmt.Sprintf("Agent %q not found", run.Spec.AgentRef))
+			}
+			return ctrl.Result{}, err
+		}
+		if refusal, err := r.authorizeRunKeys(ctx, run, &agent); err != nil || refusal != "" {
+			if refusal != "" {
+				return ctrl.Result{}, r.failRun(ctx, run, refusal)
+			}
+			return ctrl.Result{}, err
+		}
+	}
 	prepared, err := r.ScopedDispatcher.Prepare(ctx, client.ObjectKeyFromObject(run))
 	if err != nil {
 		if reason := cellnauthority.PlatformReason(err); reason != "" && run.Status.CellnScoped == nil {
@@ -361,6 +390,23 @@ func (r *AgentRunReconciler) reconcileRunningScoped(ctx context.Context, log log
 }
 
 func (r *AgentRunReconciler) scopedUncertain(ctx context.Context, run *api.AgentRun, reason string, cause error) (ctrl.Result, error) {
+	if cellnscoped.IsContextLost(cause) {
+		// The node that held this run's native state is gone. Nothing is
+		// re-placed elsewhere; the run ends and cleanup fences its allowance.
+		return ctrl.Result{}, r.failRun(ctx, run, "Celln node holding this run is gone (AUTH_CONTEXT_LOST); no replacement execution is permitted. Start a new run.")
+	}
+	if cellnscoped.IsReceiverMisconfigured(cause) {
+		if err := r.scopedProgress(ctx, run, metav1.ConditionFalse, "ReceiverUnavailable", receiverMisconfiguredMessage(cause)); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	}
+	if cellnscoped.IsUnsupported(cause) {
+		if err := r.scopedProgress(ctx, run, metav1.ConditionFalse, "Unsupported", "AUTH_PROTOCOL_UNSUPPORTED: the native backend does not advertise the required scoped artifact contract; no fallback was submitted"); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+	}
 	if statusErr := r.scopedProgress(ctx, run, metav1.ConditionUnknown, reason, scopedOutcomeUnconfirmed); statusErr != nil {
 		return ctrl.Result{}, statusErr
 	}
@@ -499,6 +545,13 @@ func (r *AgentRunReconciler) applyScopedStatus(ctx context.Context, log logr.Log
 		return ctrl.Result{}, err
 	}
 	if observed.Phase == "Uncertain" {
+		// The owner keeps reporting its context unavailable: the parent ended
+		// on its node (its budget ran out, or it exited). Past a grace period
+		// for blips, end the run so it stops looking alive. Nothing is
+		// re-created elsewhere, and cleanup still stops the original owner.
+		if scopedUncertainExpired(run, time.Now()) {
+			return ctrl.Result{}, r.failRun(ctx, run, scopedEndedSummary(observed.Reason))
+		}
 		return r.scopedUncertain(ctx, run, "NativeOwnerUncertain", errors.New("original native owner context is unavailable; no replacement execution is permitted"))
 	}
 	if slices.Contains(active, observed.Phase) {
@@ -601,7 +654,7 @@ func (r *AgentRunReconciler) cleanupScoped(ctx context.Context, run *api.AgentRu
 	if err != nil {
 		return false, err
 	}
-	if status.ID != run.Status.CellnScoped.ReceiverID || status.Owner != run.Status.CellnScoped.Owner || !status.CleanupConfirmed {
+	if status.ID != run.Status.CellnScoped.ReceiverID || (!status.ContextLost && status.Owner != run.Status.CellnScoped.Owner) || !status.CleanupConfirmed {
 		return false, errors.New("scoped receiver has not confirmed cleanup for the prepared owner")
 	}
 	if err := r.updateScopedStatus(ctx, run, func(s *api.CellnScopedStatus) error {
@@ -633,4 +686,14 @@ func (r *AgentRunReconciler) scopedChildrenFinalized(ctx context.Context, run *a
 		}
 	}
 	return true, nil
+}
+
+// receiverMisconfiguredMessage tells an operator what to fix when the scoped
+// receiver refused or never answered the controller's capability preflight.
+func receiverMisconfiguredMessage(cause error) string {
+	var e *cellnscoped.HTTPError
+	if errors.As(cause, &e) && e.Reason == cellnscoped.ReasonReceiverAuthRejected {
+		return "RECEIVER_AUTH_REJECTED: the Celln scoped receiver rejected the controller's token. If mediation trust was rotated, restart the controller-manager and model gateway; nothing was submitted"
+	}
+	return "RECEIVER_UNREACHABLE: the Celln scoped receiver did not answer over trusted TLS. Check the celln-router and, if mediation trust was rotated, restart the controller-manager and model gateway; nothing was submitted"
 }

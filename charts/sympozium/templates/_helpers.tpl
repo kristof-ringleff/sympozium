@@ -164,6 +164,9 @@ template that wires one of the three includes this.
 */}}
 {{- define "sympozium.cellnMediation" -}}
 {{- $m := .Values.celln.mediation | default dict -}}
+{{- if not (kindIs "bool" (ternary $m.defaultRoutes true (hasKey $m "defaultRoutes"))) -}}
+{{- fail "celln.mediation.defaultRoutes must be true or false" -}}
+{{- end -}}
 {{- if and (not $m.enabled) (or $m.mediateBackends $m.routes) -}}
 {{- fail "celln.mediation.routes and celln.mediation.mediateBackends require celln.mediation.enabled: without mediation an Agent's own key is never used, so the declared routes would admit nothing; enable mediation or remove them" -}}
 {{- end -}}
@@ -192,11 +195,13 @@ template that wires one of the three includes this.
 {{- end -}}
 {{- $models := $route.models | default list -}}
 {{- if or (not (kindIs "slice" $models)) (lt (len $models) 1) (gt (len $models) 32) -}}
-{{- fail (printf "celln.mediation.routes[%d].models must list 1-32 exact model names: a route without a model admits nothing" $i) -}}
+{{- fail (printf "celln.mediation.routes[%d].models must list 1-32 exact model names, or exactly [\"*\"] for any model: a route without a model admits nothing" $i) -}}
 {{- end -}}
+{{- if not (and (eq (len $models) 1) (eq (toString (index $models 0)) "*")) -}}
 {{- range $model := $models -}}
 {{- if not (regexMatch "^[^*[:space:]]([^*\\r\\n]{0,126}[^*[:space:]])?$" (toString $model)) -}}
-{{- fail (printf "celln.mediation.routes[%d].models: %q must be an exact model name of at most 128 bytes; there is no wildcard" $i (toString $model)) -}}
+{{- fail (printf "celln.mediation.routes[%d].models: %q must be an exact model name of at most 128 bytes; the only pattern is a lone \"*\" (any model), never beside a name or inside one" $i (toString $model)) -}}
+{{- end -}}
 {{- end -}}
 {{- end -}}
 {{- if ne (len ($models | uniq)) (len $models) -}}
@@ -266,14 +271,33 @@ template that wires one of the three includes this.
 {{- if .Values.modelGateway.configurationClaim -}}
 {{- fail "celln.mediation deploys the model gateway from Secret/ConfigMap volumes; unset modelGateway.configurationClaim" -}}
 {{- end -}}
-{{- if not ((.Values.modelGateway.database | default dict).secretName) -}}
-{{- fail "celln.mediation requires modelGateway.database.secretName: an operator-provided Secret holding the PostgreSQL URL (the chart bundles no database)" -}}
-{{- end -}}
-{{- if not ((.Values.modelGateway.database | default dict).key) -}}
+{{- $database := .Values.modelGateway.database | default dict -}}
+{{- if and $database.secretName (not $database.key) -}}
 {{- fail "modelGateway.database.key must name the Secret key holding the PostgreSQL URL" -}}
+{{- end -}}
+{{- if not $database.secretName -}}
+{{- $bundled := $database.bundled | default dict -}}
+{{- if not (regexMatch "^.+@sha256:[0-9a-f]{64}$" ($bundled.image | default "")) -}}
+{{- fail "modelGateway.database.bundled.image must be pinned by sha256 digest (or set modelGateway.database.secretName to use your own PostgreSQL)" -}}
+{{- end -}}
 {{- end -}}
 true
 {{- end -}}
+{{- end -}}
+
+{{/*
+"true" when celln.mediation runs the chart's own PostgreSQL: mediation is on
+and no operator database Secret is named.
+*/}}
+{{- define "sympozium.modelGatewayBundledDatabase" -}}
+{{- if and (include "sympozium.cellnMediation" .) (not ((.Values.modelGateway.database | default dict).secretName)) -}}
+true
+{{- end -}}
+{{- end -}}
+
+{{/* Name shared by the bundled PostgreSQL's StatefulSet, Service and Secret. */}}
+{{- define "sympozium.modelGatewayDatabaseName" -}}
+{{- printf "%s-model-gateway-db" (include "sympozium.fullname" .) -}}
 {{- end -}}
 
 {{/* HTTPS origin of the chart's model gateway Service. */}}
@@ -298,4 +322,40 @@ if [ -s "$SCOPED_PARENT_REQUEST" ]; then
 else
   echo "celln scoped receiver: no parent request at $SCOPED_PARENT_REQUEST; enduring scoped runs stay disabled (one-shot only) until it exists and this pod restarts" >&2
 fi
+{{- end -}}
+
+{{/*
+The mediated routes recorded when celln.mediation is enabled, the operator
+declares no routes and celln.mediation.defaultRoutes is true (the default):
+any model ("*") of the well-known hosted providers at their exact public API
+origins, each with the Agent's own key. Mirrors cellninstall.DefaultMediatedRoutes
+(TestDefaultMediatedRoutesMatchChart keeps them equal). Renders a JSON list.
+*/}}
+{{- define "sympozium.cellnDefaultMediatedRoutes" -}}
+{{- toJson (list
+  (dict "provider" "openai" "protocol" "openai-chat" "models" (list "*") "endpointOrigins" (list "https://api.openai.com"))
+  (dict "provider" "anthropic" "protocol" "anthropic-messages" "models" (list "*") "endpointOrigins" (list "https://api.anthropic.com"))
+  (dict "provider" "deepseek" "protocol" "openai-chat" "models" (list "*") "endpointOrigins" (list "https://api.deepseek.com"))
+) -}}
+{{- end }}
+
+{{/*
+sympozium.mediationTrustChecksum: changes whenever mediation trust is rotated
+- a new signing key id, or the trust Secrets/ConfigMap recreated (new UIDs) -
+so the controller and gateway, which copy their trust once at start, roll.
+lookup is empty under `helm template`; the key id still applies.
+*/}}
+{{- define "sympozium.mediationTrustChecksum" -}}
+{{- $m := .Values.celln.mediation | default dict -}}
+{{- $ns := include "sympozium.namespace" . -}}
+{{- $ids := list ($m.issuer | default dict).keyId -}}
+{{- range $secret := list $m.controllerSecret $m.gatewaySecret -}}
+{{- if $secret -}}
+{{- $ids = append $ids ((lookup "v1" "Secret" $ns $secret).metadata | default dict).uid -}}
+{{- end -}}
+{{- end -}}
+{{- if $m.trustConfigMap -}}
+{{- $ids = append $ids ((lookup "v1" "ConfigMap" $ns $m.trustConfigMap).metadata | default dict).uid -}}
+{{- end -}}
+{{- $ids | toJson | sha256sum -}}
 {{- end -}}

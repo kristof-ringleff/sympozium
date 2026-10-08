@@ -11,6 +11,7 @@ import (
 	"github.com/sympozium-ai/sympozium/internal/agentexecution"
 	"github.com/sympozium-ai/sympozium/internal/cellnauthority"
 	"github.com/sympozium-ai/sympozium/internal/modelconnection"
+	"github.com/sympozium-ai/sympozium/internal/modelkey"
 	"io"
 	"io/fs"
 	"net"
@@ -546,6 +547,23 @@ type CellnPlatformProfile struct {
 	// budget a new conversation should ask for (within them).
 	Ceilings        sympoziumv1alpha1.EnduringRunSpec `json:"ceilings"`
 	SessionDefaults sympoziumv1alpha1.EnduringRunSpec `json:"sessionDefaults"`
+	// MediationOnly is set for a backend whose key never reached the fleet:
+	// it runs only Agents with their own key (agent and credentialProfile
+	// stay empty; ask for the wrapper with runtimeOnly).
+	MediationOnly bool `json:"mediationOnly,omitempty"`
+	// StarterAgent and StarterNamespace name the Agent whose own key is a
+	// mediation-only backend's provider key (installer or added backend);
+	// absent when there is none. Names only: the key is never lent.
+	StarterAgent     string `json:"starterAgent,omitempty"`
+	StarterNamespace string `json:"starterNamespace,omitempty"`
+	// ToolboxProfile, ToolboxWrapper and ToolboxTools are what an Agent with
+	// its own key selects to lend the starter toolbox: the backend's toolbox
+	// profile, its namespace wrapper (ask for it with runtimeOnly) and
+	// exactly its tools in this order. Absent when the scope's package
+	// exports no toolbox; such an Agent then lends no tools.
+	ToolboxProfile string                                  `json:"toolboxProfile,omitempty"`
+	ToolboxWrapper string                                  `json:"toolboxWrapper,omitempty"`
+	ToolboxTools   []sympoziumv1alpha1.ClusterCellnToolRef `json:"toolboxTools,omitempty"`
 }
 
 // platformPersona returns the system prompt a fleet runtime profile binds
@@ -582,20 +600,40 @@ func (s *Server) listCellnPlatformProfiles(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	out := make([]CellnPlatformProfile, 0, len(authorised))
+	toolboxes := map[string]*sympoziumv1alpha1.CellnRuntimeProfile{}
+	for i := range authorised {
+		if cellnplatform.Toolbox(&authorised[i].Profile) {
+			toolboxes[authorised[i].Profile.Name] = &authorised[i].Profile
+		}
+	}
 	for _, a := range authorised {
-		objects, err := cellnplatform.TenantWrappers(ns, &a.Profile, &a.Policy)
-		if err != nil {
+		if cellnplatform.Toolbox(&a.Profile) {
+			continue // offered with its backend's profile, below
+		}
+		names := cellnplatform.WrapperNames(cellnplatform.Backend(&a.Profile))
+		entry := CellnPlatformProfile{Name: a.Profile.Name, Revision: a.Profile.Spec.Revision, Policy: a.Policy.Name, SystemPrompt: a.Profile.Spec.Native.SystemPrompt, Backend: names.Backend, Wrapper: names.Runtime}
+		if objects, err := cellnplatform.TenantWrappers(ns, &a.Profile, &a.Policy); err == nil {
+			connection := objects[2].(*sympoziumv1alpha1.ModelConnection)
+			entry.Model, entry.Provider, entry.Endpoint, entry.CredentialProfile, entry.Agent = connection.Spec.Models[0], connection.Spec.Provider, connection.Spec.Endpoint, connection.Spec.CredentialProfile, names.Agent
+		} else if route, endpoint, model, err := cellnplatform.ProfileRoute(&a.Profile, &a.Policy, "secret"); err == nil && cellnplatform.MediationOnly(&a.Profile) {
+			// The backend's key never reached the fleet: the profile serves
+			// Agents with their own key only, so it has no shared Agent.
+			entry.Model, entry.Provider, entry.Endpoint, entry.MediationOnly = model, route.Provider, endpoint, true
+			if starters, err := cellninstall.StarterAgentsFor(r.Context(), s.client, names.Backend); err == nil && len(starters) != 0 {
+				entry.StarterAgent, entry.StarterNamespace = starters[0].Name, starters[0].Namespace
+			}
+		} else {
 			continue // a profile without a usable route is not offered
 		}
-		connection := objects[2].(*sympoziumv1alpha1.ModelConnection)
 		c := a.Policy.Spec.Ceilings
 		ceilings := sympoziumv1alpha1.EnduringRunSpec{LeaseSeconds: int32(min(c.MaxParentLeaseSeconds, 86400)), MaxTurns: int32(min(c.MaxTurns, 1024)), MaxModelRequests: int32(min(c.MaxModelRequests, 6144)), MaxOutputTokens: c.MaxOutputTokens}
-		names := cellnplatform.WrapperNames(cellnplatform.Backend(&a.Profile))
-		tools := make([]sympoziumv1alpha1.ClusterCellnToolRef, 0, len(a.Policy.Spec.Tools))
-		for _, t := range a.Policy.Spec.Tools {
-			tools = append(tools, t.Ref)
+		entry.Tools, entry.Ceilings, entry.SessionDefaults = cellnplatform.LentTools(&a.Policy), ceilings, *cellninstall.SessionDefaultsFor(ceilings, &a.Profile)
+		if toolbox := toolboxes[cellnplatform.ToolboxProfileName(a.Profile.Name)]; toolbox != nil {
+			if tools, err := cellnplatform.ToolboxTools(toolbox); err == nil {
+				entry.ToolboxProfile, entry.ToolboxWrapper, entry.ToolboxTools = toolbox.Name, cellnplatform.RuntimeWrapperName(toolbox), tools
+			}
 		}
-		out = append(out, CellnPlatformProfile{Name: a.Profile.Name, Revision: a.Profile.Spec.Revision, Policy: a.Policy.Name, Model: connection.Spec.Models[0], Provider: connection.Spec.Provider, Endpoint: connection.Spec.Endpoint, CredentialProfile: connection.Spec.CredentialProfile, SystemPrompt: a.Profile.Spec.Native.SystemPrompt, Backend: names.Backend, Wrapper: names.Runtime, Agent: names.Agent, Tools: tools, Ceilings: ceilings, SessionDefaults: *cellninstall.SessionDefaultsFor(ceilings, &a.Profile)})
+		out = append(out, entry)
 	}
 	writeJSON(w, out)
 }
@@ -646,9 +684,9 @@ func (s *Server) ensureCellnRuntimeWrapper(ctx context.Context, namespace, profi
 		return cellnplatform.Wrappers{}, err
 	}
 	names := cellnplatform.WrapperNames(cellnplatform.Backend(&profile))
-	out := cellnplatform.Wrappers{Backend: names.Backend, Runtime: names.Runtime, Created: []string{}}
+	out := cellnplatform.Wrappers{Backend: names.Backend, Runtime: cellnplatform.RuntimeWrapperName(&profile), Created: []string{}}
 	var existing sympoziumv1alpha1.AgentRuntime
-	missing := k8serrors.IsNotFound(s.client.Get(ctx, types.NamespacedName{Namespace: namespace, Name: names.Runtime}, &existing))
+	missing := k8serrors.IsNotFound(s.client.Get(ctx, types.NamespacedName{Namespace: namespace, Name: out.Runtime}, &existing))
 	runtime, err := cellnplatform.EnsureRuntimeWrapper(ctx, s.client, namespace, profileName)
 	if err != nil {
 		return cellnplatform.Wrappers{}, err
@@ -1240,6 +1278,10 @@ func (s *Server) createAgent(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			http.Error(w, "failed to get secret: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if err := modelkey.CheckOwner(r.Context(), s.client, "Agent/"+req.Name, existing); err != nil {
+			writeKeyOwnershipError(w, err)
 			return
 		}
 	}
@@ -2467,6 +2509,10 @@ func (s *Server) patchEnsemble(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "failed to get secret: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
+		if err := modelkey.CheckOwner(r.Context(), s.client, "Ensemble/"+name, existing); err != nil {
+			writeKeyOwnershipError(w, err)
+			return
+		}
 	}
 
 	if req.Provider != "" && req.SecretName != "" {
@@ -3021,10 +3067,11 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 // runner reads, or the credential never reaches the model call. The
 // OpenAI-compatible providers share OPENAI_API_KEY: the agent runner and the
 // Hermes adapter both read it, and the provider-named slots on the allowlist
-// (MISTRAL_API_KEY etc.) are read by nothing.
+// (MISTRAL_API_KEY etc.) are read by nothing. Google goes through the runner's
+// OpenAI-compatible client too, so it shares OPENAI_API_KEY.
 func providerEnvKey(provider string) string {
 	switch provider {
-	case "openai", "custom", "ollama", "openrouter", "mistral", "groq", "deepseek":
+	case "openai", "custom", "ollama", "openrouter", "mistral", "groq", "deepseek", "google":
 		return "OPENAI_API_KEY"
 	case "anthropic":
 		return "ANTHROPIC_API_KEY"

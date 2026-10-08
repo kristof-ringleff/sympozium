@@ -61,9 +61,18 @@ to upgrade.
 If `DEEPSEEK_API_KEY`, `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` is set (or you
 answer the prompt in a terminal), the same command installs the **Celln
 fleet**: every node with `/dev/kvm` and a kernel under `/boot` runs
-long-running, hardware-isolated agents for every namespace, one model backend
-per key. On Kind, copy the host kernel into each node first — see
+long-running, hardware-isolated agents for every namespace, on any number of
+nodes. On Kind, copy the host kernel into each node first — see
 [Celln Fleet Installation](guides/celln-fleet-installation.md#prerequisites).
+
+Model access is **mediated** by default: a model gateway (with its own small
+PostgreSQL) holds provider keys, and Celln nodes never do. The key you gave
+becomes the own key of a `starter` Agent in the install namespace; every other
+Agent brings its own key (OpenAI, Anthropic and DeepSeek work out of the box),
+and no two Agents may share one — see
+[Model keys](concepts/security.md#model-keys) and
+[Mediated Model Access](guides/celln-mediated-model-access.md). Pass
+`--no-celln-mediation` to publish the key to the nodes instead.
 
 ---
 
@@ -147,7 +156,7 @@ through nine steps:
 | **5 — GitHub repository** | Optionally connect a repository for GitOps skills. |
 | **6 — Instructions** | Optional system instructions for the Agent. |
 | **7 — Channel** | Optionally connect a messaging channel (Telegram, Slack, Discord, WhatsApp). |
-| **8 — Policy** | Choose a policy preset: **Permissive** (everything allowed), **Default** (commands require approval), or **Restrictive** (very locked-down). |
+| **8 — Policy** | Choose a policy preset: **Permissive** (everything allowed), **Default** (every tool except `fetch_url`), or **Restrictive** (very locked-down). |
 | **9 — Heartbeat** | Pick how often the agent should wake up on its own: every 30 min, hourly (recommended), every 6 hours, daily at 9 AM, or disabled. |
 
 The wizard creates:
@@ -536,8 +545,8 @@ AgentRun CRs directly with kubectl.
 
 | Policy | Who it is for | Key rules |
 |--------|---------------|-----------|
-| **Permissive** | Dev clusters, demos | All tools allowed, no approval needed, generous resource limits |
-| **Default** | General use | `execute_command` requires approval, everything else allowed |
+| **Permissive** | Dev clusters, demos | All tools allowed, generous resource limits |
+| **Default** | General use | All tools allowed except `fetch_url` |
 | **Restrictive** | Production, security | All tools denied by default, must be explicitly allowed, sandbox required |
 
 ---

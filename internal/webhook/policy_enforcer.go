@@ -21,6 +21,7 @@ import (
 
 	sympoziumv1alpha1 "github.com/sympozium-ai/sympozium/api/v1alpha1"
 	"github.com/sympozium-ai/sympozium/internal/controller/taskmodes"
+	"github.com/sympozium-ai/sympozium/internal/modelkey"
 )
 
 // systemNamespace is the namespace where built-in SkillPacks live by default.
@@ -139,6 +140,14 @@ func (pe *PolicyEnforcer) Handle(ctx context.Context, req admission.Request) adm
 	// grants a provider credential to this execution identity.
 	if taskmodes.HarnessImage(run.Spec.Task) != "" && !agentAllowsModelCredential(&instance, run.Spec.Model.Provider, run.Spec.Model.AuthSecretRef) {
 		return admission.Denied(fmt.Sprintf("task.mode %q may use only model credentials declared in Agent %q spec.authRefs; secret %q is not allowed for provider %q", taskmodes.Harness, instance.Name, run.Spec.Model.AuthSecretRef, run.Spec.Model.Provider))
+	}
+	// One key per Agent: refuse early a credential that another Agent owns or
+	// this one does not grant. The controller records the claim and enforces
+	// the same rule; this read-only check only gives the author a fast answer.
+	for _, secret := range []string{run.Spec.Model.AuthSecretRef, run.Spec.Model.ProviderHeadersSecretRef} {
+		if err := modelkey.Check(ctx, pe.Client, &instance, "", secret); modelkey.IsRefusal(err) {
+			return admission.Denied(err.Error())
+		}
 	}
 
 	// Validate user-supplied volumes (AgentRun + resolved SkillPack sidecars).
@@ -898,21 +907,6 @@ func (mpe *MutatingPolicyEnforcer) Handle(ctx context.Context, req admission.Req
 			}
 			modified = true
 		}
-	}
-
-	// Inject tool policy defaults from SympoziumPolicy
-	if policy.Spec.ToolGating != nil && run.Spec.ToolPolicy == nil {
-		tp := &sympoziumv1alpha1.ToolPolicySpec{}
-		for _, rule := range policy.Spec.ToolGating.Rules {
-			switch rule.Action {
-			case "allow":
-				tp.Allow = append(tp.Allow, rule.Tool)
-			case "deny":
-				tp.Deny = append(tp.Deny, rule.Tool)
-			}
-		}
-		run.Spec.ToolPolicy = tp
-		modified = true
 	}
 
 	// Inject network isolation labels (used by NetworkPolicy)
