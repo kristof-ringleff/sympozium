@@ -70,7 +70,7 @@ func retryGateOutputLimit() int {
 }
 
 // gateRetrySpec returns the retry config in force, or nil when gate-driven
-// retry is off. Empty `on` means ["gate"]; "failure" is schema-only.
+// retry is off. Empty `on` means ["gate"].
 func gateRetrySpec(agentRun *sympoziumv1alpha1.AgentRun) *sympoziumv1alpha1.RetrySpec {
 	if agentRun.Spec.Lifecycle == nil || agentRun.Spec.Lifecycle.Retry == nil {
 		return nil

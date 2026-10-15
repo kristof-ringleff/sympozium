@@ -300,7 +300,7 @@ spec:
       maxAttempts: 3          # total attempts including the first
       backoff: 30s            # optional delay before the next attempt starts
       maxChainTokens: 200000  # cumulative across the chain; 0 = unlimited
-      on: [gate]              # only "gate" is wired today
+      on: [gate]              # which outcomes may trigger a retry
     postRun:
       - name: build-check
         image: my-org/build-check:latest

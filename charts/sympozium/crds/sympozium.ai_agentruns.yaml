@@ -881,14 +881,11 @@ spec:
                         format: int64
                         type: integer
                       "on":
-                        description: |-
-                          On selects which outcomes may trigger a retry. Only "gate" is wired
-                          today; "failure" is accepted by the schema but ignored by the controller.
+                        description: On selects which outcomes may trigger a retry.
                           Empty means ["gate"].
                         items:
                           enum:
                           - gate
-                          - failure
                           type: string
                         type: array
                     type: object

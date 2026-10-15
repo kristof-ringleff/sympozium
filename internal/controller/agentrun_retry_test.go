@@ -386,9 +386,9 @@ func TestResolveGate_RetryWithoutConfigIsRejectNotApprove(t *testing.T) {
 	}
 }
 
-func TestResolveGate_RetryOnFailureOnlyIsNotGateRetry(t *testing.T) {
+func TestResolveGate_RetryOnWithoutGateIsNotGateRetry(t *testing.T) {
 	run := withVerdict(
-		gatedRun("demo-run", &sympoziumv1alpha1.RetrySpec{MaxAttempts: 3, On: []string{"failure"}}),
+		gatedRun("demo-run", &sympoziumv1alpha1.RetrySpec{MaxAttempts: 3, On: []string{"other"}}),
 		`{"action":"retry","reason":"nope"}`)
 
 	r, _ := retryReconciler(t, run)
@@ -686,8 +686,8 @@ func TestGateRetrySpec_OnDefaultsToGate(t *testing.T) {
 	}{
 		{"unset means gate", nil, true},
 		{"explicit gate", []string{"gate"}, true},
-		{"gate among others", []string{"failure", "gate"}, true},
-		{"failure only is not wired", []string{"failure"}, false},
+		{"gate among others", []string{"other", "gate"}, true},
+		{"without gate is not wired", []string{"other"}, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

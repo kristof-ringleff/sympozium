@@ -856,10 +856,8 @@ type RetrySpec struct {
 	// +optional
 	MaxChainTokens int64 `json:"maxChainTokens,omitempty"`
 
-	// On selects which outcomes may trigger a retry. Only "gate" is wired
-	// today; "failure" is accepted by the schema but ignored by the controller.
-	// Empty means ["gate"].
-	// +kubebuilder:validation:items:Enum=gate;failure
+	// On selects which outcomes may trigger a retry. Empty means ["gate"].
+	// +kubebuilder:validation:items:Enum=gate
 	// +optional
 	On []string `json:"on,omitempty"`
 }
