@@ -229,14 +229,14 @@ Without a gate, the agent's response is published to channels (Slack, Telegram, 
 1. The IPC bridge suppresses the completion event
 2. The PostRun Job runs the gate hook container
 3. The gate hook inspects the agent's output (via `AGENT_RESULT` env var)
-4. The gate hook writes a verdict by patching an annotation on the AgentRun
+4. The gate hook posts its verdict to the Sympozium API using the per-run token it was given
 5. The controller reads the verdict, applies it, and publishes the (possibly rewritten) response
 
 If no verdict is written (hook fails, times out, or the hook is designed for manual approval), the `gateDefault` field controls behavior: `"block"` (default) replaces the output with an error, `"allow"` passes it through.
 
 ### Declaring a Gated Instance
 
-Add `gate: true` to one PostRun hook in your instance's lifecycle config. At most one PostRun hook may be a gate. The gate hook needs RBAC permission to patch the AgentRun annotation:
+Add `gate: true` to one PostRun hook in your instance's lifecycle config. At most one PostRun hook may be a gate. The gate hook needs no Kubernetes RBAC — the controller gives it a token scoped to this one run:
 
 ```yaml
 apiVersion: sympozium.ai/v1alpha1
@@ -249,27 +249,68 @@ spec:
       model: gpt-4o
       lifecycle:
         gateDefault: block   # or "allow"
-        rbac:
-          - apiGroups: ["sympozium.ai"]
-            resources: ["agentruns"]
-            verbs: ["get", "patch"]
         postRun:
           - name: content-filter
-            image: my-org/content-filter:latest
+            image: busybox:1.36   # wget is a busybox applet; curl is not
             gate: true
             command: ["sh", "-c"]
             args:
               - |
-                # Inspect $AGENT_RESULT, then patch the verdict:
-                kubectl patch agentrun $AGENT_RUN_ID -n $AGENT_NAMESPACE \
-                  --type=merge \
-                  -p "{\"metadata\":{\"annotations\":{\"sympozium.ai/gate-verdict\":\
-                  \"{\\\"action\\\":\\\"approve\\\"}\"}}}"
+                # Inspect $AGENT_RESULT, then post the verdict:
+                wget -q -O- \
+                  --header "Authorization: Bearer $GATE_VERDICT_TOKEN" \
+                  --header "Content-Type: application/json" \
+                  --post-data '{"action":"approve"}' \
+                  "$SYMPOZIUM_API_URL/api/v1/runs/$AGENT_RUN_ID/gate-verdict?namespace=$AGENT_NAMESPACE"
 ```
+
+### Delivering the Verdict
+
+The controller injects two environment variables into the gate container, and
+into no other container:
+
+| Variable | Meaning |
+|----------|---------|
+| `GATE_VERDICT_TOKEN` | A bearer minted for this run alone. Accepted only for this AgentRun, and only while it is `PostRunning`. |
+| `SYMPOZIUM_API_URL` | The in-cluster API base URL to post to. |
+
+That is the whole contract. The hook needs no `kubectl`, no ServiceAccount
+token and no entry under `lifecycle.rbac` — a gated Agent that declares no
+`rbac:` block gets no Kubernetes credentials in its pod at all.
+
+Any HTTP client will do. The examples below use `wget`, which is a busybox
+applet and so needs no extra layer; an image built on Alpine or Debian is more
+likely to carry `curl`:
+
+```sh
+curl -fsS -X POST \
+  -H "Authorization: Bearer $GATE_VERDICT_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"action":"approve"}' \
+  "$SYMPOZIUM_API_URL/api/v1/runs/$AGENT_RUN_ID/gate-verdict?namespace=$AGENT_NAMESPACE"
+```
+
+Prefer a form that fails loudly — `curl -f`, or checking `wget`'s exit code. A
+POST that quietly fails leaves no verdict, and the run falls back to
+`gateDefault` with nothing to explain why.
+
+A verdict is capped at 32KiB, matching the truncation already applied to
+`AGENT_RESULT`; a larger body is refused with `413` rather than silently cut.
+
+`lifecycle.rbac` still exists for hooks that need the Kubernetes API for other
+reasons. It is simply no longer required to report a verdict.
+
+> **Network note.** The gate container must be able to reach the API server
+> Service. Nothing restricts postRun pod egress today, but if you add a
+> NetworkPolicy covering them, allow the apiserver — otherwise every gate falls
+> back to `gateDefault`.
+
+Treat `AGENT_RESULT` as untrusted: it is whatever the agent produced, and a
+gate is precisely the thing that should not take it on faith.
 
 ### Verdict Format
 
-The gate hook patches the annotation `sympozium.ai/gate-verdict` with a JSON object:
+A verdict is a JSON object, the same on either channel — the hook's POST above, or the annotation `sympozium.ai/gate-verdict` set directly by a human or the API:
 
 | Action | Effect | Fields |
 |--------|--------|--------|
@@ -314,9 +355,15 @@ spec:
               VERDICT=$(jq -nc --arg out "$OUT" \
                 '{action:"retry", reason:"npm run check failed", response:$out}')
             fi
-            kubectl patch agentrun $AGENT_RUN_ID -n $AGENT_NAMESPACE --type=merge \
-              -p "{\"metadata\":{\"annotations\":{\"sympozium.ai/gate-verdict\":$(echo $VERDICT | jq -Rs .)}}}"
+            wget -q -O- \
+              --header "Authorization: Bearer $GATE_VERDICT_TOKEN" \
+              --header "Content-Type: application/json" \
+              --post-data "$VERDICT" \
+              "$SYMPOZIUM_API_URL/api/v1/runs/$AGENT_RUN_ID/gate-verdict?namespace=$AGENT_NAMESPACE"
 ```
+
+The verdict goes over the API, so `response` carries the build log as-is —
+no annotation escaping, and no `jq -Rs` to wrap it in.
 
 The successor attempt receives a structured card in place of its task:
 
@@ -434,6 +481,18 @@ postRun:
 
 The `requireApproval` toggle in the API and UI configures exactly this, with a 24-hour window.
 
+This hook decides nothing itself — it only holds the run open — so it needs
+neither a verdict token nor RBAC. The human's approval arrives through the same
+endpoint, authenticated with the ordinary API token.
+
+A verdict is recorded by last writer, and the endpoint accepts one only while
+the run is `PostRunning`. In practice an approving human ends the gate: the
+controller kills the gate Job as soon as it sees a verdict, and once the run
+leaves `PostRunning` any later post is refused with `409`. A gate hook that
+posts in the short window before that reconcile does still overwrite the
+human's verdict, so pair manual approval with a hook that waits rather than
+one that decides on a timer.
+
 In the web UI, gated runs show an amber "Approval" badge on the runs list and an approval bar on the run detail page with Approve and Reject buttons. A warning toast fires when a run requires approval.
 
 Via the API:
@@ -456,10 +515,6 @@ curl -X POST http://localhost:9090/api/v1/runs/my-run/gate-verdict?namespace=def
 spec:
   lifecycle:
     gateDefault: block
-    rbac:
-      - apiGroups: ["sympozium.ai"]
-        resources: ["agentruns"]
-        verbs: ["get", "patch"]
     postRun:
       - name: pii-scanner
         image: my-org/pii-scanner:latest
@@ -472,9 +527,15 @@ spec:
             else
               VERDICT='{"action":"approve","reason":"pii-scanner-clean"}'
             fi
-            kubectl patch agentrun $AGENT_RUN_ID -n $AGENT_NAMESPACE --type=merge \
-              -p "{\"metadata\":{\"annotations\":{\"sympozium.ai/gate-verdict\":$(echo $VERDICT | jq -Rs .)}}}"
+            wget -q -O- \
+              --header "Authorization: Bearer $GATE_VERDICT_TOKEN" \
+              --header "Content-Type: application/json" \
+              --post-data "$VERDICT" \
+              "$SYMPOZIUM_API_URL/api/v1/runs/$AGENT_RUN_ID/gate-verdict?namespace=$AGENT_NAMESPACE"
 ```
+
+A scanner that sees the agent's raw output is exactly the container you least
+want holding Kubernetes credentials. With the per-run token it holds none.
 
 ### Gate Status in the UI
 

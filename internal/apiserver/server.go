@@ -75,8 +75,11 @@ type Server struct {
 	densityCache *controller.DensityCache // optional: set when llmfit DaemonSet is enabled
 	powerClient  *collector.Client        // optional: nil when energy collection is disabled
 	authEnabled  bool                     // set by buildMux; gates pricing writes
-	version      string                   // build version, reported by /api/v1/cluster/identity
-	cellnCells   cellnCellsSource         // gateway `/v1/cells` client and its "unsupported" verdict
+	// authToken is the global bearer, kept so routes exempted from
+	// authMiddleware can still accept it. Nil means the server runs open.
+	authToken  *tokenReader
+	version    string           // build version, reported by /api/v1/cluster/identity
+	cellnCells cellnCellsSource // gateway `/v1/cells` client and its "unsupported" verdict
 	// completeCellnBackend finishes an added fleet backend in the background;
 	// nil runs completeCellnFleetBackend (tests replace it).
 	completeCellnBackend func(name string, facts cellninstall.FleetFacts, cellnHint string)
@@ -180,6 +183,7 @@ func (s *Server) buildMux(frontendFS fs.FS, expected *tokenReader) http.Handler 
 	// Some cluster-wide mutating routes (pricing) refuse writes outright when
 	// the server runs unauthenticated, instead of inheriting the open-API mode.
 	s.authEnabled = expected != nil && expected.Current() != ""
+	s.authToken = expected
 
 	mux := http.NewServeMux()
 
@@ -378,6 +382,15 @@ func (s *Server) buildMux(frontendFS fs.FS, expected *tokenReader) http.Handler 
 func authMiddleware(expected *tokenReader, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		path := r.URL.Path
+
+		// The gate verdict route authenticates itself, because it accepts a
+		// per-run token as well as the global one. patchRunGateVerdict calls
+		// authorizeGateVerdict before anything else — if that call is ever
+		// removed or moved, this route becomes unauthenticated.
+		if isGateVerdictRequest(r.Method, path) {
+			next.ServeHTTP(w, r)
+			return
+		}
 
 		// Skip auth for health, metrics, and static assets.
 		if path == "/healthz" || path == "/readyz" || path == "/metrics" {
@@ -1855,6 +1868,67 @@ type GateVerdictRequest struct {
 	Reason   string `json:"reason,omitempty"`   // audit trail
 }
 
+// maxGateVerdictBytes bounds a gate verdict body. It matches the 32KiB the
+// controller already truncates AGENT_RESULT to before handing it to a hook, so
+// a gate can rewrite everything it was shown and no more.
+const maxGateVerdictBytes = 32 * 1024
+
+// isGateVerdictRequest reports whether this is the self-authenticating gate
+// verdict route: POST /api/v1/runs/{name}/gate-verdict, and nothing else.
+func isGateVerdictRequest(method, path string) bool {
+	if method != http.MethodPost {
+		return false
+	}
+	rest, ok := strings.CutPrefix(path, "/api/v1/runs/")
+	if !ok {
+		return false
+	}
+	name, ok := strings.CutSuffix(rest, "/gate-verdict")
+	// A single path segment: no sub-resource, no traversal.
+	return ok && name != "" && !strings.Contains(name, "/")
+}
+
+// authorizeGateVerdict accepts either the global bearer or the run's own gate
+// verdict token. The per-run token is what lets a gate hook report a verdict
+// with no Kubernetes RBAC: it is valid for this run alone, so a hook that
+// leaks it cannot touch any other run.
+//
+// Fails closed. A missing Secret, an empty token or a read error are all
+// "unauthorized", never "internal error" — a caller must not be able to tell
+// the difference between a run with no gate and a wrong token.
+func (s *Server) authorizeGateVerdict(r *http.Request, run, ns string) bool {
+	// A server started without a token runs open, and this route is no
+	// exception. Behaving differently here would make the one route that
+	// bypasses authMiddleware also the one route with surprising semantics.
+	if s.authToken == nil || s.authToken.Current() == "" {
+		return true
+	}
+
+	presented := ""
+	if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
+		presented = strings.TrimPrefix(auth, "Bearer ")
+	}
+	if presented == "" {
+		return false
+	}
+
+	if global := s.authToken.Current(); subtle.ConstantTimeCompare([]byte(presented), []byte(global)) == 1 {
+		return true
+	}
+
+	var secret corev1.Secret
+	if err := s.client.Get(r.Context(), types.NamespacedName{
+		Name: controller.GateVerdictSecretName(run), Namespace: ns,
+	}, &secret); err != nil {
+		return false
+	}
+	expected := secret.Data[controller.GateVerdictSecretKey]
+	if len(expected) == 0 {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(presented), expected) == 1
+}
+
 func (s *Server) patchRunGateVerdict(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	ns := r.URL.Query().Get("namespace")
@@ -1862,15 +1936,35 @@ func (s *Server) patchRunGateVerdict(w http.ResponseWriter, r *http.Request) {
 		ns = "default"
 	}
 
+	// First statement in the handler, deliberately: this route is exempt from
+	// authMiddleware so that a gate hook can present its per-run token.
+	if !s.authorizeGateVerdict(r, name, ns) {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	// Bound the body before decoding. The verdict becomes an annotation, and
+	// annotations share a ~256KB metadata budget with everything else on the
+	// object, so an oversized response must fail loudly rather than be
+	// truncated into something that looks deliberate.
+	limited := http.MaxBytesReader(w, r.Body, maxGateVerdictBytes)
 	var req GateVerdictRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(limited).Decode(&req); err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			http.Error(w, fmt.Sprintf("gate verdict exceeds %d bytes", maxGateVerdictBytes),
+				http.StatusRequestEntityTooLarge)
+			return
+		}
 		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-	if req.Action != "approve" && req.Action != "reject" && req.Action != "rewrite" {
-		http.Error(w, `action must be "approve", "reject", or "rewrite"`, http.StatusBadRequest)
+	if req.Action != "approve" && req.Action != "reject" && req.Action != "rewrite" && req.Action != "retry" {
+		http.Error(w, `action must be "approve", "reject", "rewrite", or "retry"`, http.StatusBadRequest)
 		return
 	}
+	// retry is exempt: its reason is what reaches the next attempt, and
+	// buildRetryTask substitutes a default when even that is empty.
 	if (req.Action == "reject" || req.Action == "rewrite") && req.Response == "" {
 		http.Error(w, "response is required for reject/rewrite actions", http.StatusBadRequest)
 		return

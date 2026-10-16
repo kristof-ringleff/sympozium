@@ -105,6 +105,7 @@ test-integration: ## Run integration tests (requires Kind cluster + API keys)
 	./test/integration/test-slack-channel.sh
 	./test/integration/test-mcp-bridge.sh
 	./test/integration/test-lifecycle-hooks.sh
+	./test/integration/test-gate-token-verdict.sh
 	./test/integration/test-harness-mode.sh
 	./test/integration/test-persistent-harness-session.sh
 

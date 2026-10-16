@@ -819,6 +819,14 @@ func (r *AgentRunReconciler) prepareTaskPrerequisites(
 				"Underlying error: %v", err))
 	}
 
+	// Mint the response gate's verdict token before the postRun Job is built,
+	// so the gate container has a credential to be injected with.
+	if err := r.ensureGateVerdictToken(ctx, agentRun); err != nil {
+		return nil, &ctrl.Result{}, r.failRun(ctx, agentRun,
+			fmt.Sprintf("failed to create the gate verdict token — the response gate hook "+
+				"would have no way to report its verdict. Underlying error: %v", err))
+	}
+
 	// Create a workspace PVC when postRun lifecycle hooks are defined, so the
 	// workspace persists between the main pod and the postRun Job.
 	if agentRun.Spec.Lifecycle != nil && len(agentRun.Spec.Lifecycle.PostRun) > 0 {
@@ -6344,6 +6352,22 @@ func (r *AgentRunReconciler) buildPostRunJob(
 		}
 		if hook.Gate {
 			hookEnv = append(hookEnv, corev1.EnvVar{Name: "GATE_MODE", Value: "true"})
+			// The verdict credential goes to the gate container and nowhere
+			// else, the way the NATS bridge credential reaches only ipc-bridge.
+			// A per-key SecretKeyRef, never EnvFrom.
+			if apiURL := apiServerURL(); apiURL != "" {
+				hookEnv = append(hookEnv,
+					corev1.EnvVar{Name: "SYMPOZIUM_API_URL", Value: apiURL},
+					corev1.EnvVar{Name: "GATE_VERDICT_TOKEN", ValueFrom: &corev1.EnvVarSource{
+						SecretKeyRef: &corev1.SecretKeySelector{
+							LocalObjectReference: corev1.LocalObjectReference{
+								Name: agentRunGateSecretName(agentRun),
+							},
+							Key: GateVerdictSecretKey,
+						},
+					}},
+				)
+			}
 		}
 
 		hookContainer := corev1.Container{

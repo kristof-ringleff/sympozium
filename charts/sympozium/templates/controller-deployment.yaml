@@ -161,6 +161,12 @@ spec:
             - name: SYMPOZIUM_IMAGE_TAG
               value: {{ $imgTag | quote }}
             {{- end }}
+            # In-cluster API base URL handed to a response gate hook alongside
+            # its per-run verdict token, so the hook can report a verdict
+            # without Kubernetes RBAC. Unset leaves the gate on the legacy
+            # annotation-patch path.
+            - name: SYMPOZIUM_API_URL
+              value: "http://sympozium-apiserver.{{ include "sympozium.namespace" . }}.svc:{{ .Values.apiserver.service.port }}"
             # Utility image for the containers the controller injects into
             # AgentRun pods (wait-for-memory, postRun done), #348.
             - name: SYMPOZIUM_BUSYBOX_IMAGE
