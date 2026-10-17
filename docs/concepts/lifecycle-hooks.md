@@ -348,6 +348,11 @@ In-place retry needs a pod to park in. The Job and
 identically; [Celln](celln-backend.md) dispatches to a remote executor and has
 no pod, so it always uses successor runs whatever `inPlace` says.
 
+In-place retry also needs `agent-runner`, which holds the park loop. A
+[harness](../modes/harness.md) task replaces `agent-runner`, so it uses
+successor runs too, and its container never receives the gate key or the
+`/gate` mount.
+
 Enable it with `lifecycle.retry`:
 
 ```yaml

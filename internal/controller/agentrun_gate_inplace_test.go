@@ -1165,3 +1165,40 @@ func TestStartGateForAttempt_RefusesAGateJobItDoesNotOwn(t *testing.T) {
 		t.Error("run moved to AwaitingGate on a foreign Job")
 	}
 }
+
+// A harness adapter replaces agent-runner, so nothing in the pod can park,
+// and the harness runs model-chosen tools in the agent container. The gate
+// key there would let the model sign its own attempt markers. A harness run
+// must get no in-place wiring at all and fall back to successor runs.
+func TestGateInPlace_IsOffForAHarnessRun(t *testing.T) {
+	r := &AgentRunReconciler{}
+	run := gatedRun("harness-inplace", inPlace(&sympoziumv1alpha1.RetrySpec{MaxAttempts: 3}))
+	run.Spec.Task = objectTask(t, `{"mode":"harness","parameters":{"image":"registry.example/harness@sha256:`+strings.Repeat("a", 64)+`","prompt":"Ship the feature"}}`)
+
+	if gateInPlaceEnabled(run) {
+		t.Error("a harness run parks, but nothing in its pod can")
+	}
+
+	job, err := r.buildJob(context.Background(), run, false, nil, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("buildJob: %v", err)
+	}
+	spec := job.Spec.Template.Spec
+	for _, v := range spec.Volumes {
+		if v.Name == gateChannelVolume {
+			t.Error("a harness run got the gate volume")
+		}
+	}
+	for _, c := range append(append([]corev1.Container{}, spec.InitContainers...), spec.Containers...) {
+		for _, e := range c.Env {
+			if e.Name == ipc.GateKeyEnv || strings.HasPrefix(e.Name, "GATE_IN_PLACE_") || e.Name == "GATE_PARK_TIMEOUT" {
+				t.Errorf("container %s holds %s", c.Name, e.Name)
+			}
+		}
+		for _, m := range c.VolumeMounts {
+			if m.Name == gateChannelVolume {
+				t.Errorf("container %s mounts the gate channel", c.Name)
+			}
+		}
+	}
+}

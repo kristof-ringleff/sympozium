@@ -94,6 +94,12 @@ func gateInPlaceEnabled(agentRun *sympoziumv1alpha1.AgentRun) bool {
 	if spec == nil || !hasResponseGateHook(agentRun) {
 		return false
 	}
+	// The park loop is agent-runner's. A mode that replaces it (harness) has
+	// nothing that parks, and runs model-chosen tools in the agent container,
+	// where the gate key would let the model sign its own attempt markers.
+	if taskModeReplacesAgentContainer(agentRun.Spec.Task) {
+		return false
+	}
 	// There is no mutating webhook, so the kubebuilder default is not
 	// guaranteed to have been applied — resolve nil here (see CLAUDE.md).
 	return spec.InPlace != nil && *spec.InPlace

@@ -934,6 +934,9 @@ type RetrySpec struct {
 	// Agent Sandbox backends do; Celln dispatches to a remote executor and has
 	// no pod, so it always uses successor runs whatever this says.
 	//
+	// It also requires agent-runner, which holds the park loop. A harness
+	// task replaces agent-runner, so it uses successor runs too.
+	//
 	// Defaults to false, so a run written for successor retry keeps it. Set
 	// true to park instead. Leave it false when a gate takes long enough that
 	// holding the pod is not worth the resources.
