@@ -75,6 +75,16 @@ func inPlaceMaxAttempts() int {
 	return 0
 }
 
+// inPlaceStartAttempt is the attempt this pod runs first. 1 for a new run.
+// A successor run created by the clone path starts later in the chain, and
+// the controller only accepts a marker for its own attempt number.
+func inPlaceStartAttempt() int {
+	if n := envInt("GATE_IN_PLACE_START_ATTEMPT", 0); n > 0 {
+		return n
+	}
+	return 1
+}
+
 // attemptTally accumulates one attempt's usage into the run totals.
 type attemptTally struct {
 	inputTokens  int
@@ -113,14 +123,14 @@ func runInPlaceGateLoop(
 	}
 	defer cleanup()
 
-	return driveInPlaceGate(ctx, p, deps.Tools, key, inPlaceMaxAttempts(), attemptTimeout, parkTimeout())
+	return driveInPlaceGate(ctx, p, deps.Tools, key, inPlaceStartAttempt(), inPlaceMaxAttempts(), attemptTimeout, parkTimeout())
 }
 
 // driveInPlaceGate is runInPlaceGateLoop with the provider already built: one
 // provider, many attempts, a park between each.
 func driveInPlaceGate(
 	ctx context.Context, p LLMProvider, tools []ToolDef, key []byte,
-	maxAttempts int, attemptTimeout, park time.Duration,
+	firstAttempt, maxAttempts int, attemptTimeout, park time.Duration,
 ) (string, int, int, int, error) {
 	log.Printf("gate retry: parking between attempts (maxAttempts=%d attemptTimeout=%s parkTimeout=%s)",
 		maxAttempts, attemptTimeout, park)
@@ -129,7 +139,7 @@ func driveInPlaceGate(
 	var lastText string
 	budget := loadTokenBudget()
 
-	for attempt := 1; ; attempt++ {
+	for attempt := firstAttempt; ; attempt++ {
 		attemptCtx, cancelAttempt := context.WithTimeout(ctx, attemptTimeout)
 		text, inTok, outTok, calls, loopErr := runAgentLoop(attemptCtx, p, tools)
 		cancelAttempt()
@@ -149,7 +159,8 @@ func driveInPlaceGate(
 
 		// A budget halt ends the chain too. Its last assistant turn may hold
 		// tool calls with no results, and a user turn after those is rejected
-		// by the provider. A next attempt would hit the same budget anyway.
+		// by the provider. The budget counts this pod's tokens, so this
+		// conversation cannot go on in any case.
 		if budget.halts(inTok, outTok) {
 			log.Printf("gate retry: attempt %d hit the token budget; not parking", attempt)
 			return lastText, total.inputTokens, total.outputTokens, total.toolCalls, nil
@@ -200,11 +211,11 @@ func publishAttemptResult(res ipc.AttemptResult, key []byte) error {
 		return fmt.Errorf("signing attempt %d: %w", res.Attempt, err)
 	}
 	writeJSON(filepath.Join(ipcOutputDir, fmt.Sprintf("result-%d.json", res.Attempt)), res)
-	b, err := json.Marshal(res)
+	marker, err := ipc.FormatAttemptMarker(res)
 	if err != nil {
 		return fmt.Errorf("encoding attempt %d: %w", res.Attempt, err)
 	}
-	fmt.Fprintf(os.Stdout, "\n%s%s%s\n", ipc.AttemptMarkerStart, string(b), ipc.AttemptMarkerEnd)
+	fmt.Fprintf(os.Stdout, "\n%s\n", marker)
 	log.Printf("gate retry: parked after attempt %d (in=%d out=%d tools=%d)",
 		res.Attempt, res.Metrics.InputTokens, res.Metrics.OutputTokens, res.Metrics.ToolCalls)
 	return nil

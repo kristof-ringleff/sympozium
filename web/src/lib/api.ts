@@ -83,6 +83,9 @@ export interface GateVerdictRequest {
   action: "approve" | "reject" | "rewrite";
   response?: string;
   reason?: string;
+  /** The attempt the operator judged. The server answers 409 when the run
+   *  has moved on to a later attempt since. */
+  attempt?: number;
 }
 
 export interface AgentConfig {

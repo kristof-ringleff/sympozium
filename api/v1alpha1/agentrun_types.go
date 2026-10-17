@@ -910,6 +910,7 @@ type RetrySpec struct {
 	MaxAttempts int `json:"maxAttempts,omitempty"`
 
 	// Backoff delays the successor attempt. Absent means start immediately.
+	// An in-place retry ignores it: the parked pod continues at once.
 	// +optional
 	Backoff *metav1.Duration `json:"backoff,omitempty"`
 
@@ -933,9 +934,10 @@ type RetrySpec struct {
 	// Agent Sandbox backends do; Celln dispatches to a remote executor and has
 	// no pod, so it always uses successor runs whatever this says.
 	//
-	// Defaults to true. Set false to force successor runs, for example when a
-	// gate takes long enough that holding the pod is not worth the resources.
-	// +kubebuilder:default=true
+	// Defaults to false, so a run written for successor retry keeps it. Set
+	// true to park instead. Leave it false when a gate takes long enough that
+	// holding the pod is not worth the resources.
+	// +kubebuilder:default=false
 	// +optional
 	InPlace *bool `json:"inPlace,omitempty"`
 }

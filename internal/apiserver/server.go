@@ -1866,6 +1866,10 @@ type GateVerdictRequest struct {
 	Action   string `json:"action"`             // approve, reject, rewrite
 	Response string `json:"response,omitempty"` // replacement text for reject/rewrite
 	Reason   string `json:"reason,omitempty"`   // audit trail
+	// Attempt is the attempt the caller judged. When set and no longer
+	// current, the verdict is refused with 409. A gate hook may leave it
+	// out: its Job judges the current attempt and is deleted with it.
+	Attempt int `json:"attempt,omitempty"`
 }
 
 // maxGateVerdictBytes bounds a gate verdict body. It matches the 32KiB the
@@ -2010,18 +2014,32 @@ func (s *Server) patchRunGateVerdict(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// An in-place retry chain lives on one CR, so a browser tab still showing
+	// attempt 1 could otherwise approve attempt 2, which nobody has looked at.
+	current := gateVerdictAttempt(&run)
+	if req.Attempt != 0 && req.Attempt != current {
+		http.Error(w, fmt.Sprintf("verdict is for attempt %d, but the run is on attempt %d", req.Attempt, current), http.StatusConflict)
+		return
+	}
+
 	if run.Annotations == nil {
 		run.Annotations = make(map[string]string)
 	}
 	verdictJSON, _ := json.Marshal(req)
 	run.Annotations["sympozium.ai/gate-verdict"] = string(verdictJSON)
-	// Stamp the attempt this decision was made against. An in-place retry chain
-	// lives on one CR, so without it a browser tab still showing attempt 1's
-	// controls could resolve attempt 2. The controller drops a verdict whose
-	// stamp does not match the attempt awaiting one.
-	run.Annotations["sympozium.ai/gate-verdict-attempt"] = strconv.Itoa(gateVerdictAttempt(&run))
+	// Stamp the attempt this decision was made against. The controller drops
+	// a verdict whose stamp does not match the attempt awaiting one, which
+	// covers a chain that moves on between this write and the reconcile.
+	run.Annotations["sympozium.ai/gate-verdict-attempt"] = strconv.Itoa(current)
 
+	// Update, not Patch: it carries the resourceVersion read above, so a
+	// status change since (attempt 2 starting) fails it rather than letting a
+	// verdict checked against attempt 1 land on attempt 2.
 	if err := s.client.Update(r.Context(), &run); err != nil {
+		if k8serrors.IsConflict(err) {
+			http.Error(w, "the run changed while the verdict was being recorded; reload and try again", http.StatusConflict)
+			return
+		}
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}

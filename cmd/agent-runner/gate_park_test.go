@@ -169,7 +169,7 @@ func TestDriveInPlaceGate_InjectsTheVerdictOnTheLiveConversation(t *testing.T) {
 		writeVerdict(t, gate, ipc.GateVerdict{Attempt: 2, Action: "stop"})
 	}()
 
-	text, in, out, _, err := driveInPlaceGate(context.Background(), p, nil, testKey, 3, time.Minute, 5*time.Second)
+	text, in, out, _, err := driveInPlaceGate(context.Background(), p, nil, testKey, 1, 3, time.Minute, 5*time.Second)
 	if err != nil {
 		t.Fatalf("driveInPlaceGate: %v", err)
 	}
@@ -193,6 +193,50 @@ func TestDriveInPlaceGate_InjectsTheVerdictOnTheLiveConversation(t *testing.T) {
 	}
 }
 
+// A successor of an in-place run (one that halted on the token budget and
+// was retried as a new AgentRun) starts at its own attempt number. The
+// controller only accepts a marker for that attempt, so counting from 1 would
+// leave the successor parked until its timeout, never gated.
+func TestDriveInPlaceGate_ASuccessorCountsFromItsOwnAttempt(t *testing.T) {
+	gate, output := useTempIPC(t)
+	p := &mockProvider{name: "mock", model: "m", turns: []ChatResult{
+		{Text: "second try", InputTokens: 1},
+		{Text: "third try", InputTokens: 1},
+	}}
+
+	go func() {
+		waitForFile(t, filepath.Join(output, "result-2.json"), 2*time.Second)
+		writeVerdict(t, gate, ipc.GateVerdict{Attempt: 2, Action: "continue", MaxAttempts: 3})
+	}()
+
+	text, _, _, _, err := driveInPlaceGate(context.Background(), p, nil, testKey, 2, 3, time.Minute, 5*time.Second)
+	if err != nil {
+		t.Fatalf("driveInPlaceGate: %v", err)
+	}
+	if text != "third try" {
+		t.Errorf("text = %q, want attempt 3's answer", text)
+	}
+	if _, err := os.Stat(filepath.Join(output, "result-1.json")); err == nil {
+		t.Error("published attempt 1 from a run that is attempt 2")
+	}
+	if len(p.userMessages) != 1 || !strings.Contains(p.userMessages[0], "Attempt 3 of 3") {
+		t.Errorf("retry cards = %q, want one for attempt 3 of 3", p.userMessages)
+	}
+}
+
+func TestInPlaceStartAttempt_ReadsTheEnv(t *testing.T) {
+	t.Setenv("GATE_IN_PLACE_START_ATTEMPT", "2")
+	if got := inPlaceStartAttempt(); got != 2 {
+		t.Errorf("inPlaceStartAttempt = %d, want 2", got)
+	}
+	for _, v := range []string{"", "0", "-1", "two"} {
+		t.Setenv("GATE_IN_PLACE_START_ATTEMPT", v)
+		if got := inPlaceStartAttempt(); got != 1 {
+			t.Errorf("inPlaceStartAttempt(%q) = %d, want 1", v, got)
+		}
+	}
+}
+
 // The last permitted attempt has nothing to wait for, so it must not park —
 // the controller resolves the gate terminally either way.
 func TestDriveInPlaceGate_DoesNotParkOnTheLastAttempt(t *testing.T) {
@@ -200,7 +244,7 @@ func TestDriveInPlaceGate_DoesNotParkOnTheLastAttempt(t *testing.T) {
 	p := &mockProvider{name: "mock", model: "m", turns: []ChatResult{{Text: "only", InputTokens: 1}}}
 
 	start := time.Now()
-	text, _, _, _, err := driveInPlaceGate(context.Background(), p, nil, testKey, 1, time.Minute, 5*time.Second)
+	text, _, _, _, err := driveInPlaceGate(context.Background(), p, nil, testKey, 1, 1, time.Minute, 5*time.Second)
 	if err != nil {
 		t.Fatalf("driveInPlaceGate: %v", err)
 	}
@@ -221,7 +265,7 @@ func TestDriveInPlaceGate_ParkTimeoutFinishesWithWhatItHas(t *testing.T) {
 	useTempIPC(t)
 	p := &mockProvider{name: "mock", model: "m", turns: []ChatResult{{Text: "unjudged", InputTokens: 1}}}
 
-	text, _, _, _, err := driveInPlaceGate(context.Background(), p, nil, testKey, 5, time.Minute, 300*time.Millisecond)
+	text, _, _, _, err := driveInPlaceGate(context.Background(), p, nil, testKey, 1, 5, time.Minute, 300*time.Millisecond)
 	if err != nil {
 		t.Fatalf("driveInPlaceGate: %v", err)
 	}
@@ -240,7 +284,7 @@ func TestDriveInPlaceGate_StopVerdictEndsTheChain(t *testing.T) {
 		writeVerdict(t, gate, ipc.GateVerdict{Attempt: 1, Action: "stop"})
 	}()
 
-	text, _, _, _, err := driveInPlaceGate(context.Background(), p, nil, testKey, 5, time.Minute, 5*time.Second)
+	text, _, _, _, err := driveInPlaceGate(context.Background(), p, nil, testKey, 1, 5, time.Minute, 5*time.Second)
 	if err != nil {
 		t.Fatalf("driveInPlaceGate: %v", err)
 	}
@@ -263,7 +307,7 @@ func TestDriveInPlaceGate_LoopErrorEndsTheChain(t *testing.T) {
 		turnErr: []error{context.DeadlineExceeded},
 	}
 
-	if _, _, _, _, err := driveInPlaceGate(context.Background(), p, nil, testKey, 5, time.Minute, 5*time.Second); err == nil {
+	if _, _, _, _, err := driveInPlaceGate(context.Background(), p, nil, testKey, 1, 5, time.Minute, 5*time.Second); err == nil {
 		t.Fatal("a failed attempt must surface its error, not park")
 	}
 	if _, err := os.Stat(filepath.Join(output, "result-1.json")); err == nil {
@@ -286,7 +330,7 @@ func TestDriveInPlaceGate_TokenBudgetHaltEndsTheChain(t *testing.T) {
 	}}}
 
 	start := time.Now()
-	text, _, _, _, err := driveInPlaceGate(context.Background(), p, nil, testKey, 5, time.Minute, 5*time.Second)
+	text, _, _, _, err := driveInPlaceGate(context.Background(), p, nil, testKey, 1, 5, time.Minute, 5*time.Second)
 	if err != nil {
 		t.Fatalf("driveInPlaceGate: %v", err)
 	}

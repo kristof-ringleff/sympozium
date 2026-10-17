@@ -338,7 +338,7 @@ There are two ways an attempt is retried, selected by `retry.inPlace`:
 
 | | [In-place retry](#in-place-retry) | [Successor run](#successor-runs) |
 |---|---|---|
-| `retry.inPlace` | `true` (default) | `false` |
+| `retry.inPlace` | `true` | `false` (default) |
 | Conversation | kept — the agent sees its own tool results | rebuilt from a prose card |
 | Workspace | kept | fresh and empty |
 | CR | one run, `status.attempts[]` | one run per attempt, linked by `status.retryOf` |
@@ -356,10 +356,10 @@ spec:
     gateDefault: block
     retry:
       maxAttempts: 3          # total attempts including the first
-      backoff: 30s            # optional delay before the next attempt starts
+      backoff: 30s            # successor runs only: delay before the next one starts
       maxChainTokens: 200000  # cumulative across the chain; 0 = unlimited
       on: [gate]              # which outcomes may trigger a retry
-      inPlace: true           # default: keep the pod and continue the conversation
+      inPlace: true           # keep the pod and continue the conversation (default false)
     postRun:
       - name: build-check
         image: my-org/build-check:latest
@@ -423,10 +423,19 @@ npm run check failed
 <the gate's stdout/stderr>
 ```
 
+`backoff` does not apply here. The parked pod takes the next attempt as soon
+as the verdict arrives.
+
 Parking changes how time is budgeted. `spec.timeout` becomes a **per-attempt**
 budget rather than a whole-run one — waiting on a gate is not the agent working
 — and the Job's deadline is widened to cover every attempt. `maxAttempts` and
 `maxChainTokens` bound the total.
+
+A runner does not park forever. If no verdict arrives within the gate's
+budget plus five minutes, it ends the run with the attempt it has. A `retry`
+verdict that arrives after that has no pod to go to, so the run resolves on
+the last attempt as a `reject`. A gate Job that never appears is handled the
+same way as one that fails.
 
 Because both attempts share one `/workspace` PVC (ReadWriteOnce), the gate Job
 is scheduled onto the node already running the parked pod. On an Agent with
@@ -452,7 +461,7 @@ unless it is signed.
 
 #### Successor runs
 
-With `inPlace: false` — or on a backend with no pod to park — the spec is cloned
+With `inPlace: false` (the default) — or on a backend with no pod to park — the spec is cloned
 onto a new AgentRun named `<run>-retry-<n>`, whose task is a card carrying the
 feedback:
 
@@ -524,6 +533,11 @@ A caller blocked on the run it created — an OpenAI-compatible request on
 passes the gate. The retired attempts publish nothing, and the proxy follows
 `status.retryOf` to recognise the successor's completion as the answer to the
 request it is holding.
+
+The task keeps its form. A string task becomes the retry card. A
+[harness](../modes/harness.md) task stays a harness task on the same runtime,
+with the card as its `prompt`. A task with no prompt, such as `sidecar-driven`,
+is re-run unchanged.
 
 The gate verdict annotation is deliberately *not* carried: a successor
 inheriting it would resolve against its predecessor's verdict before running.
@@ -601,10 +615,12 @@ one that decides on a timer.
 
 In the web UI, gated runs show an amber "Approval" badge on the runs list and an approval bar on the run detail page with Approve and Reject buttons. A warning toast fires when a run requires approval.
 
-For a run in `AwaitingGate` the approval bar names the attempt being judged, and
-the API stamps the submitted verdict with it. A stale tab that still shows
-attempt 1's buttons cannot resolve attempt 2 — the controller drops a verdict
-whose attempt no longer matches.
+For a run in `AwaitingGate` the approval bar names the attempt being judged,
+and sends it as `attempt` with the verdict. If the run has moved on to a later
+attempt, the API refuses the verdict with `409`, so a stale tab that still
+shows attempt 1's buttons cannot approve attempt 2. A caller that leaves
+`attempt` out (a gate hook, which only ever judges the current attempt) gets
+the current one.
 
 Via the API:
 

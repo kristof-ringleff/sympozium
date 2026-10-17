@@ -19,6 +19,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	sympoziumv1alpha1 "github.com/sympozium-ai/sympozium/api/v1alpha1"
+	"github.com/sympozium-ai/sympozium/internal/controller/taskmodes"
 )
 
 // Gate-driven attempt retry: a response gate returning {"action":"retry"} gets a
@@ -391,8 +392,9 @@ func (r *AgentRunReconciler) createRetryRun(
 		},
 		Spec: *agentRun.Spec.DeepCopy(),
 	}
-	successor.Spec.Task = sympoziumv1alpha1.NewStringTask(
-		buildRetryTask(agentRun.Spec.Task.GetPrompt(), agentRun.Status.Result, verdict, attempt, spec.MaxAttempts))
+	successor.Spec.Task = retryTaskFor(agentRun.Spec.Task, func(original string) string {
+		return buildRetryTask(original, agentRun.Status.Result, verdict, attempt, spec.MaxAttempts)
+	})
 
 	if err := r.Create(ctx, successor); err != nil {
 		if !errors.IsAlreadyExists(err) {
@@ -464,6 +466,24 @@ func (r *AgentRunReconciler) retireForRetry(ctx context.Context, agentRun *sympo
 // buildRetryTask produces the card the successor receives. It reuses the
 // handoff card's shape and bounds so both kinds of injected context truncate
 // the same way.
+// retryTaskFor builds the successor's task from the predecessor's. The task
+// keeps its form: a harness task stays a harness task on the same runtime,
+// with the retry card as its prompt. Turned into a string task it would run on
+// agent-runner instead, with different tools and credentials.
+//
+// A task with no prompt (sidecar-driven calls one tool) has nowhere to put
+// the card, so it is re-run unchanged.
+func retryTaskFor(task *sympoziumv1alpha1.TaskSpec, card func(original string) string) *sympoziumv1alpha1.TaskSpec {
+	switch {
+	case task == nil || task.IsString():
+		return sympoziumv1alpha1.NewStringTask(card(task.GetPrompt()))
+	case task.GetMode() == taskmodes.Harness:
+		return taskmodes.WithHarnessPrompt(task, card(taskmodes.HarnessPrompt(task)))
+	default:
+		return task.DeepCopy()
+	}
+}
+
 func buildRetryTask(predecessorTask, predecessorResult string, verdict *gateVerdict, attempt, maxAttempts int) string {
 	originalTask := extractOriginalTask(predecessorTask)
 	if len(originalTask) > handoffTaskMaxChars {

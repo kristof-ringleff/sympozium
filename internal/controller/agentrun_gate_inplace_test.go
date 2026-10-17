@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/go-logr/logr"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -24,19 +26,41 @@ import (
 // with one recorded attempt per completed attempt. That is the only state
 // resolveInPlaceGate is reached from.
 func parkedRun(name string, retry *sympoziumv1alpha1.RetrySpec, attempt int, usagePerAttempt int) *sympoziumv1alpha1.AgentRun {
-	run := gatedRun(name, retry)
+	run := gatedRun(name, inPlace(retry))
 	run.Status.Phase = sympoziumv1alpha1.AgentRunPhaseAwaitingGate
 	run.Status.PostRunJobName = gateJobNameForAttempt(run, attempt)
 	run.Status.Attempt = attempt
 	run.Status.PodName = name + "-pod"
+	now := metav1.Now()
 	for i := 1; i <= attempt; i++ {
-		entry := sympoziumv1alpha1.AttemptStatus{Attempt: i, Result: fmt.Sprintf("attempt %d output", i)}
+		entry := sympoziumv1alpha1.AttemptStatus{Attempt: i, Result: fmt.Sprintf("attempt %d output", i), CompletedAt: &now}
 		if usagePerAttempt > 0 {
 			entry.TokenUsage = &sympoziumv1alpha1.TokenUsage{TotalTokens: usagePerAttempt}
 		}
 		run.Status.Attempts = append(run.Status.Attempts, entry)
 	}
 	return run
+}
+
+// inPlace opts spec into in-place retry, which is off by default.
+func inPlace(spec *sympoziumv1alpha1.RetrySpec) *sympoziumv1alpha1.RetrySpec {
+	if spec != nil {
+		spec.InPlace = boolPtr(true)
+	}
+	return spec
+}
+
+// parkedPod is run's agent pod, its agent container still running: parked.
+// retryReconciler adds one for every run in AwaitingGate.
+func parkedPod(run *sympoziumv1alpha1.AgentRun) *corev1.Pod {
+	return &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: run.Status.PodName, Namespace: run.Namespace},
+		Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "agent"}, {Name: "ipc-bridge"}}},
+		Status: corev1.PodStatus{ContainerStatuses: []corev1.ContainerStatus{{
+			Name:  "agent",
+			State: corev1.ContainerState{Running: &corev1.ContainerStateRunning{}},
+		}}},
+	}
 }
 
 // fakeClientWithPod builds a client that can serve the agent pod as well as
@@ -94,11 +118,11 @@ func attemptMarker(t *testing.T, res ipc.AttemptResult, key []byte) string {
 // log through any string the runner logs.
 func rawAttemptMarker(t *testing.T, res ipc.AttemptResult) string {
 	t.Helper()
-	b, err := json.Marshal(res)
+	marker, err := ipc.FormatAttemptMarker(res)
 	if err != nil {
-		t.Fatalf("marshal attempt result: %v", err)
+		t.Fatalf("format attempt marker: %v", err)
 	}
-	return "some log line\n" + ipc.AttemptMarkerStart + string(b) + ipc.AttemptMarkerEnd + "\nmore logs\n"
+	return "some log line\n" + marker + "\nmore logs\n"
 }
 
 // gateVerdicts returns the verdicts written into run's gate ConfigMap, in
@@ -513,7 +537,7 @@ func TestWorkspaceNeedsPVC(t *testing.T) {
 // this pins that the two conditions really do coincide.
 func TestBuildVolumes_InPlaceRunGetsAWorkspacePVC(t *testing.T) {
 	r := &AgentRunReconciler{}
-	run := gatedRun("vol-1", &sympoziumv1alpha1.RetrySpec{MaxAttempts: 3})
+	run := gatedRun("vol-1", inPlace(&sympoziumv1alpha1.RetrySpec{MaxAttempts: 3}))
 	if !gateInPlaceEnabled(run) {
 		t.Fatal("fixture is not an in-place retry run")
 	}
@@ -541,7 +565,7 @@ func TestBuildVolumes_WorkspaceStaysEmptyDirWithoutHooks(t *testing.T) {
 // retry always has a PVC. If a future change makes retry reachable without one
 // (failure-retry, say), this fails and the PVC condition has to grow with it.
 func TestGateInPlaceAlwaysImpliesAWorkspacePVC(t *testing.T) {
-	run := gatedRun("implies-1", &sympoziumv1alpha1.RetrySpec{MaxAttempts: 2})
+	run := gatedRun("implies-1", inPlace(&sympoziumv1alpha1.RetrySpec{MaxAttempts: 2}))
 	if gateInPlaceEnabled(run) && !workspaceNeedsPVC(run) {
 		t.Error("a run can park for a gate without a persistent workspace")
 	}
@@ -570,15 +594,15 @@ func TestGateInPlaceEnabled_NeedsBothAGateAndRetry(t *testing.T) {
 	if gateInPlaceEnabled(gatedRun("a", nil)) {
 		t.Error("a gate with no retry has nothing to continue into")
 	}
-	noGate := gatedRun("b", &sympoziumv1alpha1.RetrySpec{MaxAttempts: 2})
+	noGate := gatedRun("b", inPlace(&sympoziumv1alpha1.RetrySpec{MaxAttempts: 2}))
 	noGate.Spec.Lifecycle.PostRun[0].Gate = false
 	if gateInPlaceEnabled(noGate) {
 		t.Error("retry with no gate has nothing to park for")
 	}
-	if !gateInPlaceEnabled(gatedRun("c", &sympoziumv1alpha1.RetrySpec{MaxAttempts: 2})) {
+	if !gateInPlaceEnabled(gatedRun("c", inPlace(&sympoziumv1alpha1.RetrySpec{MaxAttempts: 2}))) {
 		t.Error("a gate plus retry must park")
 	}
-	onlyFailure := gatedRun("d", &sympoziumv1alpha1.RetrySpec{MaxAttempts: 2, On: []string{"failure"}})
+	onlyFailure := gatedRun("d", inPlace(&sympoziumv1alpha1.RetrySpec{MaxAttempts: 2, On: []string{"failure"}}))
 	if gateInPlaceEnabled(onlyFailure) {
 		t.Error(`retry on ["failure"] is not gate retry`)
 	}
@@ -587,9 +611,10 @@ func TestGateInPlaceEnabled_NeedsBothAGateAndRetry(t *testing.T) {
 // lifecycle.retry.inPlace is the switch, not the backend name. There is no
 // mutating webhook, so nil has to resolve to the documented default here.
 func TestGateInPlaceEnabled_HonoursTheInPlaceSwitch(t *testing.T) {
-	on := gatedRun("switch-1", &sympoziumv1alpha1.RetrySpec{MaxAttempts: 2})
-	if !gateInPlaceEnabled(on) {
-		t.Error("an unset inPlace must default to parking")
+	// Off by default, so a run that used successor retry keeps it on upgrade.
+	unset := gatedRun("switch-1", &sympoziumv1alpha1.RetrySpec{MaxAttempts: 2})
+	if gateInPlaceEnabled(unset) {
+		t.Error("an unset inPlace must default to successor runs")
 	}
 
 	explicit := gatedRun("switch-2", &sympoziumv1alpha1.RetrySpec{MaxAttempts: 2, InPlace: boolPtr(true)})
@@ -608,7 +633,7 @@ func TestGateInPlaceEnabled_HonoursTheInPlaceSwitch(t *testing.T) {
 // in sync is the point — a backend that cannot park excludes itself by having
 // no pod, not by being named here.
 func TestGateInPlaceEnabled_SandboxParksToo(t *testing.T) {
-	sandbox := gatedRun("sandbox-1", &sympoziumv1alpha1.RetrySpec{MaxAttempts: 2})
+	sandbox := gatedRun("sandbox-1", inPlace(&sympoziumv1alpha1.RetrySpec{MaxAttempts: 2}))
 	sandbox.Spec.AgentSandbox = &sympoziumv1alpha1.AgentSandboxSpec{Enabled: true}
 	if !gateInPlaceEnabled(sandbox) {
 		t.Error("the sandbox backend has a pod to park and must behave like the Job backend")
@@ -641,7 +666,7 @@ func TestBuildJob_DeadlineCoversTheWholeChain(t *testing.T) {
 		t.Fatalf("buildJob: %v", err)
 	}
 
-	inplace := gatedRun("dl-2", &sympoziumv1alpha1.RetrySpec{MaxAttempts: 3})
+	inplace := gatedRun("dl-2", inPlace(&sympoziumv1alpha1.RetrySpec{MaxAttempts: 3}))
 	inplaceJob, err := r.buildJob(context.Background(), inplace, false, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("buildJob: %v", err)
@@ -663,7 +688,7 @@ func TestBuildJob_DeadlineCoversTheWholeChain(t *testing.T) {
 // would let it sign a verdict.
 func TestBuildJob_OnlyTheAgentContainerHoldsTheGateKey(t *testing.T) {
 	r := &AgentRunReconciler{}
-	run := gatedRun("key-1", &sympoziumv1alpha1.RetrySpec{MaxAttempts: 3})
+	run := gatedRun("key-1", inPlace(&sympoziumv1alpha1.RetrySpec{MaxAttempts: 3}))
 	job, err := r.buildJob(context.Background(), run, false, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("buildJob: %v", err)
@@ -743,8 +768,9 @@ func TestResolveGate_NeverClonesASuccessorForAnInPlaceChain(t *testing.T) {
 	if len(list.Items) != 1 {
 		t.Fatalf("run count = %d, want 1: resolveGate cloned a successor for a parked run", len(list.Items))
 	}
-	if got := getRun(t, r, "inplace-9"); got.Status.GateVerdict != "retries-exhausted" {
-		t.Errorf("gateVerdict = %q, want retries-exhausted", got.Status.GateVerdict)
+	// Attempt 1 of 9: the chain stopped, but its bounds were not spent.
+	if got := getRun(t, r, "inplace-9"); got.Status.GateVerdict != "rejected" {
+		t.Errorf("gateVerdict = %q, want rejected", got.Status.GateVerdict)
 	}
 }
 
@@ -922,7 +948,7 @@ func TestReconcileAwaitingGate_WaitsForAJobThatIsNotThereYet(t *testing.T) {
 // model-chosen commands.
 func TestBuildJob_OnlyTheAgentContainerMountsTheGateChannel(t *testing.T) {
 	r := &AgentRunReconciler{}
-	run := gatedRun("mount-1", &sympoziumv1alpha1.RetrySpec{MaxAttempts: 3})
+	run := gatedRun("mount-1", inPlace(&sympoziumv1alpha1.RetrySpec{MaxAttempts: 3}))
 	job, err := r.buildJob(context.Background(), run, false, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("buildJob: %v", err)
@@ -963,5 +989,179 @@ func TestBuildJob_OnlyTheAgentContainerMountsTheGateChannel(t *testing.T) {
 		if v.Name == gateChannelVolume {
 			t.Error("a run that never parks got a gate volume")
 		}
+	}
+}
+
+// A successor of an in-place run is created with the attempt label set and
+// inPlace still on. Its runner must publish that attempt, not 1, or
+// checkParkedAttempt never matches its marker.
+func TestBuildJob_AnInPlaceSuccessorStartsAtItsOwnAttempt(t *testing.T) {
+	r := &AgentRunReconciler{}
+	for _, tc := range []struct {
+		name  string
+		label string
+		want  string
+	}{
+		{"first", "", "1"},
+		{"successor", "2", "2"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			run := gatedRun("start-"+tc.name, inPlace(&sympoziumv1alpha1.RetrySpec{MaxAttempts: 3}))
+			if tc.label != "" {
+				run.Labels = map[string]string{retryAttemptLabel: tc.label}
+			}
+			job, err := r.buildJob(context.Background(), run, false, nil, nil, nil, nil)
+			if err != nil {
+				t.Fatalf("buildJob: %v", err)
+			}
+			var got string
+			for _, c := range job.Spec.Template.Spec.Containers {
+				if c.Name == "agent" {
+					got, _ = findEnv(c.Env, "GATE_IN_PLACE_START_ATTEMPT")
+				}
+			}
+			if got != tc.want {
+				t.Errorf("GATE_IN_PLACE_START_ATTEMPT = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// A runner that left its park (park timeout, /ipc/done, a crash) cannot take
+// a retry. Delivering one anyway bumped status.attempt for an attempt that
+// never ran, and the completion path then gated the same output again. The
+// run must resolve on the attempt it has instead.
+func TestResolveInPlaceGate_DoesNotContinueAPodThatLeftItsPark(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		pod  func(*corev1.Pod) bool // false deletes the pod
+	}{
+		{"agent exited", func(p *corev1.Pod) bool {
+			p.Status.ContainerStatuses[0].State = corev1.ContainerState{
+				Terminated: &corev1.ContainerStateTerminated{ExitCode: 0},
+			}
+			return true
+		}},
+		{"pod gone", func(*corev1.Pod) bool { return false }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			name := "left-" + strings.ReplaceAll(tc.name, " ", "-")
+			run := parkedRun(name, &sympoziumv1alpha1.RetrySpec{MaxAttempts: 3}, 1, 100)
+			withVerdict(run, `{"action":"retry","reason":"tests fail"}`)
+			r, _ := retryReconciler(t, run)
+
+			pod := &corev1.Pod{}
+			if err := r.Get(context.Background(), client.ObjectKey{Name: run.Status.PodName, Namespace: run.Namespace}, pod); err != nil {
+				t.Fatalf("get pod: %v", err)
+			}
+			if tc.pod(pod) {
+				if err := r.Status().Update(context.Background(), pod); err != nil {
+					t.Fatalf("update pod: %v", err)
+				}
+			} else if err := r.Delete(context.Background(), pod); err != nil {
+				t.Fatalf("delete pod: %v", err)
+			}
+
+			if _, err := r.reconcileAwaitingGate(context.Background(), logr.Discard(), run); err != nil {
+				t.Fatalf("reconcileAwaitingGate: %v", err)
+			}
+
+			got := getRun(t, r, name)
+			if got.Status.Attempt != 1 {
+				t.Errorf("status.attempt = %d, want 1: attempt 2 never ran", got.Status.Attempt)
+			}
+			switch got.Status.Phase {
+			case sympoziumv1alpha1.AgentRunPhaseRunning, sympoziumv1alpha1.AgentRunPhaseAwaitingGate:
+				t.Errorf("phase = %q, want the run resolved on attempt 1", got.Status.Phase)
+			}
+			for _, v := range gateVerdicts(t, r, run) {
+				if v.Action == ipc.GateVerdictActionContinue {
+					t.Errorf("delivered a continue to a pod that is not parked: %+v", v)
+				}
+			}
+			// One of three attempts ran, so the chain was not exhausted.
+			if got.Status.GateVerdict == "retries-exhausted" {
+				t.Error("gateVerdict = retries-exhausted after 1 of 3 attempts")
+			}
+		})
+	}
+}
+
+// A gate Job that never shows up (create lost, deleted by hand) must not hold
+// the run forever. Past the gate's own budget it resolves as a failed hook.
+func TestReconcileAwaitingGate_GivesUpOnAJobThatNeverAppears(t *testing.T) {
+	run := parkedRun("jobless-3", &sympoziumv1alpha1.RetrySpec{MaxAttempts: 3}, 1, 100)
+	long := metav1.NewTime(time.Now().Add(-(postRunBudget(run.Spec.Lifecycle) + postRunTimeoutGrace + time.Minute)))
+	run.Status.Attempts[0].CompletedAt = &long
+	r, _ := retryReconciler(t, run)
+
+	if _, err := r.reconcileAwaitingGate(context.Background(), logr.Discard(), run); err != nil {
+		t.Fatalf("reconcileAwaitingGate: %v", err)
+	}
+
+	got := getRun(t, r, "jobless-3")
+	if got.Status.Phase == sympoziumv1alpha1.AgentRunPhaseAwaitingGate {
+		t.Fatal("still AwaitingGate long after the gate Job should have reported")
+	}
+	if got.Status.GateVerdict != "error" {
+		t.Errorf("gateVerdict = %q, want error: the gate never ran", got.Status.GateVerdict)
+	}
+	for _, v := range gateVerdicts(t, r, run) {
+		if v.Action == ipc.GateVerdictActionContinue {
+			t.Errorf("continued without a gate verdict: %+v", v)
+		}
+	}
+}
+
+// The model's reply goes inside the marker. A reply that quotes the end
+// marker (say, an answer about this code) must not cut the real marker
+// short, or the gate never starts.
+func TestParseAttemptResultFromLogs_SurvivesAReplyThatQuotesTheEndMarker(t *testing.T) {
+	reply := "the runner ends its marker with " + ipc.AttemptMarkerEnd + " and then a newline"
+	logs := attemptMarker(t, ipc.AttemptResult{Attempt: 1, Status: "success", Response: reply}, testGateKey)
+
+	got := parseAttemptResultFromLogs(logs, 1, testGateKey, logr.Discard())
+	if got == nil || got.Response != reply {
+		t.Fatalf("got %+v, want the attempt with its reply intact", got)
+	}
+}
+
+// Truncation keeps the first 63 characters. Two long run names that share
+// them must still get their own gate Jobs.
+func TestGateJobNameForAttempt_LongNamesThatShareAPrefixDoNotCollide(t *testing.T) {
+	prefix := strings.Repeat("n", 70)
+	a := gateJobNameForAttempt(gatedRun(prefix+"-a", nil), 1)
+	b := gateJobNameForAttempt(gatedRun(prefix+"-b", nil), 1)
+	if a == b {
+		t.Errorf("two runs share the gate Job name %q", a)
+	}
+	for _, n := range []string{a, b} {
+		if len(n) > jobNameMaxLen || !strings.HasSuffix(n, "-gate-1") {
+			t.Errorf("name %q: want at most %d chars ending in -gate-1", n, jobNameMaxLen)
+		}
+	}
+}
+
+// A Job at the gate's name that this run does not own is someone else's
+// verdict source. Treating AlreadyExists as success would gate the attempt
+// on that Job's result.
+func TestStartGateForAttempt_RefusesAGateJobItDoesNotOwn(t *testing.T) {
+	run := parkedRun("foreign-job", &sympoziumv1alpha1.RetrySpec{MaxAttempts: 3}, 1, 100)
+	run.Status.Phase = sympoziumv1alpha1.AgentRunPhaseRunning
+	r, _ := retryReconciler(t, run)
+	foreign := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{
+		Name: gateJobNameForAttempt(run, 1), Namespace: run.Namespace,
+	}}
+	if err := r.Create(context.Background(), foreign); err != nil {
+		t.Fatalf("create foreign Job: %v", err)
+	}
+
+	_, err := r.startGateForAttempt(context.Background(), logr.Discard(), run,
+		&ipc.AttemptResult{Attempt: 1, Status: "success", Response: "done"})
+	if err == nil {
+		t.Fatal("started the gate on a Job this run does not own")
+	}
+	if got := getRun(t, r, "foreign-job"); got.Status.Phase == sympoziumv1alpha1.AgentRunPhaseAwaitingGate {
+		t.Error("run moved to AwaitingGate on a foreign Job")
 	}
 }

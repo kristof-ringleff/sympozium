@@ -279,6 +279,7 @@ export function RunDetailPage() {
                     action: "reject",
                     response: "Rejected by operator",
                     reason: "manual-rejection",
+                    attempt: currentAttempt,
                   },
                 })
               }
@@ -294,7 +295,11 @@ export function RunDetailPage() {
               onClick={() =>
                 gateVerdict.mutate({
                   name: run.metadata.name,
-                  data: { action: "approve", reason: "manual-approval" },
+                  data: {
+                    action: "approve",
+                    reason: "manual-approval",
+                    attempt: currentAttempt,
+                  },
                 })
               }
               disabled={gateVerdict.isPending}

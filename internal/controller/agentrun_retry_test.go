@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -85,6 +86,9 @@ func retryReconciler(t *testing.T, objs ...*sympoziumv1alpha1.AgentRun) (*AgentR
 		builder = builder.WithObjects(o)
 		if hasResponseGateHook(o) {
 			builder = builder.WithObjects(gateSecretFor(o))
+		}
+		if o.Status.Phase == sympoziumv1alpha1.AgentRunPhaseAwaitingGate && o.Status.PodName != "" {
+			builder = builder.WithObjects(parkedPod(o))
 		}
 	}
 	bus := &recordingEventBus{}
@@ -709,5 +713,59 @@ func TestGateRetrySpec_OnDefaultsToGate(t *testing.T) {
 				t.Errorf("gateRetrySpec() enabled = %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+// objectTask decodes raw as an object-form task, the way the apiserver does.
+func objectTask(t *testing.T, raw string) *sympoziumv1alpha1.TaskSpec {
+	t.Helper()
+	var task sympoziumv1alpha1.TaskSpec
+	if err := json.Unmarshal([]byte(raw), &task); err != nil {
+		t.Fatalf("decode task: %v", err)
+	}
+	return &task
+}
+
+// A harness run's successor must stay a harness run. Rebuilt as a string task
+// it ran on agent-runner instead, with the wrong tools and credentials for
+// the task. The card replaces the prompt parameter and is built from it.
+func TestResolveGate_RetryKeepsAHarnessTask(t *testing.T) {
+	run := withVerdict(
+		gatedRun("harness-run", &sympoziumv1alpha1.RetrySpec{MaxAttempts: 3}),
+		`{"action":"retry","reason":"build failed","response":"npm ERR! missing script"}`)
+	run.Spec.Task = objectTask(t, `{"mode":"harness","parameters":{"runtime":"demo-harness","prompt":"Ship the feature"}}`)
+	r, _ := retryReconciler(t, run)
+
+	if _, err := r.resolveGate(context.Background(), logr.Discard(), run, true, false); err != nil {
+		t.Fatalf("resolveGate: %v", err)
+	}
+
+	task := getRun(t, r, "harness-run-retry-2").Spec.Task
+	if task.IsString() || task.GetMode() != "harness" || task.Parameters["runtime"] != "demo-harness" {
+		t.Fatalf("successor task = %+v, want harness mode on runtime demo-harness", task)
+	}
+	for _, want := range []string{"## Retry 2 of 3", "Ship the feature", "here is my first attempt", "build failed"} {
+		if !strings.Contains(task.Parameters["prompt"], want) {
+			t.Errorf("successor prompt is missing %q:\n%s", want, task.Parameters["prompt"])
+		}
+	}
+}
+
+// A task with no prompt to put a card in (sidecar-driven calls one tool) is
+// re-run as it was, not turned into an agent-runner prompt.
+func TestResolveGate_RetryKeepsAPromptlessObjectTask(t *testing.T) {
+	run := withVerdict(
+		gatedRun("sidecar-run", &sympoziumv1alpha1.RetrySpec{MaxAttempts: 3}),
+		`{"action":"retry","reason":"flaky"}`)
+	run.Spec.Task = objectTask(t, `{"mode":"sidecar-driven","tool":"scan","parameters":{"target":"repo"}}`)
+	r, _ := retryReconciler(t, run)
+
+	if _, err := r.resolveGate(context.Background(), logr.Discard(), run, true, false); err != nil {
+		t.Fatalf("resolveGate: %v", err)
+	}
+
+	task := getRun(t, r, "sidecar-run-retry-2").Spec.Task
+	if task.IsString() || task.GetMode() != "sidecar-driven" || task.Tool != "scan" || task.Parameters["target"] != "repo" {
+		t.Errorf("successor task = %+v, want the predecessor's sidecar-driven task unchanged", task)
 	}
 }

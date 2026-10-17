@@ -3322,6 +3322,9 @@ func (r *AgentRunReconciler) buildContainers(
 		agentEnv = append(agentEnv,
 			corev1.EnvVar{Name: "GATE_IN_PLACE_ENABLED", Value: "true"},
 			corev1.EnvVar{Name: "GATE_IN_PLACE_MAX_ATTEMPTS", Value: strconv.Itoa(spec.MaxAttempts)},
+			// Not always 1: a successor created by the clone path (after a
+			// budget halt, say) keeps inPlace and continues the count.
+			corev1.EnvVar{Name: "GATE_IN_PLACE_START_ATTEMPT", Value: strconv.Itoa(currentAttempt(agentRun))},
 			corev1.EnvVar{Name: "GATE_PARK_TIMEOUT", Value: gateParkBudget(agentRun).String()},
 			// The key that signs attempt markers and verdicts. Only this one
 			// key of the gate Secret, and only on the agent container: the
@@ -6718,9 +6721,11 @@ func (r *AgentRunReconciler) resolveGate(
 			// continue, which is the only way a retry verdict reaches here.
 			// Cloning now would give the successor a fresh workspace while the
 			// parked pod holds the real one, and leave two live attempts.
-			exhausted = true
+			// It may have stopped for a reason other than its bounds (the pod
+			// left its park), so ask rather than assume them spent.
+			exhausted, _ = r.inPlaceExhausted(ctx, agentRun, gateRetrySpec(agentRun), currentAttempt(agentRun))
 			log.Info("Gate verdict: retry on an in-place chain that cannot continue",
-				"attempt", currentAttempt(agentRun))
+				"attempt", currentAttempt(agentRun), "exhausted", exhausted)
 		} else {
 			successorName, exhausted = r.tryCreateRetryRun(ctx, log, agentRun, verdict)
 		}

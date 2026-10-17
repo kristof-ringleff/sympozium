@@ -31,6 +31,7 @@ spec:
         retry:
           maxAttempts: 3
           on: ["gate"]
+          inPlace: true
         rbac:
           - apiGroups: ["sympozium.ai"]
             resources: ["agentruns"]

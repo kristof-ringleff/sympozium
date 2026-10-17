@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -46,8 +47,10 @@ import (
 // maxChainTokens and maxAttempts read AgentRun.status, so each attempt is
 // recorded in status.attempts[] as it lands.
 //
-// Pod death (eviction, OOM, node loss) is out of scope. This branches in front
-// of the successor-clone path and leaves it intact.
+// Pod death (eviction, OOM, node loss) is not recovered from. A retry verdict
+// for a pod that is no longer parked resolves the run on the attempt it has
+// (agentStillParked). This branches in front of the successor-clone path and
+// leaves it intact.
 
 const (
 	// gateVerdictAttemptAnnotation records which attempt a manually-submitted
@@ -78,7 +81,8 @@ const (
 //
 // A gate with no retry has nothing to continue into, and retry with no gate has
 // nothing to park for, so both are required. lifecycle.retry.inPlace is the
-// operator's switch on top of that, defaulting on.
+// operator's switch on top of that. It defaults off, so a run written for
+// successor retry keeps that behaviour.
 //
 // Backends are not named here. Every caller is already inside a path that
 // builds or owns a pod, and a backend with no pod to park in cannot reach
@@ -92,7 +96,7 @@ func gateInPlaceEnabled(agentRun *sympoziumv1alpha1.AgentRun) bool {
 	}
 	// There is no mutating webhook, so the kubebuilder default is not
 	// guaranteed to have been applied — resolve nil here (see CLAUDE.md).
-	return spec.InPlace == nil || *spec.InPlace
+	return spec.InPlace != nil && *spec.InPlace
 }
 
 // gateParkBudget is how long one park may last: the gate Job's own budget plus
@@ -129,8 +133,8 @@ func parseAttemptResultFromLogs(logs string, want int, key []byte, log logr.Logg
 		if end < 0 {
 			continue
 		}
-		var parsed ipc.AttemptResult
-		if err := json.Unmarshal([]byte(strings.TrimSpace(payload[:end])), &parsed); err != nil {
+		parsed, err := ipc.ParseAttemptMarker(strings.TrimSpace(payload[:end]))
+		if err != nil {
 			log.V(1).Info("could not parse attempt marker", "err", err)
 			continue
 		}
@@ -269,8 +273,19 @@ func (r *AgentRunReconciler) startGateForAttempt(
 	if err := controllerutil.SetControllerReference(agentRun, gateJob, r.Scheme); err != nil {
 		return ctrl.Result{}, fmt.Errorf("setting owner reference on gate Job: %w", err)
 	}
-	if err := r.Create(ctx, gateJob); err != nil && !errors.IsAlreadyExists(err) {
-		return ctrl.Result{}, fmt.Errorf("creating gate Job for attempt %d: %w", parked.Attempt, err)
+	if err := r.Create(ctx, gateJob); err != nil {
+		if !errors.IsAlreadyExists(err) {
+			return ctrl.Result{}, fmt.Errorf("creating gate Job for attempt %d: %w", parked.Attempt, err)
+		}
+		// A duplicate reconcile already created it. A Job this run does not
+		// own is not its gate, and its result must not judge this attempt.
+		var existing batchv1.Job
+		if err := r.Get(ctx, client.ObjectKeyFromObject(gateJob), &existing); err != nil {
+			return ctrl.Result{}, fmt.Errorf("reading existing gate Job %s: %w", gateJob.Name, err)
+		}
+		if !metav1.IsControlledBy(&existing, agentRun) {
+			return ctrl.Result{}, fmt.Errorf("gate Job %s exists and is not owned by this run", gateJob.Name)
+		}
 	}
 
 	if err := r.updateStatusWithRetry(ctx, agentRun, func(ar *sympoziumv1alpha1.AgentRun) {
@@ -330,11 +345,17 @@ func (r *AgentRunReconciler) pinGateJobToAgentNode(
 // gateJobNameForAttempt gives each attempt's gate its own Job. One shared name
 // would collide with the previous attempt's completed Job, and a Job spec is
 // immutable, so attempt 2 could never be gated.
+//
+// A name too long to fit is cut and given a hash of the run name, as
+// runServiceAccountName does, so two runs that share a long prefix do not
+// share a gate Job.
 func gateJobNameForAttempt(agentRun *sympoziumv1alpha1.AgentRun, attempt int) string {
 	suffix := fmt.Sprintf("-gate-%d", attempt)
 	base := fmt.Sprintf("%s-postrun", agentRun.Name)
 	if len(base)+len(suffix) > jobNameMaxLen {
-		base = strings.TrimRight(base[:jobNameMaxLen-len(suffix)], "-")
+		sum := sha256.Sum256([]byte(agentRun.Name))
+		hash := fmt.Sprintf("-%x", sum[:4])
+		base = strings.TrimRight(base[:jobNameMaxLen-len(suffix)-len(hash)], "-") + hash
 	}
 	return base + suffix
 }
@@ -430,6 +451,13 @@ func (r *AgentRunReconciler) reconcileAwaitingGate(
 		if _, has := agentRun.Annotations["sympozium.ai/gate-verdict"]; has {
 			return r.resolveInPlaceGate(ctx, log, agentRun, agentSucceeded, false)
 		}
+		// Right after Create the cache may not show the Job yet, so wait.
+		// But not past the gate's own budget: a Job that was never created
+		// or was deleted by hand would hold the run forever.
+		if gateStartedLongAgo(agentRun) {
+			log.Info("Gate Job never appeared; resolving as a failed hook", "job", agentRun.Status.PostRunJobName)
+			return r.resolveInPlaceGate(ctx, log, agentRun, agentSucceeded, true)
+		}
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 
@@ -460,6 +488,20 @@ func (r *AgentRunReconciler) reconcileAwaitingGate(
 	}
 
 	return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+}
+
+// gateStartedLongAgo reports whether the current attempt's gate should have
+// reported by now. The anchor is the attempt's CompletedAt, which
+// startGateForAttempt sets before it creates the Job. With no anchor there is
+// no way to bound the wait, so it reports true.
+func gateStartedLongAgo(agentRun *sympoziumv1alpha1.AgentRun) bool {
+	attempt := currentAttempt(agentRun)
+	for _, a := range agentRun.Status.Attempts {
+		if a.Attempt == attempt && a.CompletedAt != nil {
+			return time.Since(a.CompletedAt.Time) > postRunBudget(agentRun.Spec.Lifecycle)+postRunTimeoutGrace
+		}
+	}
+	return true
 }
 
 // resolveInPlaceGate applies a verdict to a parked run.
@@ -498,7 +540,17 @@ func (r *AgentRunReconciler) resolveInPlaceGate(
 		spec := gateRetrySpec(agentRun)
 		exhausted, why := r.inPlaceExhausted(ctx, agentRun, spec, attempt)
 		if !exhausted {
-			return r.startNextAttempt(ctx, log, agentRun, verdict, spec, attempt)
+			// Only a parked runner reads the verdict. One that left its park
+			// (park timeout, /ipc/done, a crash) would never run the next
+			// attempt, and moving to Running would gate this output again.
+			parked, err := r.agentStillParked(ctx, agentRun)
+			if err != nil {
+				return ctrl.Result{}, err
+			}
+			if parked {
+				return r.startNextAttempt(ctx, log, agentRun, verdict, spec, attempt)
+			}
+			why = "the agent pod is no longer parked"
 		}
 		log.Info("Gate verdict: retry, but the chain cannot continue", "reason", why, "attempt", attempt)
 	}
@@ -507,6 +559,32 @@ func (r *AgentRunReconciler) resolveInPlaceGate(
 	// continued run ends in the same state a single-attempt gated run does.
 	r.publishGateStop(ctx, agentRun, attempt)
 	return r.resolveGate(ctx, log, agentRun, agentSucceeded, hookFailed)
+}
+
+// agentStillParked reports whether the agent pod can still take a verdict:
+// it exists, is not being deleted, and its agent container has not exited.
+func (r *AgentRunReconciler) agentStillParked(ctx context.Context, agentRun *sympoziumv1alpha1.AgentRun) (bool, error) {
+	if agentRun.Status.PodName == "" {
+		return false, nil
+	}
+	var pod corev1.Pod
+	if err := r.Get(ctx, client.ObjectKey{Namespace: agentRun.Namespace, Name: agentRun.Status.PodName}, &pod); err != nil {
+		if errors.IsNotFound(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("reading the agent pod: %w", err)
+	}
+	if pod.DeletionTimestamp != nil {
+		return false, nil
+	}
+	for _, cs := range pod.Status.ContainerStatuses {
+		if cs.Name == "agent" {
+			return cs.State.Terminated == nil, nil
+		}
+	}
+	// No status for the agent container yet means it has not started, which
+	// a pod that already published an attempt cannot be.
+	return false, nil
 }
 
 // verdictAppliesToAttempt reports whether the pending verdict targets the

@@ -233,11 +233,12 @@ func TestRunRetryFieldsRoundTrip(t *testing.T) {
 		t.Errorf("on = %v, want [gate]", retry.On)
 	}
 	// inPlace is the switch the controller reads to decide between parking and
-	// a successor run. An unset field must come back defaulted to true, not nil.
+	// a successor run. An unset field must come back defaulted to false, not
+	// nil, so a run written for successor retry keeps it.
 	if retry.InPlace == nil {
 		t.Error("retry.inPlace was not defaulted by the apiserver")
-	} else if !*retry.InPlace {
-		t.Errorf("retry.inPlace = %v, want the documented default true", *retry.InPlace)
+	} else if *retry.InPlace {
+		t.Errorf("retry.inPlace = %v, want the documented default false", *retry.InPlace)
 	}
 
 	// Assert on the object the apiserver returns from the status write rather
@@ -334,6 +335,7 @@ func TestPolicyRetryCeilingRoundTrips(t *testing.T) {
 // sum an empty slice and an operator-owned budget would silently stop being
 // enforced.
 func TestGateInPlaceAttemptsRoundTrip(t *testing.T) {
+	inPlace := true // off by default
 	ns := createTestNamespace(t)
 
 	run := &sympoziumv1alpha1.AgentRun{
@@ -343,7 +345,7 @@ func TestGateInPlaceAttemptsRoundTrip(t *testing.T) {
 			Task:     sympoziumv1alpha1.NewStringTask("Verify attempts round-trip"),
 			Lifecycle: &sympoziumv1alpha1.LifecycleHooks{
 				GateDefault: "block",
-				Retry:       &sympoziumv1alpha1.RetrySpec{MaxAttempts: 3, On: []string{"gate"}},
+				Retry:       &sympoziumv1alpha1.RetrySpec{MaxAttempts: 3, On: []string{"gate"}, InPlace: &inPlace},
 				PostRun: []sympoziumv1alpha1.LifecycleHookContainer{
 					{Name: "check", Image: "check:latest", Gate: true},
 				},
@@ -404,6 +406,7 @@ func TestGateInPlaceAttemptsRoundTrip(t *testing.T) {
 // retried attempt reads back an empty workspace — every artifact it is meant to
 // correct gone at exactly the moment it is needed.
 func TestGateInPlaceWorkspaceIsAPVC(t *testing.T) {
+	inPlace := true // off by default
 	ns := createTestNamespace(t)
 	agentName := "sys-inplace-pvc-agent"
 
@@ -431,7 +434,7 @@ func TestGateInPlaceWorkspaceIsAPVC(t *testing.T) {
 			},
 			Lifecycle: &sympoziumv1alpha1.LifecycleHooks{
 				GateDefault: "block",
-				Retry:       &sympoziumv1alpha1.RetrySpec{MaxAttempts: 3, On: []string{"gate"}},
+				Retry:       &sympoziumv1alpha1.RetrySpec{MaxAttempts: 3, On: []string{"gate"}, InPlace: &inPlace},
 				PostRun: []sympoziumv1alpha1.LifecycleHookContainer{
 					{Name: "check", Image: "check:latest", Gate: true},
 				},

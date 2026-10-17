@@ -3,6 +3,7 @@ package ipc
 import (
 	"crypto/hmac"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 )
@@ -32,6 +33,30 @@ const (
 	AttemptMarkerStart = "__SYMPOZIUM_ATTEMPT__"
 	AttemptMarkerEnd   = "__SYMPOZIUM_ATTEMPT_END__"
 )
+
+// FormatAttemptMarker renders r for the log: the base64 of its JSON between
+// the two markers. The payload holds the model's reply, and base64 has no
+// underscore, so no reply can end the marker early by quoting
+// AttemptMarkerEnd.
+func FormatAttemptMarker(r AttemptResult) (string, error) {
+	b, err := json.Marshal(r)
+	if err != nil {
+		return "", err
+	}
+	return AttemptMarkerStart + base64.StdEncoding.EncodeToString(b) + AttemptMarkerEnd, nil
+}
+
+// ParseAttemptMarker decodes the payload FormatAttemptMarker put between the
+// markers. It does not verify the MAC.
+func ParseAttemptMarker(payload string) (AttemptResult, error) {
+	var r AttemptResult
+	b, err := base64.StdEncoding.DecodeString(payload)
+	if err != nil {
+		return r, err
+	}
+	err = json.Unmarshal(b, &r)
+	return r, err
+}
 
 // Sign sets r.MAC to the HMAC of r under key.
 func (r *AttemptResult) Sign(key []byte) error {
