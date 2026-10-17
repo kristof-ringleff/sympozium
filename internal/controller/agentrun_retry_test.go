@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
+	batchv1 "k8s.io/api/batch/v1"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -26,6 +28,14 @@ func retryScheme(t *testing.T) *runtime.Scheme {
 	scheme := runtime.NewScheme()
 	if err := sympoziumv1alpha1.AddToScheme(scheme); err != nil {
 		t.Fatalf("add sympozium scheme: %v", err)
+	}
+	// The gate Secret holding the in-place retry signing key is a core/v1 type.
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add corev1 scheme: %v", err)
+	}
+	// reconcileAwaitingGate reads the gate Job.
+	if err := batchv1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add batchv1 scheme: %v", err)
 	}
 	return scheme
 }
@@ -73,6 +83,9 @@ func retryReconciler(t *testing.T, objs ...*sympoziumv1alpha1.AgentRun) (*AgentR
 		WithStatusSubresource(&sympoziumv1alpha1.AgentRun{})
 	for _, o := range objs {
 		builder = builder.WithObjects(o)
+		if hasResponseGateHook(o) {
+			builder = builder.WithObjects(gateSecretFor(o))
+		}
 	}
 	bus := &recordingEventBus{}
 	return &AgentRunReconciler{

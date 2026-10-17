@@ -1922,11 +1922,32 @@ func (s *Server) authorizeGateVerdict(r *http.Request, run, ns string) bool {
 	}, &secret); err != nil {
 		return false
 	}
+	// Only a Secret this run controls holds its token. The minter replaces a
+	// Secret planted at the predictable name, so the verifier must not accept
+	// one either. Still inside the auth check: a missing run is unauthorized
+	// like everything else here.
+	var owner sympoziumv1alpha1.AgentRun
+	if err := s.client.Get(r.Context(), types.NamespacedName{Name: run, Namespace: ns}, &owner); err != nil {
+		return false
+	}
+	if !metav1.IsControlledBy(&secret, &owner) {
+		return false
+	}
 	expected := secret.Data[controller.GateVerdictSecretKey]
 	if len(expected) == 0 {
 		return false
 	}
 	return subtle.ConstantTimeCompare([]byte(presented), expected) == 1
+}
+
+// gateVerdictAttempt returns the run's current 1-based attempt. status.attempt
+// is 0 on a first attempt that has never been retried, which means the same
+// thing as 1.
+func gateVerdictAttempt(run *sympoziumv1alpha1.AgentRun) int {
+	if run.Status.Attempt >= 1 {
+		return run.Status.Attempt
+	}
+	return 1
 }
 
 func (s *Server) patchRunGateVerdict(w http.ResponseWriter, r *http.Request) {
@@ -1980,8 +2001,12 @@ func (s *Server) patchRunGateVerdict(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if run.Status.Phase != sympoziumv1alpha1.AgentRunPhasePostRunning {
-		http.Error(w, fmt.Sprintf("run is in phase %q, gate verdict can only be set during PostRunning", run.Status.Phase), http.StatusConflict)
+	// AwaitingGate is the in-place retry phase: the pod is parked holding its
+	// conversation while the gate decides, rather than having exited into a
+	// postRun Job. A verdict is equally valid in either.
+	if run.Status.Phase != sympoziumv1alpha1.AgentRunPhasePostRunning &&
+		run.Status.Phase != sympoziumv1alpha1.AgentRunPhaseAwaitingGate {
+		http.Error(w, fmt.Sprintf("run is in phase %q, gate verdict can only be set during PostRunning or AwaitingGate", run.Status.Phase), http.StatusConflict)
 		return
 	}
 
@@ -1990,6 +2015,11 @@ func (s *Server) patchRunGateVerdict(w http.ResponseWriter, r *http.Request) {
 	}
 	verdictJSON, _ := json.Marshal(req)
 	run.Annotations["sympozium.ai/gate-verdict"] = string(verdictJSON)
+	// Stamp the attempt this decision was made against. An in-place retry chain
+	// lives on one CR, so without it a browser tab still showing attempt 1's
+	// controls could resolve attempt 2. The controller drops a verdict whose
+	// stamp does not match the attempt awaiting one.
+	run.Annotations["sympozium.ai/gate-verdict-attempt"] = strconv.Itoa(gateVerdictAttempt(&run))
 
 	if err := s.client.Update(r.Context(), &run); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)

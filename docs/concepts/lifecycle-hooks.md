@@ -20,6 +20,10 @@ AgentRun created
     → Lifecycle RBAC garbage-collected (owner reference)
 ```
 
+A [response gate](#response-gate) with `lifecycle.retry` replaces `PostRunning`
+with `AwaitingGate` and can loop back to `Running` — see
+[in-place retry](#in-place-retry).
+
 ### PreRun Hooks
 
 PreRun hooks execute as **init containers** before the agent starts. They have access to:
@@ -328,8 +332,21 @@ message. `retry` instead feeds the gate's output back to the agent as a **new
 attempt**, so the agent can fix what the gate objected to.
 
 This is not the Job's `backoffLimit` (which is disabled). That replays the pod
-with an identical task and no knowledge of why the last attempt was rejected. A
-retry attempt is a fresh AgentRun whose task carries the feedback.
+with an identical task and no knowledge of why the last attempt was rejected.
+
+There are two ways an attempt is retried, selected by `retry.inPlace`:
+
+| | [In-place retry](#in-place-retry) | [Successor run](#successor-runs) |
+|---|---|---|
+| `retry.inPlace` | `true` (default) | `false` |
+| Conversation | kept — the agent sees its own tool results | rebuilt from a prose card |
+| Workspace | kept | fresh and empty |
+| CR | one run, `status.attempts[]` | one run per attempt, linked by `status.retryOf` |
+
+In-place retry needs a pod to park in. The Job and
+[Agent Sandbox](agent-sandbox.md) backends both have one and behave
+identically; [Celln](celln-backend.md) dispatches to a remote executor and has
+no pod, so it always uses successor runs whatever `inPlace` says.
 
 Enable it with `lifecycle.retry`:
 
@@ -342,6 +359,7 @@ spec:
       backoff: 30s            # optional delay before the next attempt starts
       maxChainTokens: 200000  # cumulative across the chain; 0 = unlimited
       on: [gate]              # which outcomes may trigger a retry
+      inPlace: true           # default: keep the pod and continue the conversation
     postRun:
       - name: build-check
         image: my-org/build-check:latest
@@ -365,7 +383,78 @@ spec:
 The verdict goes over the API, so `response` carries the build log as-is —
 no annotation escaping, and no `jq -Rs` to wrap it in.
 
-The successor attempt receives a structured card in place of its task:
+#### In-place retry
+
+The agent pod stays alive across the gate cycle. Instead of exiting after its
+answer, the agent-runner **parks**: it publishes the attempt, holds its open
+conversation with the model, and waits.
+
+```
+Running        agent works, then parks and publishes the attempt
+AwaitingGate   the gate Job judges it, reading the same /workspace
+retry          verdict is delivered to the pod, status.attempt++, back to Running
+approve
+reject         pod is released, run resolves as usual
+rewrite
+```
+
+The verdict arrives as the next **user turn** in the conversation that produced
+the rejected answer, so the model keeps:
+
+- **its own reasoning and tool results** — it corrects work it can still see,
+  rather than re-deriving it from a summary
+- **`/workspace`** — every file it wrote, and anything a preRun hook put there
+- **warm state** — sidecars, MCP connections, and the provider's prefix cache
+
+The turn it receives is short, because the conversation already holds the task
+and the previous answer:
+
+```
+## Attempt 2 of 3
+
+Your previous response was rejected by the response gate. Your earlier work is
+still here — the files you wrote and the tool results above are unchanged, so
+correct that work rather than starting over.
+
+### Why It Was Rejected
+npm run check failed
+
+### Gate Output
+<the gate's stdout/stderr>
+```
+
+Parking changes how time is budgeted. `spec.timeout` becomes a **per-attempt**
+budget rather than a whole-run one — waiting on a gate is not the agent working
+— and the Job's deadline is widened to cover every attempt. `maxAttempts` and
+`maxChainTokens` bound the total.
+
+Because both attempts share one `/workspace` PVC (ReadWriteOnce), the gate Job
+is scheduled onto the node already running the parked pod. On an Agent with
+`workspace.perSessionPVC`, that PVC is the session's, so the gate reads the
+same files the agent wrote.
+
+The parked attempt reaches the controller as a marker in the agent's log. The
+verdict goes back through a ConfigMap, `<run>-gate`, which the controller
+creates with the run and the agent container mounts read-only at `/gate`. No
+other container mounts it. After each write the controller touches an
+annotation on the pod, so kubelet refreshes the mount at once (under a second)
+rather than on its periodic sync (about a minute). No event bus is involved.
+
+The model cannot speak for the gate. The parked attempt and the verdict that
+answers it are both signed with a per-run key. The controller keeps that key
+in the run's gate Secret and hands it only to the agent-runner process, as an
+env var on the agent container. The model never sees it: its tools cannot
+read the runner's environment, and the gate hook and skill sidecars do not
+receive the key at all. So although the model can write to the log, it cannot
+announce an attempt early or report its own token count. It cannot write to
+`/gate` at all, and a verdict someone else puts in the ConfigMap is ignored
+unless it is signed.
+
+#### Successor runs
+
+With `inPlace: false` — or on a backend with no pod to park — the spec is cloned
+onto a new AgentRun named `<run>-retry-<n>`, whose task is a card carrying the
+feedback:
 
 ```
 ## Retry 2 of 3
@@ -383,24 +472,40 @@ npm run check failed
 <the gate's stdout/stderr>
 ```
 
-Gate output is clipped to 4000 characters, with the clip announced in the card.
-Set `SYMPOZIUM_RETRY_GATE_OUTPUT_MAX_CHARS` on the controller to change it — a
-test-suite dump needs more room than a lint summary.
+The successor gets a fresh workspace, so a retry that depends on files the
+previous attempt wrote needs in-place retry.
+
+In both modes gate output is clipped to 4000 characters, with the clip announced
+in the card. Set `SYMPOZIUM_RETRY_GATE_OUTPUT_MAX_CHARS` on the controller to
+change it — a test-suite dump needs more room than a lint summary.
 
 #### Inspecting a chain
 
-Each attempt is named `<run>-retry-<n>` and records its lineage in
-`status.attempt` / `status.retryOf`, plus labels for querying:
+An in-place chain is one AgentRun. Each attempt is an entry in
+`status.attempts[]` with its own result, verdict, tokens and cost:
+
+```bash
+kubectl get agentrun my-run -o jsonpath='{.status.attempts[*].gateVerdict}{"\n"}'
+# retried retried approved
+```
+
+`status.attempt` is the current attempt, and `status.tokenUsage` /
+`status.costEstimate` cover the whole chain.
+
+A successor chain is several AgentRuns linked by `status.retryOf`, plus labels
+for querying:
 
 ```bash
 kubectl get agentruns -l sympozium.ai/retry-of=my-run
 kubectl get agentrun my-run-retry-2 -o jsonpath='{.status.retryOf}{"\n"}'
 ```
 
-A superseded attempt ends in the `Failed` phase with
-`status.gateVerdict: retried` and a `Retried` condition naming its successor. It
-publishes nothing — no channel reply, no failure event — because the chain has
-not finished. When the attempts or the token budget run out, the last attempt
+A superseded successor ends in the `Failed` phase with
+`status.gateVerdict: retried` and a `Retried` condition naming its replacement.
+It publishes nothing — no channel reply, no failure event — because the chain
+has not finished.
+
+Either way, when the attempts or the token budget run out the last attempt
 resolves as `retries-exhausted` and `gateDefault` decides whether its output is
 blocked or passed through.
 
@@ -459,8 +564,9 @@ Two further bounds on a gate that always says `retry`:
       maxRetryAttempts: 3
   ```
 
-- `maxChainTokens` caps the cumulative `status.tokenUsage.totalTokens` of every
-  attempt in the chain.
+- `maxChainTokens` caps the cumulative tokens of every attempt in the chain.
+  An in-place chain sums `status.attempts[].tokenUsage`; a successor chain walks
+  `status.retryOf`. Both are checked **before** the next attempt starts.
 
 ### Manual (Human-in-the-Loop) Approval
 
@@ -494,6 +600,11 @@ human's verdict, so pair manual approval with a hook that waits rather than
 one that decides on a timer.
 
 In the web UI, gated runs show an amber "Approval" badge on the runs list and an approval bar on the run detail page with Approve and Reject buttons. A warning toast fires when a run requires approval.
+
+For a run in `AwaitingGate` the approval bar names the attempt being judged, and
+the API stamps the submitted verdict with it. A stale tab that still shows
+attempt 1's buttons cannot resolve attempt 2 — the controller drops a verdict
+whose attempt no longer matches.
 
 Via the API:
 
@@ -542,6 +653,7 @@ want holding Kubernetes credentials. With the per-run token it holds none.
 | State | Web UI Indicator |
 |-------|-----------------|
 | Awaiting approval | Amber "Approval" badge on runs list, amber approval bar on detail page |
+| Parked mid-chain | Amber `AwaitingGate` phase, plus an attempt timeline on the detail page |
 | Approved | Green "approved" banner on detail page |
 | Rejected | Red "rejected" banner on detail page |
 | Rewritten | Blue "rewritten" banner on detail page |
@@ -556,6 +668,9 @@ Lifecycle hooks work with both standard Job mode and [Agent Sandbox](agent-sandb
 - **PreRun hooks** are injected as init containers into the Sandbox CR — they execute inside the gVisor/Kata sandbox.
 - **PostRun hooks** always run as a separate follow-up Job (outside the sandbox), since the sandbox is torn down after the agent completes.
 - The workspace PVC is shared between both.
+- **Gate retry** works the same as on the Job backend, including
+  [in-place retry](#in-place-retry) — the sandbox pod is rendered from the
+  same template and parks the same way.
 
 ## Phases
 
@@ -564,5 +679,13 @@ With lifecycle hooks, the AgentRun phase transitions become:
 `Pending` → `Running` → `PostRunning` → `Succeeded` (or `Failed`)
 
 The `PostRunning` phase is only entered when `postRun` hooks are defined. Without them, the flow is the standard `Pending` → `Running` → `Succeeded`/`Failed`.
+
+A gate with `lifecycle.retry` and `inPlace` uses `AwaitingGate` instead, and
+loops while the gate keeps saying `retry`:
+
+`Pending` → `Running` → `AwaitingGate` → (`Running` → `AwaitingGate`)* → `Succeeded` (or `Failed`)
+
+`AwaitingGate` means the pod is alive and parked — the same shape as
+`AwaitingDelegate`, which blocks a live pod on an external result.
 
 When a preRun hook [skips the run](#skipping-a-run), the flow short-circuits to the terminal `Skipped` phase: `Pending` → `Running` → `Skipped` (postRun hooks are bypassed).
