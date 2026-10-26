@@ -9,7 +9,7 @@
 # FAKE_MODEL_TLS_SECRET names a kubernetes.io/tls Secret in TEST_NAMESPACE:
 # the fixture then serves HTTPS with it (as a provider receiving a key must)
 # on Service port 443, so its origin carries no port, as a mediated route's
-# must; e.g. the mediated-fleet journey's key canary. FAKE_MODEL_NAME names
+# must; e.g. the fleet journey's key canary (test-celln-fleet.sh). FAKE_MODEL_NAME names
 # the Deployment and Service (default fake-model).
 set -euo pipefail
 

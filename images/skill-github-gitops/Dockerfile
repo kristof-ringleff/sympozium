@@ -10,6 +10,7 @@ RUN apk add --no-cache \
     git \
     jq \
     openssh-client \
+    openssl \
     ca-certificates \
     tar \
     && true

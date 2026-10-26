@@ -72,8 +72,8 @@ export function CellnAgentConversation({
         agentRef: agent.metadata.name,
         task: text,
         backend: "celln",
-        // A fleet profile binds its persona; the run must carry it verbatim.
-        ...(platformProfile?.systemPrompt ? { systemPrompt: platformProfile.systemPrompt } : {}),
+        // The persona is the Agent's (execution.systemPrompt), else the fleet's
+        // default; the server fills it, so the run names none here.
         model: model || undefined,
         modelConnectionRef,
         provider,

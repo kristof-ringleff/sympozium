@@ -21,7 +21,6 @@ describe("Live enduring Celln creation", () => {
     cy.get('[data-testid="celln-parent-system-prompt"]').type(persona, { parseSpecialCharSequences: false, delay: 0 });
     if (starter) {
       cy.contains("button", "Use approved starter tools (3/3)", { timeout: 15000 }).scrollIntoView().should("be.enabled").click();
-      cy.get('[data-testid="celln-permission-preview"]').should("contain", "Run files: read").and("contain", "example.com");
     } else {
       cy.contains("label", "uppercase").find('input[type="checkbox"]').check();
     }

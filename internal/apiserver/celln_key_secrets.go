@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"regexp"
 	"sort"
 
 	api "github.com/sympozium-ai/sympozium/api/v1alpha1"
@@ -36,8 +37,8 @@ func (s *Server) listCellnKeySecrets(w http.ResponseWriter, r *http.Request) {
 		ns = "default"
 	}
 	key := r.URL.Query().Get("key")
-	if key != connectionSecretKey("anthropic-messages") && key != connectionSecretKey("openai-chat") {
-		http.Error(w, "key must be ANTHROPIC_API_KEY or OPENAI_API_KEY", http.StatusBadRequest)
+	if !secretKeyName.MatchString(key) {
+		http.Error(w, "key must name a provider key, e.g. OPENAI_API_KEY, ANTHROPIC_API_KEY or API_KEY", http.StatusBadRequest)
 		return
 	}
 	var secrets corev1.SecretList
@@ -77,6 +78,11 @@ func holdsModelKey(secret *corev1.Secret, key string) bool {
 	return len(secret.Data[key]) != 0
 }
 
+// secretKeyName is the shape of a model key's Secret key this endpoint will
+// look for: a provider key or token name, never an arbitrary key, so the
+// listing cannot be used to learn which Secrets hold some other value.
+var secretKeyName = regexp.MustCompile(`^(?:[A-Z][A-Z0-9_]{0,120}_)?(?:API_KEY|TOKEN|KEY)$`)
+
 // cellnConnectionSecret is the authRefs grant for the Secret a native Celln
 // Agent's own connection uses, after checking it exists and holds the key the
 // connection's protocol fixes. Nil for a connection without a Secret (a host
@@ -89,7 +95,7 @@ func (s *Server) cellnConnectionSecret(ctx context.Context, namespace, connectio
 	if connection.Spec.SecretRef == "" {
 		return nil, nil
 	}
-	key := connectionSecretKey(connection.Spec.Protocol)
+	key := connection.Spec.CredentialSecretKey()
 	var secret corev1.Secret
 	if err := s.client.Get(ctx, types.NamespacedName{Namespace: namespace, Name: connection.Spec.SecretRef}, &secret); err != nil {
 		if k8serrors.IsNotFound(err) {

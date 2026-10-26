@@ -13,7 +13,7 @@ import (
 
 func fleetValues() []string {
 	return []string{
-		"celln.enabled=true", "celln.allowInsecureHttp=true", "celln.dispatcher.enabled=false",
+		"celln.enabled=true", "celln.allowInsecureHttp=true",
 		"celln.tokenSecret=client", "celln.capabilityTokenSecret=discovery",
 		"celln.router.clientTokenSecret=client", "celln.router.backendTokenSecret=backend",
 		"celln.router.capabilityTokenSecret=discovery", "celln.router.parentTokenSecret=parent",
@@ -24,7 +24,6 @@ func fleetValues() []string {
 		"celln.fleet.package.hash=blake3:" + strings.Repeat("b", 64),
 		"celln.fleet.publisher=ed25519:operator", "celln.fleet.principal=sympozium:celln",
 		"celln.fleet.parentClientsConfigMap=parent-clients",
-		"celln.fleet.parentConfigSecret=registrations",
 	}
 }
 
@@ -51,16 +50,6 @@ func prepareBackends(t *testing.T, spec corev1.PodSpec) (map[string]string, []fl
 		t.Fatalf("FLEET_BACKENDS is not a JSON list: %v: %q", err, env["FLEET_BACKENDS"])
 	}
 	return env, backends
-}
-
-func twoBackendValues() []string {
-	values := fleetValues()
-	return append(values,
-		"celln.fleet.backends[0].name=native", "celln.fleet.backends[0].provider=deepseek", "celln.fleet.backends[0].protocol=openai-chat",
-		"celln.fleet.backends[0].endpoint=https://api.deepseek.com/chat/completions", "celln.fleet.backends[0].model=deepseek-chat",
-		"celln.fleet.backends[1].name=local", "celln.fleet.backends[1].provider=llama-server", "celln.fleet.backends[1].protocol=openai-chat",
-		"celln.fleet.backends[1].endpoint=http://100.81.163.75:8080/v1/chat/completions", "celln.fleet.backends[1].model=qwen.gguf", "celln.fleet.backends[1].allowInsecure=true",
-	)
 }
 
 type fleetRender struct {
@@ -147,16 +136,14 @@ func TestFleetRendersPerNodeOwnersBehindOneGateway(t *testing.T) {
 	if strings.Contains(args, "--max-cells") || !strings.HasPrefix(command, "/bin/sh -ec") || !strings.Contains(command, "/proc/meminfo") || !strings.Contains(command, `--max-cells "$cells"`) || !strings.Contains(command, `--egress-slots "$cells"`) || !strings.Contains(command, "* 75 ))") {
 		t.Fatalf("dispatcher does not size capacity on the node: command=%s args=%s", command, args)
 	}
+	// One model-free backend named native: no endpoint, no credential file,
+	// nothing for a node to hold.
 	prepareEnv, backends := prepareBackends(t, configureSpec)
-	if len(backends) != 1 || backends[0].Name != "native" || backends[0].Endpoint != "" || backends[0].CredentialFile != "/etc/celln-native/credentials/native" || prepareEnv["FLEET_SCOPE"] != "starter" {
-		t.Fatalf("legacy single-backend values must become the one backend named native on Celln's reviewed model route: %+v", backends)
+	if len(backends) != 1 || backends[0].Name != "native" || backends[0].Endpoint != "" || backends[0].CredentialFile != "" || backends[0].Provider != "" || prepareEnv["FLEET_SCOPE"] != "starter" {
+		t.Fatalf("the fleet must configure exactly one model-free backend named native: %+v", backends)
 	}
-	llama, err := renderNativeParent(t, append(fleetValues(), "celln.fleet.model.provider=llama-server", "celln.fleet.model.protocol=openai-chat", "celln.fleet.model.endpoint=http://100.81.163.75:8080/v1/chat/completions", "celln.fleet.model.name=qwen.gguf", "celln.fleet.model.allowInsecure=true"))
-	if err != nil {
-		t.Fatalf("llama-server model render: %v: %s", err, llama)
-	}
-	if _, b := prepareBackends(t, decodeFleet(t, llama).daemonSets["celln-node-configure"].Spec.Template.Spec); len(b) != 1 || b[0].Endpoint != "http://100.81.163.75:8080/v1/chat/completions" || !b[0].AllowInsecure || b[0].Model != "qwen.gguf" || b[0].Protocol != "openai-chat" || b[0].Provider != "llama-server" {
-		t.Fatalf("model route not passed to node preparation: %+v", b)
+	if raw := mustJSON(t, configureSpec); strings.Contains(raw, "model-credentials") || strings.Contains(raw, "backends-extra") {
+		t.Fatal("the configure pod mounts model credentials or an extra backend list")
 	}
 	if prepareEnv["FLEET_LIMIT_LEASE_SECONDS"] != "0" {
 		t.Fatalf("default fleet must keep Celln's reviewed host limits: %v", prepareEnv)
@@ -183,8 +170,8 @@ func TestFleetRendersPerNodeOwnersBehindOneGateway(t *testing.T) {
 	for _, m := range spec.Containers[0].VolumeMounts {
 		mounts[m.Name] = m
 	}
-	if m := mounts["model-credentials"]; m.MountPath != "/etc/celln-native/credentials" || !m.ReadOnly {
-		t.Fatalf("model credentials must mount read-only as one directory keyed by backend: %+v", m)
+	if _, ok := mounts["model-credentials"]; ok {
+		t.Fatal("the dispatcher mounts model credentials; no Celln node holds a model key")
 	}
 	if _, ok := mounts["publisher-credentials"]; ok {
 		t.Fatal("dispatcher must not receive the configuration publishing credential")
@@ -235,24 +222,19 @@ func TestFleetRendersPerNodeOwnersBehindOneGateway(t *testing.T) {
 			t.Fatal("fleet controller must not mount host state")
 		}
 	}
-	if len(controller.InitContainers) != 1 || controller.Volumes == nil {
-		t.Fatal("fleet controller lacks the journal preparation step")
-	}
-	claimed := false
+	// The fleet's parents are issued and journaled by the node that owns them;
+	// the controller keeps no parent journal, claim or registrations of its own.
 	for _, v := range controller.Volumes {
-		if v.PersistentVolumeClaim != nil && v.PersistentVolumeClaim.ClaimName == "celln-parent-journal" {
-			claimed = true
+		if v.PersistentVolumeClaim != nil {
+			t.Fatalf("fleet controller must not claim storage: %s", v.Name)
 		}
 	}
-	if !claimed {
-		t.Fatal("fleet controller journal must live on a claim")
-	}
-	if _, ok := r.claims["celln-parent-journal"]; !ok {
-		t.Fatal("journal claim not rendered")
+	if _, ok := r.claims["celln-parent-journal"]; ok {
+		t.Fatal("the controller journal claim was removed with the parent plane")
 	}
 	for _, e := range controller.Containers[0].Env {
-		if e.Name == "CELLN_PARENT_CONFIG" && e.Value != "/var/lib/sympozium/celln-parent/approvals" {
-			t.Fatalf("approvals must point at the claim: %s", e.Value)
+		if strings.HasPrefix(e.Name, "CELLN_PARENT_") {
+			t.Fatalf("parent plane wiring remains: %s", e.Name)
 		}
 	}
 }
@@ -274,88 +256,13 @@ func TestFleetRefusesUnsafeConfiguration(t *testing.T) {
 		"celln.fleet.backends[0].name=native,celln.fleet.backends[1].name=native",
 		"celln.fleet.backends[0].name=local,celln.fleet.backends[0].provider=llama-server,celln.fleet.backends[0].protocol=openai-chat,celln.fleet.backends[0].model=q,celln.fleet.backends[0].endpoint=http://10.0.0.5:8080/v1/chat/completions",
 		"celln.fleet.backends[0].name=openai,celln.fleet.backends[0].provider=openai,celln.fleet.backends[0].protocol=openai-chat,celln.fleet.backends[0].endpoint=https://api.openai.com/v1/chat/completions",
-		"celln.dispatcher.enabled=true", "celln.installer.enabled=true", "celln.router.external=true",
-		"controller.replicas=2",
+		"celln.router.external=true",
 	} {
 		t.Run(override, func(t *testing.T) {
 			if raw, err := renderNativeParent(t, append(fleetValues(), strings.Split(override, ",")...)); err == nil {
 				t.Fatalf("unsafe fleet rendered: %s", raw)
 			}
 		})
-	}
-}
-
-func TestFleetWithoutParentConfigPreparesNodesOnly(t *testing.T) {
-	values := fleetValues()
-	values = append(values[:len(values)-1], "celln.fleet.parentConfigSecret=")
-	raw, err := renderNativeParent(t, values)
-	if err != nil {
-		t.Fatalf("render: %v: %s", err, raw)
-	}
-	r := decodeFleet(t, raw)
-	if _, ok := r.daemonSets["celln-node"]; !ok {
-		t.Fatal("nodes must prepare before the controller is wired")
-	}
-	controller := r.deployments["sympozium-controller-manager"].Spec.Template.Spec
-	if len(controller.InitContainers) != 0 {
-		t.Fatal("controller wired before registrations exist")
-	}
-	for _, e := range controller.Containers[0].Env {
-		if e.Name == "CELLN_PARENT_REGISTRATIONS" {
-			t.Fatal("controller wired before registrations exist")
-		}
-	}
-}
-
-func TestFleetConfiguresEveryBackendOnEveryNode(t *testing.T) {
-	raw, err := renderNativeParent(t, twoBackendValues())
-	if err != nil {
-		t.Fatalf("render: %v: %s", err, raw)
-	}
-	r := decodeFleet(t, raw)
-	spec := r.daemonSets["celln-node"].Spec.Template.Spec
-	configureSpec := r.daemonSets["celln-node-configure"].Spec.Template.Spec
-	env, backends := prepareBackends(t, configureSpec)
-	if len(backends) != 2 || backends[0].Name != "native" || backends[1].Name != "local" || env["FLEET_SCOPE"] != "starter" {
-		t.Fatalf("both backends must reach node configuration in order: %+v", backends)
-	}
-	if backends[0].CredentialFile != "/etc/celln-native/credentials/native" || backends[1].CredentialFile != "/etc/celln-native/credentials/local" || backends[1].Provider != "llama-server" || !backends[1].AllowInsecure {
-		t.Fatalf("backend routes drifted: %+v", backends)
-	}
-	// Configuration reads the same Secret only to know when a backend's key
-	// has reached the node; the volume is optional so first boot never blocks.
-	var configureCredentials *corev1.Volume
-	for i := range configureSpec.Volumes {
-		if configureSpec.Volumes[i].Name == "model-credentials" {
-			configureCredentials = &configureSpec.Volumes[i]
-		}
-	}
-	if configureCredentials == nil || configureCredentials.Secret == nil || configureCredentials.Secret.Optional == nil || !*configureCredentials.Secret.Optional {
-		t.Fatalf("configure step must mount the credentials Secret optionally: %+v", configureCredentials)
-	}
-	configureMounts := map[string]corev1.VolumeMount{}
-	for _, m := range configureSpec.Containers[0].VolumeMounts {
-		configureMounts[m.Name] = m
-	}
-	if m, ok := configureMounts["model-credentials"]; !ok || !m.ReadOnly || m.MountPath != "/etc/celln-native/credentials" {
-		t.Fatal("configure step must see the credentials read-only at the owner's path")
-	}
-	var credentials *corev1.Volume
-	for i := range spec.Volumes {
-		if spec.Volumes[i].Name == "model-credentials" {
-			credentials = &spec.Volumes[i]
-		}
-	}
-	if credentials == nil || credentials.Secret == nil || credentials.Secret.SecretName != "celln-fleet-model-credentials" || len(credentials.Secret.Items) != 0 {
-		t.Fatalf("owner must mount the shared credentials Secret whole so new backends' keys arrive without a restart: %+v", credentials)
-	}
-	// The same owner template renders with one backend or two.
-	one := decodeFleet(t, mustRender(t, fleetValues())).daemonSets["celln-node"].Spec.Template
-	if mustJSON(t, one) != mustJSON(t, r.daemonSets["celln-node"].Spec.Template) {
-		t.Fatal("adding a backend changed the owner template; running parents would be restarted")
-	}
-	if r.daemonSets["celln-node-configure"].Spec.Template.Annotations["celln.sympozium.ai/backends"] == decodeFleet(t, mustRender(t, fleetValues())).daemonSets["celln-node-configure"].Spec.Template.Annotations["celln.sympozium.ai/backends"] {
-		t.Fatal("adding a backend did not roll the configuration DaemonSet")
 	}
 }
 

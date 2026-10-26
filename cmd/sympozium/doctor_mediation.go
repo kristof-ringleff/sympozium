@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"reflect"
 	"slices"
 	"strings"
 	"time"
@@ -19,12 +18,8 @@ import (
 	"github.com/sympozium-ai/sympozium/internal/cellninstall"
 )
 
-const (
-	mediatedRouteRemedy = "sympozium install --celln-fleet ... --celln-mediated-route provider=anthropic,protocol=anthropic-messages,origin=https://api.anthropic.com,models=<model>   # or set celln.mediation.routes and run: sympozium celln-mediation apply-routes"
-	applyRoutesRemedy   = "sympozium celln-mediation apply-routes   # appends the declared routes to the scope's policy; removes nothing"
-	// The CA key was discarded, so certificates are renewed by rotating.
-	mediationRotateRemedy = "delete the five mediation objects (docs/guides/celln-mediated-model-access.md, Rotation), run sympozium install, then restart the controller, model gateway and celln-node pods"
-)
+// The CA key was discarded, so certificates are renewed by rotating.
+const mediationRotateRemedy = "delete the five mediation objects (docs/guides/celln-mediated-model-access.md, Rotation), run sympozium install, then restart the controller, model gateway and celln-node pods"
 
 // mediationObjectNames are the bootstrap objects' names: the chart's
 // defaults, or what the release's celln.mediation values name instead.
@@ -44,11 +39,9 @@ func mediationObjectNames(rel *releaseInfo) (controller, gateway, node, trust st
 }
 
 // checkMediation reports whether Agents can use their own provider key on
-// the fleet. Mediation is enabled when the chart rendered the operator's
-// declaration into celln-system; it then needs the bootstrapped trust, a
-// ready model gateway, and at least one auth "secret" route in the scope's
-// policy, because the resolver matches a connection against those routes
-// exactly and refuses everything else.
+// the fleet: the chart recorded the gateway in celln-system, the bootstrapped
+// trust is present and the gateway is ready. There is no route list to
+// check; the Agent's connection is the route.
 func (d *doctor) checkMediation(ctx context.Context, rel *releaseInfo) doctorFinding {
 	const check = "Mediated model access"
 	if installed, err := d.fleetInstalled(ctx); err != nil {
@@ -58,10 +51,10 @@ func (d *doctor) checkMediation(ctx context.Context, rel *releaseInfo) doctorFin
 	}
 	record, err := cellninstall.ReadMediationRecord(ctx, d.client)
 	if err != nil {
-		return doctorFinding{Check: check, Status: statusFail, Summary: err.Error(), Remedy: []string{"correct celln.mediation.routes in the release's values and upgrade; the chart refuses the same input"}}
+		return failed(check, err)
 	}
 	if !record.Enabled {
-		return doctorFinding{Check: check, Status: statusPass, Summary: "disabled (celln.mediation.enabled=false): fleet backends serve every run; a run on an Agent's own Secret-backed ModelConnection is held with ScopedDispatchDisabled"}
+		return doctorFinding{Check: check, Status: statusFail, Summary: "the release records no model gateway (ConfigMap celln-system/celln-mediation): Celln Agents have no model path", Remedy: []string{"sympozium install   # wires the model gateway and bootstraps its trust"}}
 	}
 	f := doctorFinding{Check: check, Status: statusPass}
 	raise := func(status string) {
@@ -114,54 +107,31 @@ func (d *doctor) checkMediation(ctx context.Context, rel *releaseInfo) doctorFin
 		f.Details = append(f.Details, doctorDetail{Object: "Deployment " + helmNamespace + "/" + name, Problem: "not ready; ready means PostgreSQL, RBAC and keys were accepted", Remedy: fmt.Sprintf("kubectl -n %s logs deploy/%s", helmNamespace, name)})
 		raise(statusFail)
 	}
-	// The routes that count are the ones in the scope's policy: that is what
-	// the resolver matches, whatever the release declares.
-	var published []sympoziumv1alpha1.CellnExecutionPolicyRoute
-	policyName := ""
+	// The Agent's connection is the route; what the operator may have placed
+	// on it is the policy's origin guardrail, reported so a refusal there is
+	// no surprise.
+	guardrail := ""
 	if facts, err := cellninstall.ReadFleetFacts(ctx, d.client); err == nil {
-		_, policyName, _ = cellninstall.PlatformCatalogueNames(facts.Scope)
+		_, policyName, _ := cellninstall.PlatformCatalogueNames(facts.Scope)
 		var policy sympoziumv1alpha1.CellnExecutionPolicy
 		if err := d.client.Get(ctx, types.NamespacedName{Name: policyName}, &policy); err != nil && !apierrors.IsNotFound(err) && !meta.IsNoMatchError(err) {
 			return failed(check, err)
 		}
-		for _, route := range policy.Spec.Routes {
-			if route.Auth == "secret" || route.Auth == "none" {
-				published = append(published, route)
-			}
+		switch {
+		case len(policy.Spec.AllowedOrigins) != 0 && len(policy.Spec.DeniedOrigins) != 0:
+			guardrail = fmt.Sprintf("; policy %s allows keys to go only to %s and never to %s", policyName, strings.Join(policy.Spec.AllowedOrigins, ", "), strings.Join(policy.Spec.DeniedOrigins, ", "))
+		case len(policy.Spec.AllowedOrigins) != 0:
+			guardrail = fmt.Sprintf("; policy %s allows keys to go only to %s", policyName, strings.Join(policy.Spec.AllowedOrigins, ", "))
+		case len(policy.Spec.DeniedOrigins) != 0:
+			guardrail = fmt.Sprintf("; policy %s never lets a key go to %s", policyName, strings.Join(policy.Spec.DeniedOrigins, ", "))
+		case policy.Name != "":
+			guardrail = fmt.Sprintf("; policy %s lets an Agent's own key go to any origin the gateway reaches (narrow it with allowedOrigins/deniedOrigins)", policyName)
 		}
 	}
-	var pending []string
-	for _, declared := range record.Routes {
-		route, err := declared.PolicyRoute()
-		if err == nil && !slices.ContainsFunc(published, func(have sympoziumv1alpha1.CellnExecutionPolicyRoute) bool { return reflect.DeepEqual(have, route) }) {
-			pending = append(pending, fmt.Sprintf("%s/%s", route.Provider, modelsLabel(route.Models)))
-		}
-	}
-	switch {
-	case len(published) == 0 && len(pending) == 0 && !record.MediateBackends:
-		raise(statusWarn)
-		f.Warning = "no auth \"secret\" route is declared or published (celln.mediation.defaultRoutes=false and no routes): Agents with their own key will be refused AUTH_ROUTE_MISMATCH; declare a route with --celln-mediated-route"
-		f.Remedy = append(f.Remedy, mediatedRouteRemedy)
-	case len(pending) != 0 || (len(published) == 0 && record.MediateBackends):
-		raise(statusWarn)
-		what := "celln.mediation.mediateBackends"
-		if len(pending) != 0 {
-			what = strings.Join(pending, ", ")
-		}
-		f.Warning = fmt.Sprintf("declared but not in policy %s yet: %s; until then Agents with their own key for it are refused AUTH_ROUTE_MISMATCH", policyName, what)
-		f.Remedy = append(f.Remedy, applyRoutesRemedy)
-	}
-	routes := make([]string, 0, len(published))
-	for _, route := range published {
-		routes = append(routes, fmt.Sprintf("%s/%s (%s, auth=%s) at %s", route.Provider, modelsLabel(route.Models), route.Protocol, route.Auth, strings.Join(route.EndpointOrigins, "+")))
-	}
-	switch {
-	case f.Status == statusFail:
+	if f.Status == statusFail {
 		f.Summary = fmt.Sprintf("enabled, but %d of its parts are missing or not ready", len(f.Details))
-	case len(routes) == 0:
-		f.Summary = "enabled; trust objects present and the model gateway is ready, but no Agent may bring its own key yet"
-	default:
-		f.Summary = fmt.Sprintf("enabled; trust objects present, the model gateway is ready and policy %s permits: %s", policyName, strings.Join(routes, "; "))
+	} else {
+		f.Summary = "enabled; trust objects present and the model gateway is ready: every Agent brings its own connection and key, pinned to that endpoint's origin" + guardrail
 	}
 	return f
 }

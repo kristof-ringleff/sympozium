@@ -57,7 +57,7 @@ const continuationWithheld = run({
 }, { conversation: { continuation: "automatic", continuesFrom: "hermes-first", depth: 1 } });
 
 const profiles = [{
-  name: "native", revision: "p1", policy: "fleet", model: "qwen3", provider: "llama-server", endpoint: "", credentialProfile: "", systemPrompt: "You are Hermes.",
+  name: "native", revision: "p1", policy: "fleet", model: "", provider: "", endpoint: "", systemPrompt: "You are Hermes.", mediationOnly: true,
   backend: "native", wrapper: "celln-fleet-native", agent: "hermes", tools: [{ name: "web-fetch", revision: "r1" }],
   ceilings: { leaseSeconds: 7200, maxTurns: 16, maxModelRequests: 64, maxOutputTokens: 8192 },
   sessionDefaults: { leaseSeconds: 3600, maxTurns: 8, maxModelRequests: 32, maxOutputTokens: 4096 },
@@ -171,41 +171,51 @@ describe("diagnoseRun", () => {
   // the controller shares the reason code but never the resolver's sentence.
   const SCOPED_REFUSAL = "AUTH_ROUTE_MISMATCH: scoped authority refused before receiver enrollment; no native execution started";
   const ownKeyModel = { connectionRef: "mine-connection", provider: "anthropic", protocol: "anthropic-messages", model: "claude-opus-5", baseURL: "https://api.anthropic.com/v1/messages" };
-  const mediation = (models: string[]): CellnMediation => ({ enabled: true, mediateBackends: false, pending: [],
-    routes: [{ provider: "anthropic", protocol: "anthropic-messages", models, endpointOrigins: ["https://api.anthropic.com"], policy: "celln-fleet-starter", secretKey: "ANTHROPIC_API_KEY" }] });
+  // The namespace's guardrail over an Agent's own connection: origin globs, and
+  // the operator's exact approval of private origins. Empty lists admit any
+  // public origin.
+  const mediation = (overrides: Partial<CellnMediation> = {}): CellnMediation => ({ enabled: true, allowedOrigins: [], deniedOrigins: [], policies: ["celln-fleet-starter"], routes: [], pending: [], ...overrides });
   const scopedRefused = run({ phase: "Failed", error: SCOPED_REFUSAL, conditions: [condition("CellnScopedExecution", "AdmissionRefused", SCOPED_REFUSAL)] }, { model: ownKeyModel });
 
-  it("AUTH_ROUTE_MISMATCH names the provider, model and origin asked and that no declared route matches", () => {
-    const diagnosis = diagnoseRun(scopedRefused, [], { mediation: mediation(["claude-sonnet-5"]) })!;
+  it("AUTH_ROUTE_MISMATCH names the provider, model and origin asked and the policy's globs that refuse the origin", () => {
+    const diagnosis = diagnoseRun(scopedRefused, [], { mediation: mediation({ allowedOrigins: ["api.openai.com"] }) })!;
     expect(diagnosis).to.include({ kind: "admission-refused", code: "AUTH_ROUTE_MISMATCH" });
-    expect(diagnosis.cause).to.contain("anthropic (anthropic-messages)").and.contain("claude-opus-5").and.contain("https://api.anthropic.com").and.contain("no route an operator declared").and.contain("claude-sonnet-5");
+    expect(diagnosis.cause).to.contain("anthropic (anthropic-messages)").and.contain("claude-opus-5").and.contain("https://api.anthropic.com").and.contain("does not admit origin").and.contain("celln-fleet-starter").and.contain("allowed: api.openai.com").and.contain("denied: none");
+    expect(diagnosis.cause).not.to.contain("declared");
     // The controller's boilerplate is evidence, not an explanation.
     expect(diagnosis.cause).not.to.contain("receiver enrollment");
     expect(diagnosis.evidence.join(" ")).to.contain("receiver enrollment");
-    expect(diagnosis.nextSteps[0].label).to.equal("Declare the route, or pick a declared one");
-    expect(diagnosis.nextSteps[0].detail).to.contain("--celln-mediated-route provider=anthropic,protocol=anthropic-messages,origin=https://api.anthropic.com,models=claude-opus-5").and.contain("apply-routes");
+    expect(diagnosis.nextSteps[0].label).to.equal("Use an admitted origin, or ask the operator to admit this one");
+    expect(diagnosis.nextSteps[0].detail).to.contain("allowedOrigins/deniedOrigins").and.not.contain("--celln-mediated-route").and.not.contain("apply-routes");
+    // A denied glob wins, and is named.
+    const denied = diagnoseRun(scopedRefused, [], { mediation: mediation({ deniedOrigins: ["*.anthropic.com"] }) })!;
+    expect(denied.cause).to.contain("denied pattern *.anthropic.com");
   });
 
-  it("AUTH_ROUTE_MISMATCH with a matching declared route points at the connection and the Agent's authRefs", () => {
-    const diagnosis = diagnoseRun(scopedRefused, [], { mediation: mediation(["claude-opus-5"]) })!;
-    expect(diagnosis.cause).to.contain("an operator declared").and.contain("mine-connection").and.contain("authRefs");
+  it("AUTH_ROUTE_MISMATCH with an admitted origin points at the connection and the Agent's authRefs", () => {
+    const diagnosis = diagnoseRun(scopedRefused, [], { mediation: mediation() })!;
+    expect(diagnosis.cause).to.contain("the policy admits").and.contain("mine-connection").and.contain("authRefs");
     expect(diagnosis.nextSteps.map((step) => step.label)).to.deep.equal(["Run on this Agent's own connection", "Delete this run, then start a new one"]);
-    // Without the declared routes nothing is claimed about them.
-    expect(diagnoseRun(scopedRefused)!.cause).to.contain("claude-opus-5").and.contain("must all match one declared route").and.contain("Secret");
+    // A "*." glob admits the bare domain and its subdomains.
+    expect(diagnoseRun(scopedRefused, [], { mediation: mediation({ allowedOrigins: ["*.anthropic.com"] }) })!.cause).to.contain("the policy admits");
+    // Without the policy nothing is claimed about it.
+    expect(diagnoseRun(scopedRefused)!.cause).to.contain("claude-opus-5").and.contain("a route the policy permits").and.contain("Secret");
   });
 
-  it("AUTH_ROUTE_MISMATCH counts an any-model route as declared for any model at its origin, never at another", () => {
-    const anyModel: CellnMediation = { ...mediation(["*"]), routes: mediation(["*"]).routes.map((route) => ({ ...route, anyModel: true })) };
-    const diagnosis = diagnoseRun(scopedRefused, [], { mediation: anyModel })!;
-    expect(diagnosis.cause).to.contain("an operator declared").and.contain("mine-connection");
-    const elsewhere = run({ phase: "Failed", error: SCOPED_REFUSAL, conditions: [condition("CellnScopedExecution", "AdmissionRefused", SCOPED_REFUSAL)] }, { model: { ...ownKeyModel, baseURL: "https://proxy.example/v1/messages" } });
-    expect(diagnoseRun(elsewhere, [], { mediation: anyModel })!.cause).to.contain("no route an operator declared").and.contain("any model");
+  it("AUTH_ROUTE_MISMATCH on a private origin says the operator must approve exactly it, until they have", () => {
+    const local = run({ phase: "Failed", error: SCOPED_REFUSAL, conditions: [condition("CellnScopedExecution", "AdmissionRefused", SCOPED_REFUSAL)] }, { model: { ...ownKeyModel, provider: "ollama", protocol: "openai-chat", model: "qwen3", baseURL: "http://ollama.default.svc:11434/v1/chat/completions" } });
+    const diagnosis = diagnoseRun(local, [], { mediation: mediation() })!;
+    expect(diagnosis.cause).to.contain("http://ollama.default.svc:11434").and.contain("private").and.contain("modelGateway.privateOrigins");
+    expect(diagnosis.nextSteps[0].label).to.equal("Ask the operator to approve the private origin");
+    expect(diagnosis.nextSteps[0].detail).to.contain("exactly http://ollama.default.svc:11434").and.contain("modelGateway.privateOrigins");
+    const approved = diagnoseRun(local, [], { mediation: mediation({ privateOrigins: ["http://ollama.default.svc:11434"] }) })!;
+    expect(approved.cause).to.contain("the policy admits").and.contain("mine-connection");
   });
 
   it("the authRefs refusal says the run named a connection whose Secret the Agent was not given", () => {
     // platform_resolver.go resolveDecisionRoute; shared verbatim on the fleet parent path.
     const message = `Platform policy refused admission (AUTH_ROUTE_MISMATCH): Agent "hermes" does not grant the model connection's Secret; add it to the Agent's authRefs or select the connection in the Agent's execution defaults. ${REFUSAL_TAIL}`;
-    const diagnosis = diagnoseRun(run({ phase: "Pending", conditions: [condition("CellnParentReady", "AdmissionPending", message)] }, { model: ownKeyModel }), [], { mediation: mediation(["claude-opus-5"]) })!;
+    const diagnosis = diagnoseRun(run({ phase: "Pending", conditions: [condition("CellnParentReady", "AdmissionPending", message)] }, { model: ownKeyModel }), [], { mediation: mediation() })!;
     expect(diagnosis.code).to.equal("AUTH_ROUTE_MISMATCH");
     expect(diagnosis.cause).to.contain("mine-connection").and.contain("whose Secret this Agent was not given");
     expect(diagnosis.nextSteps[0].label).to.equal("Run on this Agent's own connection");

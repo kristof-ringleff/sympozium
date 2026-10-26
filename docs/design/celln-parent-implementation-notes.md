@@ -1,5 +1,12 @@
 # Parent/turn implementation inventory — epic #464
 
+> **Superseded (2026-10-22).** The host issuer stack, the in-cluster
+> dispatcher and the native parent plane this inventory describes were
+> removed in 0.12; parents now run only on the model-free fleet and get
+> their model through each Agent's own `ModelConnection`. See
+> [Agent-bound model access](celln-agent-bound-model-access.md). Kept as the
+> record of what existed on 2026-09-08.
+
 Repository inspection, 2026-09-08. This is evidence about the current code and
 the parser and real-guest mailbox slices, not proof of a working multi-turn Harness.
 

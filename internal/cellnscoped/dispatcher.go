@@ -34,17 +34,18 @@ func (d *Dispatcher) Prepare(ctx context.Context, key types.NamespacedName) (*ce
 	if err := d.Store.Reader.Get(ctx, key, &run); err != nil {
 		return nil, err
 	}
-	if run.Spec.ExecutionLifecycle == "enduring" {
-		var namespace corev1.Namespace
-		if err := d.Store.Reader.Get(ctx, types.NamespacedName{Name: key.Namespace}, &namespace); err != nil {
-			return nil, err
-		}
-		incarnation, err := cellnauthority.ScopedParentIncarnation(d.ClusterID, string(namespace.UID), string(run.UID))
-		if err != nil {
-			return nil, err
-		}
-		request.ParentIncarnation = incarnation
+	// Every scoped run gets its parent incarnation: an enduring run is a
+	// parent, and the resolver issues a one-shot with a model on a fleet
+	// profile as a single-turn parent too. A plain one-shot ignores it.
+	var namespace corev1.Namespace
+	if err := d.Store.Reader.Get(ctx, types.NamespacedName{Name: key.Namespace}, &namespace); err != nil {
+		return nil, err
 	}
+	incarnation, err := cellnauthority.ScopedParentIncarnation(d.ClusterID, string(namespace.UID), string(run.UID))
+	if err != nil {
+		return nil, err
+	}
+	request.ParentIncarnation = incarnation
 	return d.Store.Prepare(ctx, key, request)
 }
 
@@ -148,11 +149,27 @@ func CapabilityDecision(decision cellnauthority.PlatformDecision) (cap.Decision,
 // the frozen clock or granting a replacement allowance. Recovery/cleanup must
 // not call this: historical owner authority survives policy withdrawal.
 func (d *Dispatcher) RevalidateAdmission(ctx context.Context, prepared *cellnauthority.StoredPreparation) error {
+	if err := d.PreflightArtifacts(ctx, prepared); err != nil {
+		return err
+	}
+	return d.RevalidateAuthority(ctx, prepared)
+}
+
+// PreflightArtifacts asks the receiver whether its node advertises every
+// contract the decision needs; the first half of RevalidateAdmission.
+func (d *Dispatcher) PreflightArtifacts(ctx context.Context, prepared *cellnauthority.StoredPreparation) error {
 	if d == nil || d.Store.Reader == nil || prepared == nil {
 		return errors.New("scoped admission reader is unavailable")
 	}
-	if err := d.Receiver.PreflightArtifacts(ctx, prepared.Operation.Resolution.Decision); err != nil {
-		return err
+	return d.Receiver.PreflightArtifacts(ctx, prepared.Operation.Resolution.Decision)
+}
+
+// RevalidateAuthority resolves the run again and refuses if the authority
+// the frozen decision was issued under has changed; the second half of
+// RevalidateAdmission.
+func (d *Dispatcher) RevalidateAuthority(ctx context.Context, prepared *cellnauthority.StoredPreparation) error {
+	if d == nil || d.Store.Reader == nil || prepared == nil {
+		return errors.New("scoped admission reader is unavailable")
 	}
 	frozen := prepared.Operation.Resolution
 	frozen.Request = prepared.Operation.ResolveRequest

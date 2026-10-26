@@ -32,13 +32,25 @@ func preflightClient(t *testing.T, objects ...client.Object) client.Client {
 	return fake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).Build()
 }
 
-// defaultInstallValues are the values of a plain `sympozium install`.
-func defaultInstallValues(t *testing.T) map[string]interface{} {
+// testInstallValues are the --set values of a plain `sympozium install` on a
+// build that pins a starter package: the router and the model-free fleet.
+func testInstallValues(t *testing.T) []string {
 	t.Helper()
-	set, err := cellnInstallSetValues(context.Background(), "", "", nil, 1, false)
+	set, _, err := doctorValuesFor(defaultFleetScope, cellnStarter{
+		Image:       "registry.example/celln/starter@sha256:" + strings.Repeat("a", 64),
+		PackageHash: "blake3:" + strings.Repeat("b", 64),
+		Publisher:   "ed25519:test",
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
+	return set
+}
+
+// defaultInstallValues are the values of a plain `sympozium install`.
+func defaultInstallValues(t *testing.T) map[string]interface{} {
+	t.Helper()
+	set := testInstallValues(t)
 	vals, err := buildHelmValues("", set)
 	if err != nil {
 		t.Fatal(err)
@@ -59,11 +71,11 @@ func leftovers() []client.Object {
 		&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: "celln-router-ingress", Namespace: "celln-system"}},
 		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "celln-dispatcher-backend", Namespace: "celln-system"}, Data: map[string][]byte{"token": []byte("kept")}},
 		&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: "celln-router", Namespace: "celln-system"}},
-		&appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: "celln-dispatcher", Namespace: "celln-system"}},
+		&appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Name: "celln-node", Namespace: "celln-system"}},
 		// Properly owned: never a collision.
 		&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: "celln-router", Namespace: "celln-system", Labels: labels, Annotations: annotations}},
 		// Claimed by another release: reported, never adopted automatically.
-		&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: "celln-dispatcher", Namespace: "celln-system", Labels: labels,
+		&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: "celln-node", Namespace: "celln-system", Labels: labels,
 			Annotations: map[string]string{helmReleaseNameAnno: "other", helmReleaseNamespaceAnn: "elsewhere"}}},
 		// Not something the chart creates.
 		&corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "unrelated", Namespace: "celln-system"}},
@@ -96,8 +108,8 @@ func TestOwnershipCollisionsFindsEveryLeftoverInOnePass(t *testing.T) {
 		{"NetworkPolicy celln-system/celln-router-ingress", true, "kubectl label -n celln-system networkpolicy.networking.k8s.io celln-router-ingress app.kubernetes.io/managed-by=Helm"},
 		{"Secret celln-system/celln-dispatcher-backend", true, "kubectl label -n celln-system secret celln-dispatcher-backend"},
 		{"Deployment celln-system/celln-router", false, "kubectl delete -n celln-system deployment.apps celln-router"},
-		{"Deployment celln-system/celln-dispatcher", false, "kubectl delete -n celln-system deployment.apps celln-dispatcher"},
-		{"Service celln-system/celln-dispatcher", false, "kubectl label -n celln-system service celln-dispatcher"},
+		{"DaemonSet celln-system/celln-node", false, "kubectl delete -n celln-system daemonset.apps celln-node"},
+		{"Service celln-system/celln-node", false, "kubectl label -n celln-system service celln-node"},
 	} {
 		t.Run(tc.object, func(t *testing.T) {
 			c, ok := got[tc.object]
@@ -127,7 +139,7 @@ func TestInstallPreflightStopsWithTheCompleteList(t *testing.T) {
 	}
 	for _, want := range []string{
 		"6 object(s)", "nothing was changed", "Namespace celln-system", "NetworkPolicy celln-system/celln-router-ingress",
-		"kubectl delete -n celln-system deployment.apps celln-router", "kubectl delete -n celln-system deployment.apps celln-dispatcher",
+		"kubectl delete -n celln-system deployment.apps celln-router", "kubectl delete -n celln-system daemonset.apps celln-node",
 		"another Helm release claims it", "sympozium install --adopt-existing", "sympozium doctor",
 	} {
 		if !strings.Contains(err.Error(), want) {
@@ -152,7 +164,7 @@ func TestInstallPreflightAdoptsOnlyWhatIsSafe(t *testing.T) {
 	if err == nil {
 		t.Fatal("workloads are never adopted, so the install must still stop")
 	}
-	for _, want := range []string{"3 object(s)", "deployment.apps celln-router", "deployment.apps celln-dispatcher", "Service celln-system/celln-dispatcher"} {
+	for _, want := range []string{"3 object(s)", "deployment.apps celln-router", "daemonset.apps celln-node", "Service celln-system/celln-node"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Fatalf("refusal lacks %q:\n%v", want, err)
 		}
@@ -181,7 +193,7 @@ func TestInstallPreflightAdoptsOnlyWhatIsSafe(t *testing.T) {
 		t.Fatalf("a Deployment must never be adopted: %v %v", err, deployment.Labels)
 	}
 	var other corev1.Service
-	if err := c.Get(ctx, types.NamespacedName{Namespace: "celln-system", Name: "celln-dispatcher"}, &other); err != nil || other.Annotations[helmReleaseNameAnno] != "other" {
+	if err := c.Get(ctx, types.NamespacedName{Namespace: "celln-system", Name: "celln-node"}, &other); err != nil || other.Annotations[helmReleaseNameAnno] != "other" {
 		t.Fatalf("another release's object must be left alone: %v %v", err, other.Annotations)
 	}
 	if !strings.Contains(out.String(), "Adopted Namespace celln-system") {
@@ -189,7 +201,7 @@ func TestInstallPreflightAdoptsOnlyWhatIsSafe(t *testing.T) {
 	}
 
 	// Once the workloads are gone and the foreign Service handed over, a rerun passes.
-	for _, obj := range []client.Object{&deployment, &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Name: "celln-dispatcher", Namespace: "celln-system"}}, &other} {
+	for _, obj := range []client.Object{&deployment, &appsv1.DaemonSet{ObjectMeta: metav1.ObjectMeta{Name: "celln-node", Namespace: "celln-system"}}, &other} {
 		if err := c.Delete(ctx, obj); err != nil {
 			t.Fatal(err)
 		}

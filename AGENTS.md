@@ -201,8 +201,8 @@ TEST_MODEL=gpt-5.2 TEST_TIMEOUT=180 ./test/integration/test-write-file.sh
 | `test-slack-channel.sh` | Slack channel deployment (Socket Mode) |
 | `test-web-proxy-api.sh` | Web proxy API — healthz, auth, models, chat completions (blocking + streaming), MCP SSE |
 | `test-persistent-harness-session.sh` | Persistent AgentHarness session lifecycle |
-| `test-celln-fleet.sh` | Celln fleet on multi-node Kind: backends, one-shot + enduring runs, tools, tenancy, node loss and continuation |
-| `test-celln-oneliner.sh` | Bare `sympozium install` brings up the fleet |
+| `test-celln-fleet.sh` | Model-free Celln fleet on multi-node Kind: install with no model input, two teams' own connections and keys through the API, key canary (each Agent's key and no other), refused key reuse and origin move, package gate, node loss |
+| `test-celln-oneliner.sh` | Bare `sympozium install` brings up the fleet and gateway; `doctor` passes |
 
 `test/integration/` holds many more (API smoke, ensembles, memory, MCP, sandbox, Celln contracts); `make integration-tests` runs the API suite.
 

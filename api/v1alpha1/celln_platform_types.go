@@ -1,8 +1,6 @@
 package v1alpha1
 
 import (
-	"slices"
-
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
@@ -88,12 +86,12 @@ type CellnNativeProvisioning struct {
 	Worker apiextensionsv1.JSON `json:"worker"`
 	// +kubebuilder:pruning:PreserveUnknownFields
 	Template apiextensionsv1.JSON `json:"template"`
+	// ModelProfile is the hash of the pinned model profile of a model the
+	// fleet calls itself. Absent for a model-free profile: its nodes hold no
+	// model and every run brings its own route through the gateway.
 	// +kubebuilder:validation:Pattern=`^blake3:[0-9a-f]{64}$`
-	ModelProfile string `json:"modelProfile"`
-	// CredentialProfile names the owner-installed model credential; a tenant
-	// ModelConnection using this runtime must reference exactly this profile.
-	// +kubebuilder:validation:Pattern=`^[A-Za-z0-9_-]{1,64}$`
-	CredentialProfile string `json:"credentialProfile"`
+	// +optional
+	ModelProfile string `json:"modelProfile,omitempty"`
 	// +kubebuilder:validation:Minimum=1
 	ReservedMemoryBytes int64 `json:"reservedMemoryBytes"`
 	// +kubebuilder:validation:Minimum=1
@@ -175,58 +173,9 @@ type CellnExecutionPolicyTool struct {
 	Limits *CellnToolLimits `json:"limits,omitempty"`
 }
 
-// CellnExecutionPolicyRoute is explicit model endpoint authority. A tenant
-// ModelConnection may choose only a route contained by one of these entries.
-// Models are exact names, or exactly ["*"] (CellnAnyModel) for any model name
-// of the route's provider at its exact endpoint origins; origins are never a
-// pattern, so a key only ever goes to the origins listed here.
-// +kubebuilder:validation:XValidation:rule="!self.models.exists(m, m == '*') || (self.models.size() == 1 && self.auth != 'host-profile')",message="the any-model token '*' must be a route's only model and is not allowed on a host-profile route"
-// +kubebuilder:validation:XValidation:rule="self.endpointOrigins.all(x, x.startsWith('https://') || (x.startsWith('http://') && self.auth in ['none', 'host-profile'] && has(self.allowInsecure) && self.allowInsecure))",message="Secret routes require https; http requires auth none or host-profile and explicit allowInsecure"
-type CellnExecutionPolicyRoute struct {
-	// +kubebuilder:validation:MinLength=1
-	// +kubebuilder:validation:MaxLength=64
-	Provider string `json:"provider"`
-	// +kubebuilder:validation:Enum=openai-chat;anthropic-messages
-	Protocol string `json:"protocol"`
-	// +kubebuilder:validation:MinItems=1
-	// +kubebuilder:validation:MaxItems=32
-	// +listType=set
-	Models []string `json:"models"`
-	// +kubebuilder:validation:MinItems=1
-	// +kubebuilder:validation:MaxItems=16
-	// +listType=set
-	EndpointOrigins []string `json:"endpointOrigins"`
-	// +kubebuilder:validation:Enum=secret;none;host-profile
-	Auth string `json:"auth"`
-	// AllowInsecure approves plain-HTTP or private endpoint origins for a
-	// keyless or host-profile route (for example a LAN llama-server).
-	// A cluster Secret route can never use plain HTTP.
-	// +optional
-	AllowInsecure bool `json:"allowInsecure,omitempty"`
-}
-
-// CellnAnyModel is the only model pattern a route may declare, and only as its
-// sole model: any model name the route's provider serves at the route's exact
-// origins. A decision still binds the run's concrete model.
+// CellnAnyModel is the token a route-era policy used for "any model". A run
+// still never binds it as a concrete model name.
 const CellnAnyModel = "*"
-
-// AnyModel reports that the route admits any model name (models ["*"]).
-func (r CellnExecutionPolicyRoute) AnyModel() bool {
-	return len(r.Models) == 1 && r.Models[0] == CellnAnyModel
-}
-
-// AllowsModel reports whether the route admits a concrete model: one of its
-// exact names, or, for an any-model route, any valid model identifier other
-// than the token itself (the rules ModelConnectionSpec.Validate applies).
-func (r CellnExecutionPolicyRoute) AllowsModel(model string) bool {
-	if model == "" || model == CellnAnyModel {
-		return false
-	}
-	if r.AnyModel() {
-		return ValidModelIdentifier(model)
-	}
-	return slices.Contains(r.Models, model)
-}
 
 type CellnExecutionPolicyCeilings struct {
 	// +kubebuilder:validation:Minimum=1
@@ -247,7 +196,8 @@ type CellnExecutionPolicyCeilings struct {
 }
 
 // CellnExecutionPolicySpec maps protected namespace labels to an intersection of
-// exact catalogue revisions, model routes, lifecycle modes, and hard ceilings.
+// exact catalogue revisions, lifecycle modes, and hard ceilings. An Agent's
+// ModelConnection is its model route; AllowedOrigins/DeniedOrigins narrow it.
 // Empty tools means no tool authority; it does not make an otherwise valid
 // tool-free direct request invalid.
 // +kubebuilder:validation:XValidation:rule="self.runtimeProfiles.all(x, self.runtimeProfiles.filter(y, y.ref.name == x.ref.name).size() == 1)",message="runtime profile names must be unique within a policy"
@@ -265,11 +215,46 @@ type CellnExecutionPolicySpec struct {
 	// +kubebuilder:validation:MaxItems=3
 	// +listType=set
 	// +kubebuilder:validation:items:Enum=direct-one-shot;harness-one-shot;enduring
-	Lifecycles []string `json:"lifecycles"`
-	// +kubebuilder:validation:MaxItems=32
-	// +listType=atomic
-	Routes   []CellnExecutionPolicyRoute  `json:"routes"`
-	Ceilings CellnExecutionPolicyCeilings `json:"ceilings"`
+	Lifecycles []string                     `json:"lifecycles"`
+	Ceilings   CellnExecutionPolicyCeilings `json:"ceilings"`
+	// AllowedOrigins narrows where an Agent's own key (or a keyless
+	// connection) may send model requests: host patterns, each an exact
+	// lowercase host with an optional port or a "*." wildcard over
+	// subdomains. Empty admits any origin the gateway can reach. The
+	// Agent's connection is the route; this is the operator's one-line
+	// guardrail over it.
+	// +kubebuilder:validation:MaxItems=64
+	// +kubebuilder:validation:items:Pattern=`^(\*\.)?[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*(:[0-9]{1,5})?$`
+	// +listType=set
+	// +optional
+	AllowedOrigins []string `json:"allowedOrigins,omitempty"`
+	// DeniedOrigins refuses matching origins even when AllowedOrigins admits
+	// them; same patterns.
+	// +kubebuilder:validation:MaxItems=64
+	// +kubebuilder:validation:items:Pattern=`^(\*\.)?[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*(:[0-9]{1,5})?$`
+	// +listType=set
+	// +optional
+	DeniedOrigins []string `json:"deniedOrigins,omitempty"`
+}
+
+// AdmitsOrigin reports whether the policy's origin guardrail admits a model
+// endpoint origin for an Agent's own connection: not denied, and allowed when
+// an allow-list is declared. It returns the pattern that decided a refusal.
+func (s CellnExecutionPolicySpec) AdmitsOrigin(origin string) (bool, string) {
+	for _, pattern := range s.DeniedOrigins {
+		if OriginMatches(origin, pattern) {
+			return false, pattern
+		}
+	}
+	if len(s.AllowedOrigins) == 0 {
+		return true, ""
+	}
+	for _, pattern := range s.AllowedOrigins {
+		if OriginMatches(origin, pattern) {
+			return true, ""
+		}
+	}
+	return false, ""
 }
 
 // +kubebuilder:object:root=true

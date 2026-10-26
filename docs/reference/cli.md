@@ -6,17 +6,19 @@ Every command accepts the global flags `--kubeconfig PATH` and
 ## Install & Uninstall
 
 ```bash
-sympozium install                        # CRDs, control plane, built-in Ensembles, Celln and ergoz
-sympozium install --image-tag v0.10.77   # a specific image tag
+sympozium install                        # CRDs, control plane, built-in Ensembles, the Celln fleet, the model gateway and ergoz
+sympozium install --image-tag v0.12.0    # a specific image tag
 sympozium install --set key=value        # extra Helm values (repeatable)
-sympozium install --no-celln             # skip Celln entirely
+sympozium install --no-celln             # skip Celln entirely (no fleet, router or gateway)
 sympozium install --no-ergoz             # skip ergoz (accelerator power telemetry)
 sympozium install --adopt-existing       # adopt leftover objects of an older install instead of refusing
 sympozium doctor                         # read-only checklist of what is in the way, with remedies (--json)
 sympozium uninstall                      # clean removal
 ```
 
-`sympozium install` is idempotent; rerun it to add a Celln model backend.
+`sympozium install` is idempotent and asks nothing about models. Rerun it to
+upgrade, after labeling more KVM nodes, or to migrate a 0.11 keyed fleet
+(see [Upgrading from 0.11](../guides/celln-fleet-installation.md#upgrading-from-011)).
 
 ## Update & Upgrade
 
@@ -27,48 +29,75 @@ sympozium upgrade --dry-run      # show what would change (also --image-tag, --s
 ```
 
 Run `sympozium update` first, then `sympozium upgrade`, so the cluster moves
-to the chart embedded in the new CLI. With mediated model access, `upgrade`
-also moves the model gateway to the digest the new CLI pins (unless the
-release runs a gateway from another repository).
+to the chart embedded in the new CLI. `upgrade` reuses the deployed release's
+values and refreshes the image tags, the Celln node and router images and the
+model gateway digest to the ones the new CLI pins.
 
 ### Celln
 
-A bare `sympozium install` installs the **Celln fleet** when it finds a model
-backend: `DEEPSEEK_API_KEY`, `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` (each
-present key becomes a backend), or explicit specs in
-`SYMPOZIUM_CELLN_BACKEND` (semicolon-separated, same syntax as
-`--celln-fleet-backend`). In a terminal with none set it asks for a provider
-and key; without a terminal it installs only the one-shot router. See
-[Celln Fleet Installation](../guides/celln-fleet-installation.md).
-
-Every fleet install mediates model access by default: the installer
-bootstraps the model gateway's trust, your key becomes the own key of the
-`starter` Agent (Secret `starter-model-key`, ModelConnection and Agent
-`starter` in the `-n` namespace) and no Celln node holds it. See
-[Mediated model access](../guides/celln-mediated-model-access.md).
+A bare `sympozium install` deploys the **Celln fleet** whenever the build
+pins a starter package (every release does): two privileged DaemonSets on
+every node labeled `celln.dev/kvm=true`, the router and the model gateway.
+It prints the privilege it needs before it proceeds. No provider or key is
+asked for: each Agent brings its own `ModelConnection` and key, which the
+gateway adds to its requests and no node ever holds. See
+[Celln Fleet Installation](../guides/celln-fleet-installation.md) and
+[Agent-bound model access](../guides/celln-mediated-model-access.md).
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--celln-fleet` | auto | Run the native Celln plane as a per-node fleet (implied by a found backend) |
-| `--celln-fleet-backend` | — | A model backend, repeatable: `name=…,provider=…,model=…[,endpoint=URL][,protocol=openai-chat\|anthropic-messages][,credential-file=/path][,allow-insecure=true][,parameters-file=/abs.json][,max-output-tokens=N]` |
-| `--celln-fleet-model-provider`, `--celln-fleet-model`, `--celln-fleet-model-endpoint`, `--celln-fleet-model-protocol`, `--celln-fleet-model-allow-insecure`, `--celln-fleet-model-credential-file` | `deepseek` | Define the single backend named `native` when `--celln-fleet-backend` is not used |
+| `--no-celln` | `false` | Install without Celln |
+| `--celln-fleet` | on when the build pins a package | Deploy the fleet explicitly; with the three package flags for your own package (a source build pins none) |
+| `--celln-fleet-package-image`, `--celln-fleet-package-hash`, `--celln-fleet-publisher` | the release's starter package | A reviewed, digest-pinned starter package (`repository@sha256:…`, `blake3:…`, publisher key from `celln starter-inspect`) |
 | `--celln-fleet-scope` | `starter` | Stable installation identity; node state lives at `/var/lib/sympozium-celln/<scope>` |
-| `--celln-fleet-package-image`, `--celln-fleet-package-hash`, `--celln-fleet-publisher` | the release's starter package | Your own reviewed, digest-pinned starter package |
-| `--celln-fleet-https-host` | any public host | Restrict the `https-fetch`/`https-post-json` tools to these hosts (repeatable). Unset, they may reach any public HTTPS host; private, loopback and link-local addresses are always refused |
-| `--celln-fleet-authorise` | `all` | `all` (every non-system namespace) or `labeled` (`celln.sympozium.ai/scope=<scope>` only) |
-| `--celln-fleet-max-lease-seconds`, `-max-turns`, `-max-model-requests`, `-max-output-tokens` | 86400 / 256 / 1536 / 786432 | Scope ceilings for every parent (tokens scale with the largest backend cap) |
-| `--celln-fleet-model-parameters-file`, `--celln-fleet-model-max-output-tokens` | — | Model parameters and per-request output cap for the single backend (`parameters-file=`, `max-output-tokens=` in a backend spec) |
-| `--celln-fleet-replace-package` | `false` | Move an installed scope to a new starter package (ends live parents) |
-| `--celln-fleet-skip-preflight` | `false` | Skip the one-token chat probe of each backend |
+| `--celln-fleet-principal` | `sympozium:celln` | Parent principal every fleet owner authenticates |
+| `--celln-fleet-authorise` | `all` | `all` (every namespace except `kube-*`, `cert-manager`, the control-plane namespaces and namespaces labeled `celln.sympozium.ai/excluded`) or `labeled` (`celln.sympozium.ai/scope=<scope>` only) |
+| `--celln-fleet-https-host` | any public host | Restrict the `https-fetch`/`https-post-json` tools to these hosts (repeatable); private addresses are always refused |
+| `--celln-fleet-max-lease-seconds`, `-max-turns`, `-max-model-requests`, `-max-output-tokens` | 86400 / 256 / 1536 / 6291456 | Scope ceilings for every parent; output tokens are sized as turns × 6 × 4096 when unset |
+| `--model-gateway-image` | the release's pin | Digest-pinned model gateway image; a source build pins none and needs this flag |
+| `--celln-fleet-replace-package` | `false` | Approve moving an installed scope to another package or scope (ends live parents) |
 | `--celln-fleet-output-dir` | `~/.sympozium/celln-fleet/<scope>` | Private directory for configuration and install records |
 | `--celln-fleet-wait` | `15m` | How long to wait for the first labeled node |
-| `--no-celln-mediation` | `false` | Opt out of mediated model access: publish the installer's key to every fleet node instead of the starter Agent |
-| `--model-gateway-image` | the release's pin | Digest-pinned model gateway image; a source build pins none and installs without mediation unless this is given |
-| `--celln-starter-namespace` | the `-n` namespace | Namespace of the starter Agent that owns the installer's key |
-| `--celln-mediated-route`, `--celln-mediate-backends` | — | Further providers (or every HTTPS backend) Agents may bring their own key for |
-| `--celln-native-approve-starter-tools` | `false` | Approve the starter tool grants |
-| `--celln-host-installer` | `false` | Legacy bare-metal host dispatcher (with `--celln-backend URL`) |
-| `--celln-native`, `--celln-native-*` | — | The single-node [native installation](../guides/celln-native-installation.md) |
+| `--celln-router-image` | `ghcr.io/sympozium-ai/celln:v0.5.34` | Router image, `repo:tag` or `repo@sha256:…` |
+| `--celln-installer-image` | `ghcr.io/sympozium-ai/sympozium/celln-installer:<release>` | The fleet node image (the `celln` binary and runtime assets); a source build uses the embedded chart's `appVersion` |
+| `--celln-router-replicas` | `1` | Router replicas for the generated ownership PVC |
+
+`--enable-hermetic-workloads` is deprecated and does nothing: Celln is on by
+default; use `--no-celln` to skip it.
+
+### `sympozium doctor`
+
+Reads the cluster and prints `PASS`, `WARN` or `FAIL` per check, each problem
+with the command that fixes it; nothing is changed, and it exits 1 when any
+check fails.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--json` | `false` | Print the report as JSON |
+| `--celln-fleet-scope` | `starter` | Fleet scope the install would use, for the package comparison |
+| `--celln-fleet-package-hash` | the build's starter package | Package the install would use |
+
+Checks: **Cluster**, **Helm release**, **Ownership**, **Terminating**, **KVM
+nodes**, **Fleet pods**, **Fleet package**, **Fleet turn budget** and
+**Mediated model access** (trust objects, gateway readiness and the policy's
+`allowedOrigins`/`deniedOrigins` guardrail).
+
+### `sympozium celln-mediation bootstrap`
+
+Mints the model gateway's trust (issuer key, JWKS, transport tokens, private
+CA and certificates) once and publishes it as Secrets and ConfigMaps;
+`sympozium install` does this itself, so the command is for Helm-only
+installs. It prints the credential-free chart values to pass to `helm
+upgrade`; an existing installation is verified and never replaced.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--cluster-id` | required | Cluster identity bound into every signed decision |
+| `--system-namespace` | `sympozium-system` | Control-plane namespace of the release |
+| `--release-fullname` | `sympozium` | Chart full name; the gateway Service is `<fullname>-model-gateway` |
+| `--gateway-host`, `--receiver-host` | the chart's Services | Certificate names |
+| `--validity` | ten years | Lifetime of the CA and both certificates; rotation is the renewal |
+| `--values-out` | stdout | Write the chart values to this file |
 
 ## Onboarding
 
@@ -129,22 +158,6 @@ sympozium workspace show NAME            # session, PVC and last AgentRun
 sympozium workspace delete NAME [--force]  # cascades to the PVC
 sympozium workspace exec NAME [--image alpine:3.20] [--ttl 1h]  # debug pod with the PVC at /workspace
 ```
-
-### Celln operator tools
-
-`sympozium celln-tool` holds operator-only commands for reviewing tools and
-managing Celln grants. Most installations never need them; the fleet
-installer does this for you.
-
-| Command | Purpose |
-|---------|---------|
-| `celln-tool inspect NAME` | Print a tool submission's identity for review |
-| `celln-tool approve NAME` | Verify a local bundle and publish a reviewed revision |
-| `celln-tool plan AGENT` | Resolve live grants into a composition plan without executing |
-| `celln-tool compose` / `issue` / `issue-remote` / `issue-run AGENT` | Catalogue issuance against a host issuer |
-| `celln-tool withdraw-grant REPORT`, `recover-grants` | Withdraw issued host profiles |
-| `celln-tool serve-issuer --config FILE` | Run the TLS host issuer |
-| `celln-tool install-native` | Install a native starter catalogue and grant layers |
 
 ## Development
 

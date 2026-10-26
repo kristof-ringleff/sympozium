@@ -120,12 +120,11 @@ func deleteIgnoringMissing(ctx context.Context, store client.Client, object clie
 	return nil
 }
 
-// rebindTenantWrappers points every namespace's platform-managed wrappers at
-// the new profiles: the runtime wrapper's profile reference and the model
-// connection's route and credential profile. Wrappers a namespace prepared
-// itself (without the managed-by label) are left alone, as are wrappers for
-// a backend the new publication does not carry.
-func rebindTenantWrappers(ctx context.Context, store client.Client, profiles, toolboxes map[string]*api.CellnRuntimeProfile, policy *api.CellnExecutionPolicy, mediatedOnly map[string]bool) error {
+// rebindTenantWrappers points every namespace's platform-managed runtime
+// wrappers at the new profiles. Wrappers a namespace prepared itself (without
+// the managed-by label) are left alone, as are wrappers for a backend the new
+// publication does not carry.
+func rebindTenantWrappers(ctx context.Context, store client.Client, profiles, toolboxes map[string]*api.CellnRuntimeProfile) error {
 	var runtimes api.AgentRuntimeList
 	if err := store.List(ctx, &runtimes, client.MatchingLabels{cellnplatform.ManagedByLabel: cellnplatform.ManagedByValue}); err != nil {
 		return err
@@ -141,38 +140,14 @@ func rebindTenantWrappers(ctx context.Context, store client.Client, profiles, to
 		if profile == nil || runtime.Spec.CellnProfileRef == nil {
 			continue
 		}
-		backend := runtime.Labels[cellnplatform.BackendLabel]
-		wanted, err := platformWrappers(runtime.Namespace, profile, policy, mediatedOnly[backend])
-		if err != nil {
-			return err
+		wanted := cellnplatform.RuntimeWrapper(runtime.Namespace, profile)
+		if *runtime.Spec.CellnProfileRef == *wanted.Spec.CellnProfileRef {
+			continue
 		}
-		for _, object := range wanted {
-			switch w := object.(type) {
-			case *api.AgentRuntime:
-				if *runtime.Spec.CellnProfileRef == *w.Spec.CellnProfileRef {
-					continue
-				}
-				patch := client.MergeFrom(runtime.DeepCopy())
-				runtime.Spec.CellnProfileRef = w.Spec.CellnProfileRef
-				if err := store.Patch(ctx, runtime, patch); err != nil {
-					return fmt.Errorf("rebind %s/%s: %w", runtime.Namespace, runtime.Name, err)
-				}
-			case *api.ModelConnection:
-				var connection api.ModelConnection
-				if err := store.Get(ctx, client.ObjectKeyFromObject(w), &connection); apierrors.IsNotFound(err) {
-					continue
-				} else if err != nil {
-					return err
-				}
-				if connection.Labels[cellnplatform.ManagedByLabel] != cellnplatform.ManagedByValue {
-					continue
-				}
-				patch := client.MergeFrom(connection.DeepCopy())
-				connection.Spec = w.Spec
-				if err := store.Patch(ctx, &connection, patch); err != nil {
-					return fmt.Errorf("rebind %s/%s: %w", connection.Namespace, connection.Name, err)
-				}
-			}
+		patch := client.MergeFrom(runtime.DeepCopy())
+		runtime.Spec.CellnProfileRef = wanted.Spec.CellnProfileRef
+		if err := store.Patch(ctx, runtime, patch); err != nil {
+			return fmt.Errorf("rebind %s/%s: %w", runtime.Namespace, runtime.Name, err)
 		}
 	}
 	return nil

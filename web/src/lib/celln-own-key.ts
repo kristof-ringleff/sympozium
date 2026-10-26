@@ -1,35 +1,31 @@
 // A native Celln Agent owns its model backend: a namespaced ModelConnection
-// backed by a Secret in the Agent's namespace, matched against a provider
-// route the operator declared (exact origin; exact model, or any model when the
-// route declares ["*"]) (docs/guides/celln-mediated-model-access.md).
+// backed by a Secret in the Agent's namespace. The connection is the route —
+// any provider, any OpenAI- or Anthropic-compatible endpoint — and the
+// namespace's policy only guards the endpoint origin
+// (docs/guides/celln-mediated-model-access.md). One key belongs to one Agent
+// and is pinned to the first origin it is used with; the API refuses to move it.
 // Nothing here ever keeps an API key: it is handed to the API once and dropped.
 import { ApiError, api } from "@/lib/api";
 import type { CellnMediatedRoute, CellnPlatformProfile, EnduringLimits, ModelConnection } from "@/lib/api";
 import { turnOutputTokens, type ModelParameters } from "@/lib/model-parameters";
 import { TURN_MODEL_REQUESTS } from "@/lib/agent-execution";
-import { routeAllowsModel } from "@/lib/celln-routes";
+import { cellnPreset, endpointOrigin, secretKeyFor } from "@/lib/celln-providers";
 
 export { routeAllowsModel, routeModelsLabel, validModelName } from "@/lib/celln-routes";
 
 /** Create a Secret from a pasted key, or name one that already holds it. */
 export type KeyChoice = { mode: "create"; apiKey: string } | { mode: "existing"; secretName: string };
 
+/** The guide to an Agent's own model access through the gateway: docs/guides/celln-mediated-model-access.md. */
 export const GUIDE_URL = "https://github.com/sympozium-ai/sympozium/blob/main/docs/guides/celln-mediated-model-access.md";
 
-/** Stable identity of a declared route, for select values. */
-export function routeId(route: CellnMediatedRoute): string {
-  return [route.policy || "", route.provider, route.protocol, route.auth || "secret", ...route.endpointOrigins].join("|");
-}
-
-const SUGGESTED_MODELS: Record<string, string> = { openai: "gpt-4o", anthropic: "claude-sonnet-4-20250514", deepseek: "deepseek-chat" };
-
-/** The model a route starts with: its only declared model, a well-known default for an any-model route, or nothing to choose. */
+/** The model a route starts with: its only model, the provider preset's well-known default, or nothing to choose. */
 export function initialModelFor(route: CellnMediatedRoute): string {
-  if (route.anyModel) return SUGGESTED_MODELS[route.provider] || "";
+  if (route.anyModel) return cellnPreset(route.provider)?.suggestedModel || "";
   return route.models.length === 1 ? route.models[0] : "";
 }
 
-/** The standard request path of a protocol; an operator's gateway may differ. */
+/** The standard request path of a protocol; a provider or gateway may differ. */
 export function defaultEndpointPath(protocol: string): string {
   return protocol === "anthropic-messages" ? "/v1/messages" : "/v1/chat/completions";
 }
@@ -76,21 +72,23 @@ export function ownKeyConnectionSpec(selection: OwnKeySelection, secretRef?: str
   };
 }
 
-/** The route a connection was made from, if the operator still declares it. */
-export function routeForConnection(connection: ModelConnection, model: string, routes: CellnMediatedRoute[]): CellnMediatedRoute | undefined {
-  let origin = "";
-  try { origin = new URL(connection.spec.endpoint).origin; } catch { /* matched as no route */ }
-  return routes.find((route) => (route.auth === "none") === !connection.spec.secretRef && route.provider === connection.spec.provider && route.protocol === connection.spec.protocol && route.endpointOrigins.includes(origin) && routeAllowsModel(route, model));
-}
-
 /**
- * The fleet runtime profile an own-key Agent runs on: one admitted by the
- * policy that carries the route, the fleet's default backend first. The
- * profile's own model route is not used; only its runtime is.
+ * The route a connection is: its own provider, protocol, models and endpoint
+ * origin, keyed by the Secret it names (under the key the connection or its
+ * protocol fixes). The origin falls back to the endpoint text when unreadable.
  */
-export function profileForRoute(route: CellnMediatedRoute, profiles: CellnPlatformProfile[]): CellnPlatformProfile | undefined {
-  const admitted = profiles.filter((profile) => !route.policy || profile.policy === route.policy);
-  return admitted.find((profile) => profile.backend === "native") || admitted[0];
+export function routeForConnection(connection: ModelConnection, model?: string): CellnMediatedRoute {
+  const { spec } = connection;
+  const models = model && !spec.models.includes(model) ? [...spec.models, model] : spec.models;
+  return {
+    provider: spec.provider,
+    protocol: spec.protocol,
+    models,
+    endpointOrigins: [endpointOrigin(spec.endpoint) || spec.endpoint],
+    auth: spec.secretRef ? "secret" : "none",
+    secretKey: spec.secretRef ? spec.secretKey || secretKeyFor(spec.protocol) : "",
+    ...(spec.allowInsecure ? { allowInsecure: true } : {}),
+  };
 }
 
 /**
@@ -149,7 +147,8 @@ export function ownKeySelection(profile: CellnPlatformProfile): { profile: strin
  * Saves the Agent's Secret (when pasted) and ModelConnection, then makes sure
  * the namespace has the fleet's runtime wrapper (ownKeySelection's). Every call is idempotent, so
  * a retry after a failure repeats nothing harmful. Throws OwnKeyError naming
- * what exists and what does not.
+ * what exists and what does not; the API's own words are kept, in particular
+ * its 409 when a Secret is already pinned to another origin.
  */
 export async function prepareOwnKeyBackend(input: { connectionName: string; selection: OwnKeySelection; key: KeyChoice; profile: CellnPlatformProfile; agentName?: string; onConnectionSaved?: (connection: ModelConnection) => void }): Promise<{ connection: ModelConnection; runtime: string; steps: OwnKeyStep[] }> {
   const { connectionName, selection, key, profile } = input;

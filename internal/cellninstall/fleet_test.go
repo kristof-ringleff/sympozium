@@ -2,7 +2,6 @@ package cellninstall
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -10,7 +9,6 @@ import (
 	"testing"
 
 	api "github.com/sympozium-ai/sympozium/api/v1alpha1"
-	"github.com/sympozium-ai/sympozium/internal/cellnparent"
 	"github.com/zeebo/blake3"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -36,22 +34,12 @@ func TestFleetValuesRefuseAmbiguousOrUnpinnedInputs(t *testing.T) {
 		t.Fatalf("valid fleet refused: %v %v", err, values)
 	}
 	for name, change := range map[string]func(*FleetOptions){
-		"scope":             func(o *FleetOptions) { o.Scope = "Starter" },
-		"tag":               func(o *FleetOptions) { o.PackageImage = "registry.example/celln/starter:latest" },
-		"hash":              func(o *FleetOptions) { o.PackageHash = "sha256:" + strings.Repeat("b", 64) },
-		"publisher":         func(o *FleetOptions) { o.Publisher = "" },
-		"comma":             func(o *FleetOptions) { o.Publisher = "a,b" },
-		"principal":         func(o *FleetOptions) { o.Principal = "sympozium celln" },
-		"relative key file": func(o *FleetOptions) { o.ModelCredentialFile = "etc/token" },
-		"bad backend name": func(o *FleetOptions) {
-			o.Backends = []FleetBackend{{Name: "Claude", Model: FleetModel{Provider: "anthropic", Name: "m"}}}
-		},
-		"duplicate backends": func(o *FleetOptions) {
-			o.Backends = []FleetBackend{{Name: "a", Model: FleetModel{}}, {Name: "a", Model: FleetModel{}}}
-		},
-		"backend without model": func(o *FleetOptions) {
-			o.Backends = []FleetBackend{{Name: "openai", Model: FleetModel{Provider: "openai"}}}
-		},
+		"scope":                func(o *FleetOptions) { o.Scope = "Starter" },
+		"tag":                  func(o *FleetOptions) { o.PackageImage = "registry.example/celln/starter:latest" },
+		"hash":                 func(o *FleetOptions) { o.PackageHash = "sha256:" + strings.Repeat("b", 64) },
+		"publisher":            func(o *FleetOptions) { o.Publisher = "" },
+		"comma":                func(o *FleetOptions) { o.Publisher = "a,b" },
+		"principal":            func(o *FleetOptions) { o.Principal = "sympozium celln" },
 		"uppercase https host": func(o *FleetOptions) { o.HTTPSHosts = []string{"Hooks.Example"} },
 		"bare https host":      func(o *FleetOptions) { o.HTTPSHosts = []string{"localhost"} },
 		"https host with port": func(o *FleetOptions) { o.HTTPSHosts = []string{"hooks.example:8080"} },
@@ -119,37 +107,6 @@ func TestPrepareFleetTrustPublishesHashOnlyPolicyOnce(t *testing.T) {
 	}
 }
 
-func TestPublishFleetModelCredentialKeepsExistingSecret(t *testing.T) {
-	ctx := context.Background()
-	store := fleetStore()
-	path := filepath.Join(t.TempDir(), "model-token")
-	if err := PublishFleetModelCredential(ctx, store, path, FleetModel{}); err == nil {
-		t.Fatal("missing file accepted")
-	}
-	if err := os.WriteFile(path, []byte("sk-test-model-credential-0001\n"), 0600); err != nil {
-		t.Fatal(err)
-	}
-	if err := PublishFleetModelCredential(ctx, store, path, FleetModel{}); err != nil {
-		t.Fatal(err)
-	}
-	var secret corev1.Secret
-	if err := store.Get(ctx, types.NamespacedName{Namespace: "celln-system", Name: FleetModelCredentialSecret}, &secret); err != nil || string(secret.Data["native"]) != "sk-test-model-credential-0001" {
-		t.Fatalf("credential not published verbatim under the backend's name: %v %q", err, secret.Data)
-	}
-	if err := PublishFleetModelCredential(ctx, store, path, FleetModel{}); err != nil {
-		t.Fatalf("identical rerun refused: %v", err)
-	}
-	if err := os.WriteFile(path, []byte("sk-rotated-model-credential-01\n"), 0600); err != nil {
-		t.Fatal(err)
-	}
-	if err := PublishFleetModelCredential(ctx, store, path, FleetModel{}); err == nil {
-		t.Fatal("existing credential replaced")
-	}
-	if err := PublishFleetModelCredential(ctx, store, "", FleetModel{}); err != nil {
-		t.Fatalf("existing credential not kept: %v", err)
-	}
-}
-
 func TestReadFleetConfigurationWaitsForNodesAndRefusesDrift(t *testing.T) {
 	ctx := context.Background()
 	store := fleetStore()
@@ -187,129 +144,45 @@ func TestReadFleetConfigurationWaitsForNodesAndRefusesDrift(t *testing.T) {
 	}
 }
 
-func TestConfigureFleetRebindsIssuanceToGateway(t *testing.T) {
-	ctx := context.Background()
-	dir := t.TempDir()
-	o := Options{OutputDir: dir, ControllerNamespace: "sympozium-system", OwnerTarget: ManagedRouterURL, StatePath: "/var/lib/sympozium-celln/starter"}
-	registration := cellnparent.RegistrationConfig{APIVersion: "sympozium.ai/celln-parent-registrations-v1", Journal: "/var/lib/sympozium-celln/starter/journal", Approvals: "/var/lib/sympozium-celln/starter/approvals", LocalProvisioner: &cellnparent.LocalProvisioner{Binary: "/usr/local/bin/celln", Root: "/var/lib/sympozium-celln/starter/authority", Journal: "/var/lib/sympozium-celln/starter/journal", Approvals: "/var/lib/sympozium-celln/starter/approvals", Target: ManagedRouterURL, TokenFile: "/etc/sympozium/celln-parent/owner-token"}, HostTemplates: []cellnparent.HostProvisionTemplate{{Principal: "sympozium:celln"}}}
-	write := func() {
-		t.Helper()
-		raw, _ := json.Marshal(registration)
-		if err := os.WriteFile(filepath.Join(dir, "registrations.json"), raw, 0600); err != nil {
-			t.Fatal(err)
-		}
-	}
-	write()
-	store := fleetStore()
-	different := o
-	different.OwnerTarget = "http://another-owner:8787"
-	if _, err := ConfigureFleet(ctx, store, different); err == nil {
-		t.Fatal("non-gateway owner accepted")
-	}
-	values, err := ConfigureFleet(ctx, store, o)
-	if err != nil || len(values) != 1 || values[0] != "celln.fleet.parentConfigSecret="+FleetParentConfigSecret {
-		t.Fatalf("fleet wiring: %v %v", err, values)
-	}
-	var secret corev1.Secret
-	if err := store.Get(ctx, types.NamespacedName{Namespace: o.ControllerNamespace, Name: FleetParentConfigSecret}, &secret); err != nil {
-		t.Fatal(err)
-	}
-	var published cellnparent.RegistrationConfig
-	if err := json.Unmarshal(secret.Data["registrations.json"], &published); err != nil {
-		t.Fatal(err)
-	}
-	remote := published.RemoteProvisioner
-	if published.LocalProvisioner != nil || remote == nil || remote.Target != ManagedRouterURL || remote.TokenFile != "/etc/sympozium/celln/token" || remote.CAFile != "" || remote.Journal != FleetJournalRoot+"/journal" || published.Journal != remote.Journal || published.Approvals != FleetJournalRoot+"/approvals" || remote.Approvals != published.Approvals || len(published.HostTemplates) != 1 {
-		t.Fatalf("controller wiring did not move issuance to the gateway: %+v", published)
-	}
-	// A rerun keeps identical wiring; different wiring is never replaced.
-	if again, err := ConfigureFleet(ctx, store, o); err != nil || strings.Join(again, ",") != strings.Join(values, ",") {
-		t.Fatalf("identical rerun did not keep the wiring: %v %v", err, again)
-	}
-	if wired, err := ExistingFleetWiring(ctx, store, o.ControllerNamespace); err != nil || !wired {
-		t.Fatalf("existing wiring not detected: %v", err)
-	}
-	secret.Data["registrations.json"] = []byte(`{"apiVersion":"other"}`)
-	if err := store.Update(ctx, &secret); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := ConfigureFleet(ctx, store, o); err == nil {
-		t.Fatal("existing wiring replaced")
-	}
-	registration.LocalProvisioner = nil
-	write()
-	if _, err := ConfigureFleet(ctx, fleetStore(), o); err == nil {
-		t.Fatal("registration without local starter issuance accepted")
-	}
-}
-
-func TestFleetModelPresetsAndRefusals(t *testing.T) {
-	ok := map[string]FleetModel{
-		"deepseek default": {},
-		"openai":           {Provider: ModelProviderOpenAI, Name: "gpt-test"},
-		"anthropic":        {Provider: ModelProviderAnthropic, Name: "claude-test"},
-		"llama-server":     {Provider: ModelProviderLlamaServer, Name: "qwen.gguf", Endpoint: "http://100.81.163.75:8080/v1/chat/completions", AllowInsecure: true},
-		"custom gateway":   {Provider: "litellm", Name: "m", Endpoint: "https://gateway.example/v1/chat/completions", Protocol: "openai-chat"},
-	}
-	want := map[string][3]string{
-		"deepseek default": {"deepseek", "openai-chat", "https://api.deepseek.com/chat/completions"},
-		"openai":           {"openai", "openai-chat", "https://api.openai.com/v1/chat/completions"},
-		"anthropic":        {"anthropic", "anthropic-messages", "https://api.anthropic.com/v1/messages"},
-		"llama-server":     {"llama-server", "openai-chat", "http://100.81.163.75:8080/v1/chat/completions"},
-		"custom gateway":   {"litellm", "openai-chat", "https://gateway.example/v1/chat/completions"},
-	}
-	for name, m := range ok {
-		got, err := m.Resolve("trial")
-		if err != nil || [3]string{got.Provider, got.Protocol, got.Endpoint} != want[name] || got.Name == "" {
-			t.Fatalf("%s: %+v %v", name, got, err)
-		}
-	}
-	for name, m := range map[string]FleetModel{
-		"openai without model":      {Provider: ModelProviderOpenAI},
-		"llama without endpoint":    {Provider: ModelProviderLlamaServer, Name: "q"},
-		"plain http unapproved":     {Provider: ModelProviderLlamaServer, Name: "q", Endpoint: "http://10.0.0.5:8080/v1/chat/completions"},
-		"custom without protocol":   {Provider: "litellm", Name: "m", Endpoint: "https://gateway.example/v1/chat/completions"},
-		"unsupported protocol":      {Provider: "litellm", Name: "m", Endpoint: "https://gateway.example/v1/x", Protocol: "gemini"},
-		"endpoint with credentials": {Provider: ModelProviderOpenAI, Name: "m", Endpoint: "https://user:pw@api.openai.com/v1/chat/completions"},
-		"comma breaks helm --set":   {Provider: ModelProviderOpenAI, Name: "a,b"},
-	} {
-		if _, err := m.Resolve("trial"); err == nil {
-			t.Fatalf("%s accepted", name)
-		}
-	}
-	o := validFleet()
-	o.Model = ok["llama-server"]
-	values, err := FleetValues(o)
-	joined := strings.Join(values, "\n")
-	if err != nil || !strings.Contains(joined, "celln.fleet.backends[0].endpoint=http://100.81.163.75:8080/v1/chat/completions") || !strings.Contains(joined, "celln.fleet.backends[0].allowInsecure=true") || !strings.Contains(joined, "celln.fleet.backends[0].model=qwen.gguf") || !strings.Contains(joined, "celln.fleet.backends[0].name=native") || strings.Contains(joined, "credential") {
-		t.Fatalf("model route not rendered into values: %v %s", err, joined)
-	}
-	o.Model = FleetModel{Provider: ModelProviderOpenAI}
-	if _, err := FleetValues(o); err == nil {
-		t.Fatal("fleet values rendered without a model name")
-	}
-}
-
-func TestKeylessModelPublishesPlaceholderAndShortKeysAreRefused(t *testing.T) {
+// A publication the nodes re-derived with another Celln binary (recorded in
+// configured-by) replaces the operator's local copy for the same package; a
+// local change under the same binary is still drift.
+func TestReadFleetConfigurationFollowsARederivedPublication(t *testing.T) {
 	ctx := context.Background()
 	store := fleetStore()
-	llama := FleetModel{Provider: ModelProviderLlamaServer}
-	if err := PublishFleetModelCredential(ctx, store, "", FleetModel{Provider: ModelProviderOpenAI}); err == nil {
-		t.Fatal("a provider that needs a key was installed without one")
+	dir := filepath.Join(t.TempDir(), "configuration")
+	data := func(persona string) map[string]string {
+		return map[string]string{"native.catalogue.json": `{"systemPrompt":"` + persona + `","tools":[]}`, "native.configured.json": `{"apiVersion":"celln.native-starter-configured/v1"}`, "native.native-template.json": `{"maxTurns":12}`}
 	}
-	if err := PublishFleetModelCredential(ctx, store, "", llama); err != nil {
+	published := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: FleetConfigurationConfigMap, Namespace: "celln-system", Annotations: map[string]string{ConfiguredByAnnotation: "celln-old"}}, Data: data("terse")}
+	if err := store.Create(ctx, published); err != nil {
 		t.Fatal(err)
 	}
-	var secret corev1.Secret
-	if err := store.Get(ctx, types.NamespacedName{Namespace: "celln-system", Name: FleetModelCredentialSecret}, &secret); err != nil || len(secret.Data["native"]) < 24 {
-		t.Fatalf("keyless backend placeholder missing or too short for Celln: %v %q", err, secret.Data)
+	if ok, err := ReadFleetConfiguration(ctx, store, dir); err != nil || !ok {
+		t.Fatalf("first materialization: %v %v", ok, err)
 	}
-	short := filepath.Join(t.TempDir(), "short")
-	if err := os.WriteFile(short, []byte("sk-short\n"), 0600); err != nil {
+	if marker, err := os.ReadFile(filepath.Join(dir, configuredByFile)); err != nil || string(marker) != "celln-old" {
+		t.Fatalf("binary not recorded: %q %v", marker, err)
+	}
+	published.Annotations[ConfiguredByAnnotation] = "celln-new"
+	published.Data = data("fetch first")
+	if err := store.Update(ctx, published); err != nil {
 		t.Fatal(err)
 	}
-	if err := PublishFleetModelCredential(ctx, fleetStore(), short, FleetModel{}); err == nil {
-		t.Fatal("credential Celln would refuse was published")
+	if ok, err := ReadFleetConfiguration(ctx, store, dir); err != nil || !ok {
+		t.Fatalf("re-derived publication refused: %v %v", ok, err)
+	}
+	if raw, _ := os.ReadFile(filepath.Join(dir, "native", "catalogue.json")); !strings.Contains(string(raw), "fetch first") {
+		t.Fatalf("local copy not replaced: %s", raw)
+	}
+	if marker, _ := os.ReadFile(filepath.Join(dir, configuredByFile)); string(marker) != "celln-new" {
+		t.Fatalf("binary record not updated: %q", marker)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "native", "catalogue.json"), []byte(`{"systemPrompt":"tampered","tools":[]}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ReadFleetConfiguration(ctx, store, dir); err == nil {
+		t.Fatal("drift under the same binary accepted")
 	}
 }
 
@@ -341,62 +214,6 @@ func TestFleetLimitsDefaultToLongRunningAndAreBounded(t *testing.T) {
 	joined := strings.Join(values, "\n")
 	if err != nil || !strings.Contains(joined, "celln.fleet.limits.leaseSeconds=7200") || !strings.Contains(joined, "celln.fleet.limits.maxTurns=256") {
 		t.Fatalf("limits not rendered: %v %s", err, joined)
-	}
-}
-
-// A scope may carry several backends: each gets its own values entry, entry
-// in the shared credentials Secret, credential path and credential profile;
-// the default backend keeps the original names.
-func TestFleetBackendsRenderSeparately(t *testing.T) {
-	o := validFleet()
-	o.Backends = []FleetBackend{
-		{Name: "native", Model: FleetModel{}, CredentialFile: "/keys/deepseek"},
-		{Name: "local-qwen", Model: FleetModel{Provider: ModelProviderLlamaServer, Name: "qwen.gguf", Endpoint: "http://100.81.163.75:8080/v1/chat/completions", AllowInsecure: true}},
-		{Name: "claude", Model: FleetModel{Provider: ModelProviderAnthropic, Name: "claude-test"}, CredentialFile: "/keys/anthropic"},
-	}
-	backends, err := o.ResolvedBackends()
-	if err != nil || len(backends) != 3 || backends[1].Model.Protocol != "openai-chat" || backends[2].Model.Protocol != "anthropic-messages" {
-		t.Fatalf("resolved backends: %+v %v", backends, err)
-	}
-	values, err := FleetValues(o)
-	joined := strings.Join(values, "\n")
-	for _, want := range []string{
-		"celln.fleet.backends[0].name=native", "celln.fleet.backends[0].provider=deepseek",
-		"celln.fleet.backends[1].name=local-qwen", "celln.fleet.backends[1].allowInsecure=true",
-		"celln.fleet.backends[2].name=claude", "celln.fleet.backends[2].protocol=anthropic-messages", "celln.fleet.backends[2].endpoint=https://api.anthropic.com/v1/messages",
-	} {
-		if err != nil || !strings.Contains(joined, want) {
-			t.Fatalf("values lack %q: %v\n%s", want, err, joined)
-		}
-	}
-	if CredentialProfileFor("starter", "native") != "starter" || CredentialProfileFor("starter", "claude") != "starter-claude" || BackendCredentialPath("native") != "/etc/celln-native/credentials/native" || BackendCredentialPath("claude") != "/etc/celln-native/credentials/claude" {
-		t.Fatal("credential profiles and paths must distinguish backends")
-	}
-	ctx := context.Background()
-	store := fleetStore()
-	key := filepath.Join(t.TempDir(), "anthropic")
-	if err := os.WriteFile(key, []byte("sk-ant-test-credential-0000000001\n"), 0600); err != nil {
-		t.Fatal(err)
-	}
-	backends[2].CredentialFile = key
-	for _, b := range backends[1:] {
-		if err := PublishFleetBackendCredential(ctx, store, b); err != nil {
-			t.Fatalf("%s: %v", b.Name, err)
-		}
-	}
-	var secret corev1.Secret
-	if err := store.Get(ctx, types.NamespacedName{Namespace: "celln-system", Name: FleetModelCredentialSecret}, &secret); err != nil || len(secret.Data["local-qwen"]) < 24 || string(secret.Data["claude"]) != "sk-ant-test-credential-0000000001" || len(secret.Data) != 2 {
-		t.Fatalf("backend credentials are one entry each in the shared Secret: %v %q", err, secret.Data)
-	}
-	// Adding a backend later adds its entry and leaves the others untouched.
-	if err := PublishFleetBackendCredential(ctx, store, FleetBackend{Name: "native", Model: backends[0].Model, CredentialFile: key}); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.Get(ctx, types.NamespacedName{Namespace: "celln-system", Name: FleetModelCredentialSecret}, &secret); err != nil || len(secret.Data) != 3 || string(secret.Data["claude"]) != "sk-ant-test-credential-0000000001" {
-		t.Fatalf("adding a backend disturbed the others: %v %q", err, secret.Data)
-	}
-	if err := PublishFleetBackendCredential(ctx, store, FleetBackend{Name: "claude", Model: backends[2].Model, CredentialFile: filepath.Join(t.TempDir(), "missing")}); err == nil {
-		t.Fatal("unreadable replacement accepted")
 	}
 }
 
@@ -441,4 +258,45 @@ func TestReadFleetConfigurationMaterializesEveryBackend(t *testing.T) {
 	if raw, _ := os.ReadFile(filepath.Join(dir, "claude", "configured.json")); string(raw) != "{}" {
 		t.Fatalf("claude backend file: %s", raw)
 	}
+	// Drift between the operator's directory and the nodes is refused...
+	if err := os.WriteFile(filepath.Join(dir, "native", "catalogue.json"), []byte(`{"edited":true}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ReadFleetConfiguration(ctx, store, dir); err == nil || !strings.Contains(err.Error(), "differs") {
+		t.Fatalf("drift accepted: %v", err)
+	}
+	// ...except the 0.12 upgrade: a backend materialized with a fleet-held
+	// model is rewritten from the model-free publication, and backends the
+	// nodes no longer publish are removed.
+	if err := os.WriteFile(filepath.Join(dir, "native", "configured.json"), []byte(`{"modelProfile":"blake3:old","model":{"provider":"deepseek"}}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	var cm corev1.ConfigMap
+	if err := store.Get(ctx, types.NamespacedName{Namespace: "celln-system", Name: FleetConfigurationConfigMap}, &cm); err != nil {
+		t.Fatal(err)
+	}
+	for key := range cm.Data {
+		if strings.HasPrefix(key, "claude.") {
+			delete(cm.Data, key)
+		}
+	}
+	if err := store.Update(ctx, &cm); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := ReadFleetConfiguration(ctx, store, dir); err != nil || !ok {
+		t.Fatalf("model-free rewrite: %v %v", ok, err)
+	}
+	if got, err := ConfigurationBackends(dir); err != nil || strings.Join(got, ",") != "native" {
+		t.Fatalf("stale backend kept: %v %v", got, err)
+	}
+	if raw, _ := os.ReadFile(filepath.Join(dir, "native", "catalogue.json")); string(raw) != data["catalogue.json"] {
+		t.Fatalf("keyed files were not rewritten: %s", raw)
+	}
+}
+
+// fleetStoreWith is fleetStore seeded with objects.
+func fleetStoreWith(objects ...client.Object) client.Client {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	return fake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).Build()
 }

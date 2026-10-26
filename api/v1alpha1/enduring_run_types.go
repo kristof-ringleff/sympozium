@@ -108,11 +108,10 @@ func (s *AgentRunSpec) ContinuesOnLoss() bool {
 // PlatformOneShotShape reports whether this spec asks for a single answer from
 // the shared catalogue: backend celln, a one-shot lifecycle, cluster tools or a
 // platform wrapper (no namespaced tools), the namespace's model connection and
-// a string task. On a fleet such a run is served by a single-turn native
-// parent that ends after its answer; the controller still confirms the runtime
-// is a platform wrapper before taking that path.
+// a string task. Such a run is executed by the platform's scoped receiver and
+// ends after its answer.
 func (s *AgentRunSpec) PlatformOneShotShape() bool {
-	return s.Backend == "celln" && s.ExecutionLifecycle != "enduring" && s.Enduring == nil && s.Celln == nil &&
+	return s.Backend == "celln" && s.ExecutionLifecycle != "enduring" && s.Enduring == nil &&
 		s.CellnSelection != nil && len(s.CellnSelection.ToolRefs) == 0 && s.Model.ConnectionRef != "" &&
 		(s.Mode == "" || s.Mode == "task") && s.Task.IsString() && s.ValidateLifecycle() == ""
 }
@@ -132,7 +131,7 @@ func (s *AgentRunSpec) ValidateLifecycle() string {
 		}
 		return ""
 	}
-	if s.Backend != "celln" || s.CellnSelection == nil || s.Celln != nil || (s.Mode != "" && s.Mode != "task") || s.Enduring == nil {
+	if s.Backend != "celln" || s.CellnSelection == nil || (s.Mode != "" && s.Mode != "task") || s.Enduring == nil {
 		return "enduring lifecycle requires Celln catalogue selection, limits, and task mode"
 	}
 	e := s.Enduring

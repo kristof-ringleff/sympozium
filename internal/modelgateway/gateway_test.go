@@ -172,7 +172,7 @@ func testGatewayTenantCredentialIsolation(t *testing.T, live, process bool) {
 			connUID := types.UID("connection-" + tenant)
 			secretUID := types.UID("secret-" + tenant)
 			conn := &api.ModelConnection{ObjectMeta: meta.ObjectMeta{Namespace: ns, Name: "model", UID: connUID}, Spec: api.ModelConnectionSpec{Provider: "openai", Protocol: "openai-chat", Endpoint: provider.URL + "/v1/chat/completions", SecretRef: "key", Models: []string{"m"}, AllowInsecure: true}}
-			secret := &core.Secret{ObjectMeta: meta.ObjectMeta{Namespace: ns, Name: "key", UID: secretUID, Annotations: map[string]string{modelkey.OwnerAnnotation: "Agent/agent"}}, Data: map[string][]byte{"OPENAI_API_KEY": []byte(key)}}
+			secret := &core.Secret{ObjectMeta: meta.ObjectMeta{Namespace: ns, Name: "key", UID: secretUID, Annotations: map[string]string{modelkey.OwnerAnnotation: "Agent/agent", modelkey.OriginAnnotation: provider.URL}}, Data: map[string][]byte{"OPENAI_API_KEY": []byte(key)}}
 			agent := &api.Agent{ObjectMeta: meta.ObjectMeta{Namespace: ns, Name: "agent", UID: "agent-uid"}}
 			namespace := &core.Namespace{ObjectMeta: meta.ObjectMeta{Name: ns, UID: uid, Labels: map[string]string{"sympozium.ai/test": "model-gateway"}}}
 			for _, obj := range []client.Object{namespace, conn, secret, agent} {

@@ -40,8 +40,7 @@ func testDoctor(t *testing.T, objects ...client.Object) *doctor {
 		now:           func() time.Time { return doctorNow },
 		chart:         ch,
 		defaultValues: func() ([]string, string, error) {
-			set, err := cellnInstallSetValues(context.Background(), "", "", nil, 1, false)
-			return set, "a plain 'sympozium install'", err
+			return testInstallValues(t), "a plain 'sympozium install'", nil
 		},
 		scope:       defaultFleetScope,
 		packageHash: newPackage,
@@ -286,43 +285,6 @@ func configureDaemonSet() *appsv1.DaemonSet {
 		}}}}}}}
 }
 
-func TestDoctorModelCredentials(t *testing.T) {
-	secret := func(keys ...string) *corev1.Secret {
-		s := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: cellninstall.FleetModelCredentialSecret, Namespace: cellnSystemNamespace}, Data: map[string][]byte{}}
-		for _, k := range keys {
-			s.Data[k] = []byte("key")
-		}
-		return s
-	}
-	for _, tc := range []struct {
-		name    string
-		objects []client.Object
-		status  string
-		missing []string
-		remedy  string
-	}{
-		{name: "no fleet", status: statusPass},
-		{name: "every backend has a key", objects: []client.Object{configureDaemonSet(), secret("native", "openai")}, status: statusPass},
-		{name: "one backend lacks its key", objects: []client.Object{configureDaemonSet(), secret("native")}, status: statusFail, missing: []string{"backend openai (openai/gpt-4o-mini)"}, remedy: "kubectl -n celln-system patch secret celln-fleet-model-credentials"},
-		{name: "no Secret at all", objects: []client.Object{configureDaemonSet()}, status: statusFail, missing: []string{"backend native (deepseek/deepseek-chat)", "backend openai (openai/gpt-4o-mini)"}, remedy: "kubectl -n celln-system create secret generic celln-fleet-model-credentials --from-file=native=/path/to/key"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			f := findingOf(t, testDoctor(t, append(tc.objects, kvmNode("node-a"))...).run(context.Background()), "Model credentials")
-			if f.Status != tc.status || len(f.Details) != len(tc.missing) {
-				t.Fatalf("got %+v", f)
-			}
-			for i, want := range tc.missing {
-				if f.Details[i].Object != want {
-					t.Fatalf("detail %d: %+v", i, f.Details[i])
-				}
-			}
-			if tc.remedy != "" && !strings.HasPrefix(f.Details[0].Remedy, tc.remedy) {
-				t.Fatalf("remedy %q", f.Details[0].Remedy)
-			}
-		})
-	}
-}
-
 // usedMachine is the cluster of epic #591 in one fixture.
 func usedMachine(t *testing.T) *doctor {
 	objects := append(leftovers(), terminatingCRD(time.Date(2026, 9, 15, 8, 0, 0, 0, time.UTC)), kvmNode("kubeadm-1"),
@@ -394,7 +356,7 @@ func TestSourceBuildDefaultsToTheChartAppVersion(t *testing.T) {
 	chartTag := "v" + appVersion
 	installerTag := func(t *testing.T, installerImage string) string {
 		t.Helper()
-		set, err := cellnInstallSetValues(context.Background(), "", installerImage, nil, 1, false)
+		set, err := cellnInstallSetValues(context.Background(), "", installerImage, 1)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -441,11 +403,7 @@ func TestImageTagFlagStillWinsForControlPlaneImages(t *testing.T) {
 		t.Fatal(err)
 	}
 	images := func(imageTag string) (controller, installer string) {
-		set, err := cellnInstallSetValues(context.Background(), "", "", nil, 1, false)
-		if err != nil {
-			t.Fatal(err)
-		}
-		vals, err := buildHelmValues(imageTag, set)
+		vals, err := buildHelmValues(imageTag, testInstallValues(t))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -454,19 +412,26 @@ func TestImageTagFlagStillWinsForControlPlaneImages(t *testing.T) {
 			t.Fatal(err)
 		}
 		for _, obj := range objects {
-			if obj.GetKind() != "Deployment" {
-				continue
-			}
-			var d appsv1.Deployment
-			raw, _ := json.Marshal(obj.Object)
-			if err := json.Unmarshal(raw, &d); err != nil {
-				t.Fatal(err)
-			}
-			switch d.Name {
-			case "sympozium-controller-manager":
-				controller = d.Spec.Template.Spec.Containers[0].Image
-			case "celln-dispatcher":
-				installer = d.Spec.Template.Spec.Containers[0].Image
+			// The fleet node image (celln.image) runs the celln-node DaemonSet.
+			switch obj.GetKind() {
+			case "Deployment":
+				var d appsv1.Deployment
+				raw, _ := json.Marshal(obj.Object)
+				if err := json.Unmarshal(raw, &d); err != nil {
+					t.Fatal(err)
+				}
+				if d.Name == "sympozium-controller-manager" {
+					controller = d.Spec.Template.Spec.Containers[0].Image
+				}
+			case "DaemonSet":
+				var d appsv1.DaemonSet
+				raw, _ := json.Marshal(obj.Object)
+				if err := json.Unmarshal(raw, &d); err != nil {
+					t.Fatal(err)
+				}
+				if d.Name == "celln-node" {
+					installer = d.Spec.Template.Spec.Containers[0].Image
+				}
 			}
 		}
 		return controller, installer

@@ -15,9 +15,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
-// A shared-catalogue run may select an Agent's own Secret-backed connection:
-// it is frozen from the connection without any credential reference. A legacy
-// namespaced selection has no gateway and keeps requiring a host profile.
+// A run may select an Agent's own Secret-backed connection: the route is
+// frozen from the connection without any credential reference, and the key
+// joins the request only at the model gateway.
 func TestCreateRunOnAnAgentsOwnSecretConnection(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = sympoziumv1alpha1.AddToScheme(scheme)
@@ -41,10 +41,7 @@ func TestCreateRunOnAnAgentsOwnSecretConnection(t *testing.T) {
 	if model.ConnectionRef != "my-anthropic" || model.Provider != "anthropic" || model.Protocol != "anthropic-messages" || model.BaseURL != connection.Spec.Endpoint || model.ConnectionRevision == "" {
 		t.Fatalf("route not frozen from the connection: %+v", model)
 	}
-	if model.AuthSecretRef != "" || model.CredentialProfile != "" || len(run.Spec.Env) != 0 || strings.Contains(res.Body.String(), "my-anthropic-key") {
+	if model.AuthSecretRef != "" || len(run.Spec.Env) != 0 || strings.Contains(res.Body.String(), "my-anthropic-key") {
 		t.Fatalf("the Secret reached the run: %s", res.Body.String())
-	}
-	if res := post(`{"runtimeRef":"celln-native","toolRefs":[{"name":"workspace-read","revision":"v1"}]}`); res.Code != http.StatusBadRequest || !strings.Contains(res.Body.String(), "host credential profile") {
-		t.Fatalf("legacy namespaced selection accepted a Secret connection: %d %s", res.Code, res.Body.String())
 	}
 }

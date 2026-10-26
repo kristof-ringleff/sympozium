@@ -1,32 +1,36 @@
 /**
- * A Celln Agent owns its model backend: a provider route the operator declared
- * for the namespace, the Agent's own key (pasted, or an existing Secret) and
- * one of the route's models. Intercepted browser contract tests — they need no
- * cluster and are not live execution evidence. The Secret's fixed key name is
- * written by the API server (internal/apiserver/server_modelconnections.go,
- * covered by its Go tests); here it is what the console tells the user and
- * what it asks the Secret listing for.
+ * A Celln Agent owns its model backend: its own ModelConnection — any provider
+ * preset, local server or custom endpoint — with the Agent's own key (pasted,
+ * or an existing Secret) and a model name. Celln holds no model; the
+ * namespace's policy only guards the endpoint origin (allowed/denied host
+ * globs, and an operator's exact approval for private addresses). Intercepted
+ * browser contract tests — they need no cluster and are not live execution
+ * evidence. The Secret's fixed key name is written by the API server
+ * (internal/apiserver/server_modelconnections.go, covered by its Go tests);
+ * here it is what the console tells the user and what it asks the Secret
+ * listing for.
  */
 
 const KEY = "sk-ant-cypress-never-shown-again";
 
-const anthropic = { provider: "anthropic", protocol: "anthropic-messages", models: ["claude-opus-5", "claude-sonnet-5"], endpointOrigins: ["https://api.anthropic.com"], policy: "celln-fleet-starter", secretKey: "ANTHROPIC_API_KEY" };
-const gateway = { provider: "llm-gateway", protocol: "openai-chat", models: ["qwen3"], endpointOrigins: ["https://llm.example.com", "https://llm-eu.example.com"], policy: "celln-fleet-starter", secretKey: "OPENAI_API_KEY" };
-
 const profile = {
-  name: "celln-native-starter", revision: "v1", policy: "celln-fleet-starter", model: "deepseek-chat", provider: "deepseek",
-  endpoint: "https://api.deepseek.com/chat/completions", credentialProfile: "starter", systemPrompt: "Keep replies brief.",
-  backend: "native", wrapper: "celln-native", agent: "celln-agent", tools: [{ name: "celln-starter-grep", revision: "v1" }],
+  name: "celln-native-starter", revision: "v1", policy: "celln-fleet-starter", model: "", provider: "", endpoint: "", systemPrompt: "Keep replies brief.",
+  backend: "native", wrapper: "celln-native", agent: "", tools: [{ name: "celln-starter-grep", revision: "v1" }], mediationOnly: true,
   ceilings: { leaseSeconds: 86400, maxTurns: 256, maxModelRequests: 1536, maxOutputTokens: 786432 },
   sessionDefaults: { leaseSeconds: 14400, maxTurns: 64, maxModelRequests: 384, maxOutputTokens: 196608 },
 };
 
-type Mediation = { enabled: boolean; mediateBackends: boolean; routes: unknown[]; pending: unknown[] };
+type Mediation = { enabled: boolean; allowedOrigins: string[]; deniedOrigins: string[]; policies: string[]; privateOrigins?: string[]; routes: never[]; pending: never[] };
 
-function stub(mediation: Mediation) {
+/** The namespace's guardrail as the API answers it; by default every public origin is admitted. */
+function mediation(overrides: Partial<Mediation> = {}): Mediation {
+  return { enabled: true, allowedOrigins: [], deniedOrigins: [], policies: ["celln-fleet-starter"], routes: [], pending: [], ...overrides };
+}
+
+function stub(guardrail: Mediation = mediation()) {
   cy.intercept("GET", "**/api/v1/**", { body: [] });
   cy.intercept("GET", "**/api/v1/celln-platform/profiles*", { body: [profile] });
-  cy.intercept("GET", "**/api/v1/celln-platform/mediation*", { body: mediation }).as("mediation");
+  cy.intercept("GET", "**/api/v1/celln-platform/mediation*", { body: guardrail }).as("mediation");
   cy.intercept("GET", "**/api/v1/capabilities*", { body: { celln: { available: true, state: "ready", reason: "fleet ready" } } });
   // The old fleet-backend API must never be consulted again.
   cy.intercept("**/api/v1/celln-platform/backends*", () => { throw new Error("the console asked for fleet backends"); });
@@ -43,16 +47,95 @@ function openProviderStep(name = "mine") {
   next();
 }
 
-function chooseProvider(label: string) {
-  cy.get('[data-testid="celln-route-select"]').click();
-  cy.get('[role="option"]').contains(label).click();
-}
+const chooseProvider = (value: string) => cy.get(`[data-testid="celln-provider-${value}"]`).click();
+const typeModel = (model: string) => cy.get('[data-testid="celln-model-name"]').clear().type(model);
 
 describe("Create Agent → Celln: the Agent's own model backend", () => {
+  it("offers every provider preset, a local server and a custom endpoint, and never asks the fleet for a route", () => {
+    stub();
+    openProviderStep();
+    cy.get('[data-testid="wizard-steps"] [data-step]').then(($steps) => {
+      expect([...$steps].map((el) => el.getAttribute("data-step"))).to.deep.equal(["name", "plane", "provider", "apikey", "model", "confirm"]);
+    });
+    cy.get('[data-testid="celln-provider-grid"] button').should("have.length", 13);
+    for (const label of ["OpenAI", "Anthropic", "OpenRouter", "DeepSeek", "Mistral", "Groq", "Google", "xAI", "Ollama", "llama-server", "LM Studio", "vLLM", "Custom"]) {
+      cy.get('[data-testid="celln-provider-grid"]').contains("button", label).should("exist");
+    }
+    cy.get('[data-testid="celln-route-select"]').should("not.exist");
+    dialog().should("not.contain", "declared").and("not.contain", "--celln-mediated-route").and("not.contain", "apply-routes").and("not.contain", "starter Agent").and("not.contain", "holds no key");
+    dialog().contains("button", "Next").should("be.disabled");
+    chooseProvider("deepseek");
+    cy.get('[data-testid="celln-route-summary"]').should("contain", "https://api.deepseek.com").and("contain", "any model").and("contain", "celln-fleet-starter").and("contain", "its own key");
+    cy.get('[data-testid="celln-endpoint"]').should("not.exist");
+    dialog().contains("button", "Next").should("not.be.disabled");
+  });
+
+  it("says what the operator must run when mediated model access is disabled, and offers nothing in its place", () => {
+    stub(mediation({ enabled: false }));
+    openProviderStep();
+    cy.get('[data-testid="celln-mediation-disabled"]').should("contain", "Mediated model access is not enabled").and("contain", "celln.mediation.enabled").and("contain", "sympozium install").and("not.contain", "--celln-mediated-route");
+    cy.get('[data-testid="celln-mediation-disabled"] a').should("have.attr", "href").and("contain", "celln-mediated-model-access.md");
+    cy.get('[data-testid="celln-provider-grid"]').should("not.exist");
+    dialog().should("not.contain", "fleet backend").and("not.contain", "Add to the fleet");
+    dialog().contains("button", "Next").should("be.disabled");
+  });
+
+  it("refuses an origin the policy denies, quoting its allowed and denied globs, and admits one it allows", () => {
+    stub(mediation({ allowedOrigins: ["api.anthropic.com", "*.example.com"], deniedOrigins: ["*.openai.com"] }));
+    openProviderStep();
+    chooseProvider("openai");
+    cy.get('[data-testid="celln-origin-denied"]')
+      .should("contain", "celln-fleet-starter")
+      .and("contain", "https://api.openai.com")
+      .and("contain", "denied pattern *.openai.com")
+      .and("contain", "api.anthropic.com, *.example.com")
+      .and("contain", "allowedOrigins");
+    cy.get('[data-testid="celln-route-summary"]').should("not.exist");
+    dialog().contains("button", "Next").should("be.disabled");
+    // Not denied, but outside a declared allow-list.
+    chooseProvider("deepseek");
+    cy.get('[data-testid="celln-origin-denied"]').should("contain", "https://api.deepseek.com").and("not.contain", "denied pattern");
+    dialog().contains("button", "Next").should("be.disabled");
+    // A "*." glob admits the bare domain and its subdomains.
+    chooseProvider("custom");
+    cy.get('[data-testid="celln-endpoint"]').type("https://llm.example.com/v1/chat/completions");
+    cy.get('[data-testid="celln-origin-denied"]').should("not.exist");
+    cy.get('[data-testid="celln-route-summary"]').should("contain", "https://llm.example.com");
+    chooseProvider("anthropic");
+    cy.get('[data-testid="celln-origin-denied"]').should("not.exist");
+    cy.get('[data-testid="celln-route-summary"]').should("contain", "https://api.anthropic.com");
+    dialog().contains("button", "Next").should("not.be.disabled");
+  });
+
+  it("holds a private, LAN or loopback origin until an operator approves exactly it in modelGateway.privateOrigins", () => {
+    stub(mediation({ privateOrigins: ["http://llama-server.default.svc:8080"] }));
+    openProviderStep();
+    chooseProvider("ollama");
+    cy.get('[data-testid="celln-endpoint"]').should("have.value", "");
+    dialog().contains("button", "Next").should("be.disabled");
+    cy.get('[data-testid="celln-endpoint"]').type("not a url");
+    cy.get('[data-testid="celln-endpoint-error"]').should("exist");
+    cy.get('[data-testid="celln-endpoint"]').clear().type("http://ollama.default.svc:11434");
+    cy.get('[data-testid="celln-origin-needs-approval"]')
+      .should("contain", "http://ollama.default.svc:11434")
+      .and("contain", "modelGateway.privateOrigins")
+      .and("contain", "operator")
+      .and("contain", "http://llama-server.default.svc:8080");
+    dialog().contains("button", "Next").should("be.disabled");
+    for (const origin of ["http://192.168.1.20:1234", "http://127.0.0.1:8080", "http://framework:8080", "http://10.0.0.5"]) {
+      cy.get('[data-testid="celln-endpoint"]').clear().type(origin);
+      cy.get('[data-testid="celln-origin-needs-approval"]').should("contain", origin);
+    }
+    // The approved origin, exactly: the key may travel there.
+    cy.get('[data-testid="celln-endpoint"]').clear().type("http://llama-server.default.svc:8080/v1/chat/completions");
+    cy.get('[data-testid="celln-origin-needs-approval"]').should("not.exist");
+    cy.get('[data-testid="celln-route-summary"]').should("contain", "http://llama-server.default.svc:8080");
+    dialog().contains("button", "Next").should("not.be.disabled");
+  });
+
   it("creates a keyless local model connection without reading or writing a Secret", () => {
-    const local = { ...gateway, provider: "llama-server", endpointOrigins: ["http://framework:8080"], auth: "none", allowInsecure: true, secretKey: "" };
-    stub({ enabled: true, mediateBackends: false, routes: [local], pending: [] });
-    cy.intercept("GET", "**/api/v1/celln-platform/key-secrets*", () => { throw new Error("keyless route listed Secrets"); });
+    stub(mediation({ privateOrigins: ["http://framework:8080"] }));
+    cy.intercept("GET", "**/api/v1/celln-platform/key-secrets*", () => { throw new Error("keyless endpoint listed Secrets"); });
     cy.intercept("POST", "**/api/v1/model-connections*", (request) => {
       expect(request.body).not.to.have.property("apiKey");
       expect(request.body.spec).to.deep.equal({ provider: "llama-server", protocol: "openai-chat", endpoint: "http://framework:8080/v1/chat/completions", models: ["qwen3"], allowInsecure: true });
@@ -65,14 +148,19 @@ describe("Create Agent → Celln: the Agent's own model backend", () => {
       request.reply({ statusCode: 201, body: { metadata: { name: "mine" }, spec: {} } });
     }).as("agent");
     openProviderStep();
-    cy.get('[data-testid="celln-route-select"]').click();
-    cy.get('[role="option"]').first().click();
+    chooseProvider("llama-server");
+    cy.get('[data-testid="celln-endpoint"]').type("http://framework:8080");
+    cy.get('[data-testid="celln-keyed"]').should("not.be.checked");
+    cy.get('[data-testid="celln-route-summary"]').should("contain", "No key is required");
     next();
     cy.get('[data-testid="celln-keyless-route"]').should("contain", "No API key is required");
     cy.get('[data-testid="celln-api-key"]').should("not.exist");
     next();
+    cy.get('[data-testid="celln-origin"]').should("have.text", "http://framework:8080");
+    cy.get('[data-testid="celln-endpoint-path"]').should("have.value", "/v1/chat/completions");
+    typeModel("qwen3");
     next();
-    cy.get('[data-testid="celln-own-key-confirmation"]').should("contain", "keyless route");
+    cy.get('[data-testid="celln-own-key-confirmation"]').should("contain", "keyless endpoint").and("contain", "allowInsecure");
     dialog().contains("button", "YAML").click();
     cy.get('[role="dialog"]').last().should("not.contain", "secretRef:").and("not.contain", "authRefs:").and("contain", "allowInsecure: true");
     cy.get("body").type("{esc}");
@@ -81,38 +169,8 @@ describe("Create Agent → Celln: the Agent's own model backend", () => {
     cy.get('[role="dialog"]').should("not.exist");
   });
 
-  it("says what the operator must run when mediated model access is disabled", () => {
-    stub({ enabled: false, mediateBackends: false, routes: [], pending: [] });
-    openProviderStep();
-    cy.get('[data-testid="wizard-steps"] [data-step]').then(($steps) => {
-      expect([...$steps].map((el) => el.getAttribute("data-step"))).to.deep.equal(["name", "plane", "provider", "apikey", "model", "confirm"]);
-    });
-    cy.get('[data-testid="celln-mediation-disabled"]').should("contain", "Mediated model access is not enabled").and("contain", "celln.mediation.enabled");
-    cy.get('[data-testid="celln-route-command"]').should("contain", "sympozium install").and("not.contain", "--set celln.mediation.enabled=true").and("contain", "--celln-mediated-route provider=").and("contain", "protocol=").and("contain", "origin=https://").and("contain", "models=");
-    cy.get('[data-testid="celln-mediation-disabled"] a').should("have.attr", "href").and("contain", "celln-mediated-model-access.md");
-    // Nothing else is offered in its place.
-    cy.get('[data-testid="celln-route-select"]').should("not.exist");
-    dialog().should("not.contain", "fleet backend").and("not.contain", "Add to the fleet");
-    dialog().contains("button", "Next").should("be.disabled");
-  });
-
-  it("says no provider is declared", () => {
-    stub({ enabled: true, mediateBackends: false, routes: [], pending: [] });
-    openProviderStep();
-    cy.get('[data-testid="celln-no-routes"]').should("contain", "No provider is declared for this namespace").and("contain", "AUTH_ROUTE_MISMATCH");
-    cy.get('[data-testid="celln-route-command"]').should("contain", "--celln-mediated-route provider=").and("not.contain", "celln.mediation.enabled=true");
-    dialog().contains("button", "Next").should("be.disabled");
-  });
-
-  it("says declared providers are not published yet", () => {
-    stub({ enabled: true, mediateBackends: false, routes: [], pending: [{ ...anthropic, policy: undefined }] });
-    openProviderStep();
-    cy.get('[data-testid="celln-no-routes"]').should("contain", "not published yet").and("contain", "anthropic");
-    cy.get('[data-testid="celln-route-command"]').should("have.text", "sympozium celln-mediation apply-routes");
-  });
-
   it("creates the Secret, the connection, the runtime wrapper and the Agent from a pasted key, and never shows the key again", () => {
-    stub({ enabled: true, mediateBackends: false, routes: [anthropic, gateway], pending: [] });
+    stub();
     const calls: string[] = [];
     cy.intercept("POST", "**/api/v1/model-connections*", (request) => {
       calls.push("connection");
@@ -127,6 +185,7 @@ describe("Create Agent → Celln: the Agent's own model backend", () => {
     }).as("connection");
     cy.intercept("POST", "**/api/v1/celln-platform/wrappers*", (request) => {
       calls.push("runtime");
+      // The namespace's offered profile, runtime only: no shared Agent or connection.
       expect(request.body).to.deep.equal({ profile: "celln-native-starter", runtimeOnly: true });
       request.reply({ body: { backend: "native", runtime: "celln-native", agent: "", connection: "", created: ["celln-native"] } });
     }).as("runtime");
@@ -144,12 +203,8 @@ describe("Create Agent → Celln: the Agent's own model backend", () => {
     }).as("agent");
 
     openProviderStep();
-    // Only the declared providers, in the Kubernetes plane's visual language.
-    cy.get('[data-testid="celln-route-select"]').click();
-    cy.get('[role="option"]').should("have.length", 2);
-    cy.get('[role="option"]').contains("OpenAI").should("not.exist");
-    cy.get('[role="option"]').contains("Anthropic").click();
-    cy.get('[data-testid="celln-route-summary"]').should("contain", "celln-fleet-starter").and("contain", "its own key");
+    chooseProvider("anthropic");
+    cy.get('[data-testid="celln-route-summary"]').should("contain", "anthropic-messages").and("contain", "https://api.anthropic.com").and("contain", "pinned to this origin");
     next();
 
     // Auth: the key name is fixed by the protocol and the Secret lives here.
@@ -159,19 +214,26 @@ describe("Create Agent → Celln: the Agent's own model backend", () => {
     cy.get('[data-testid="celln-api-key"]').should("have.attr", "type", "password").type(KEY, { log: false });
     next();
 
-    // Model: exactly the route's models; nothing is free text.
-    cy.get('[data-testid="celln-models"] button').should("have.length", 2);
-    cy.get('[data-testid="celln-model-step"]').find('input[placeholder="gpt-4o"]').should("not.exist");
-    dialog().contains("button", "Next").should("be.disabled");
-    cy.get('[data-testid="celln-models"] [data-model="claude-sonnet-5"]').click();
+    // Model: any model name, prefilled with a well-known one; the origin is fixed.
+    cy.get('[data-testid="celln-models"]').should("not.exist");
+    cy.get('[data-testid="celln-model-name"]').should("have.value", "claude-sonnet-4-20250514");
+    typeModel("claude-sonnet-5");
     cy.get('[data-testid="celln-origin"]').should("have.text", "https://api.anthropic.com");
+    cy.get('[data-testid="celln-origin-select"]').should("not.exist");
     cy.get('[data-testid="celln-endpoint-path"]').should("have.value", "/v1/messages");
     // Hosted Anthropic takes no chat-template switch.
     cy.get('[data-testid="celln-model-parameters"] summary').click();
     cy.get('[data-testid="celln-disable-thinking"]').should("not.exist");
     next();
 
-    cy.get('[data-testid="celln-own-key-confirmation"]').should("contain", "mine-connection-anthropic-key").and("contain", "ANTHROPIC_API_KEY").and("contain", "https://api.anthropic.com/v1/messages").and("contain", "celln-native");
+    cy.get('[data-testid="celln-own-key-confirmation"]')
+      .should("contain", "anthropic (anthropic-messages)")
+      .and("contain", "mine-connection-anthropic-key").and("contain", "ANTHROPIC_API_KEY")
+      .and("contain", "https://api.anthropic.com/v1/messages")
+      .and("contain", "celln-native").and("contain", "celln-native-starter")
+      .and("contain", "One conversation")
+      .and("not.contain", "declared in policy");
+    cy.get('[data-testid="celln-confirm-origin"]').should("have.text", "https://api.anthropic.com");
     // The YAML preview names the Secret and never carries the key.
     dialog().contains("button", "YAML").click();
     cy.get('[role="dialog"]').last().should("contain", "secretRef: mine-connection-anthropic-key").and("contain", "authRefs").and("contain", "modelConnectionRef: mine-connection").and("not.contain", KEY).and("not.contain", "credentialProfile");
@@ -189,9 +251,8 @@ describe("Create Agent → Celln: the Agent's own model backend", () => {
     });
   });
 
-  it("takes a typed model name on an any-model route, prefilled and validated, with the origin still fixed", () => {
-    const anyOpenAI = { provider: "openai", protocol: "openai-chat", models: ["*"], anyModel: true, endpointOrigins: ["https://api.openai.com"], policy: "celln-fleet-starter", secretKey: "OPENAI_API_KEY" };
-    stub({ enabled: true, mediateBackends: false, routes: [anyOpenAI, anthropic], pending: [] });
+  it("validates a typed model name on a hosted preset, with the origin still fixed", () => {
+    stub();
     cy.intercept("POST", "**/api/v1/model-connections*", (request) => {
       expect(request.body.spec).to.deep.equal({ provider: "openai", protocol: "openai-chat", endpoint: "https://api.openai.com/v1/chat/completions", models: ["gpt-new-2026"] });
       request.reply({ statusCode: 201, body: { metadata: { name: "mine-connection", namespace: "default" }, spec: { ...request.body.spec, secretRef: "mine-connection-openai-key" } } });
@@ -202,22 +263,20 @@ describe("Create Agent → Celln: the Agent's own model backend", () => {
       request.reply({ statusCode: 201, body: { metadata: { name: "mine" }, spec: {} } });
     }).as("agent");
     openProviderStep();
-    chooseProvider("OpenAI");
-    cy.get('[data-testid="celln-route-summary"]').should("contain", "any model").and("not.contain", "*");
+    chooseProvider("openai");
     next();
+    cy.get('[data-testid="celln-key-step"]').should("contain", "OPENAI_API_KEY");
     cy.get('[data-testid="celln-api-key"]').type(KEY, { log: false });
     next();
-    // No list to choose from: a model name, prefilled with a well-known one.
-    cy.get('[data-testid="celln-models"]').should("not.exist");
     cy.get('[data-testid="celln-model-name"]').should("have.value", "gpt-4o");
     dialog().contains("button", "Next").should("not.be.disabled");
     for (const bad of ["gpt 4o", "*"]) {
-      cy.get('[data-testid="celln-model-name"]').clear().type(bad);
+      typeModel(bad);
       dialog().contains("button", "Next").should("be.disabled");
     }
     cy.get('[data-testid="celln-model-name"]').clear();
     dialog().contains("button", "Next").should("be.disabled");
-    cy.get('[data-testid="celln-model-name"]').type("gpt-new-2026");
+    typeModel("gpt-new-2026");
     cy.get('[data-testid="celln-model-name-error"]').should("not.exist");
     cy.get('[data-testid="celln-origin"]').should("have.text", "https://api.openai.com");
     next();
@@ -226,7 +285,7 @@ describe("Create Agent → Celln: the Agent's own model backend", () => {
   });
 
   it("links an existing Secret that already holds the protocol's key, with a kubectl prompt and a refresh", () => {
-    stub({ enabled: true, mediateBackends: false, routes: [anthropic], pending: [] });
+    stub();
     let listed = 0;
     cy.intercept("GET", "**/api/v1/celln-platform/key-secrets*", (request) => {
       listed++;
@@ -245,7 +304,7 @@ describe("Create Agent → Celln: the Agent's own model backend", () => {
     cy.intercept("POST", "**/api/v1/agents*", { statusCode: 201, body: { metadata: { name: "mine" }, spec: {} } }).as("agent");
 
     openProviderStep();
-    chooseProvider("Anthropic");
+    chooseProvider("anthropic");
     next();
     cy.get('[data-testid="celln-key-mode-existing"]').click();
     cy.wait("@secrets");
@@ -260,22 +319,23 @@ describe("Create Agent → Celln: the Agent's own model backend", () => {
     cy.get('[data-testid="celln-key-secrets"] [data-secret="other-connection-anthropic-key"]').should("contain", "created by the console");
     cy.get('[data-testid="celln-key-secrets"] [data-secret="team-anthropic"]').click();
     next();
-    cy.get('[data-testid="celln-models"] [data-model="claude-opus-5"]').click();
+    typeModel("claude-opus-5");
     next();
-    cy.get('[data-testid="celln-own-key-confirmation"]').should("contain", "existing Secret team-anthropic");
+    cy.get('[data-testid="celln-own-key-confirmation"]').should("contain", "existing Secret team-anthropic").and("contain", "pinned to https://api.anthropic.com");
     dialog().contains("button", /Create\s*$/).click();
     cy.wait(["@connection", "@runtime", "@agent"]);
     cy.get('[role="dialog"]').should("not.exist");
   });
 
-  it("offers a route's several origins, fixes the key name by protocol, and writes the advanced parameters to this Agent's connection", () => {
-    stub({ enabled: true, mediateBackends: false, routes: [anthropic, gateway], pending: [] });
+  it("takes a custom endpoint with its protocol and key, keeps its path, and writes the advanced parameters to this Agent's connection", () => {
+    stub();
     cy.intercept("POST", "**/api/v1/model-connections*", (request) => {
       expect(request.body.spec).to.deep.equal({
-        provider: "llm-gateway", protocol: "openai-chat", endpoint: "https://llm-eu.example.com/openai/v1/chat/completions", models: ["qwen3"],
+        provider: "custom", protocol: "openai-chat", endpoint: "https://llm-eu.example.com/openai/v1/chat/completions", models: ["qwen3"],
         parameters: { chat_template_kwargs: { enable_thinking: false } }, maxOutputTokens: 2048,
       });
-      request.reply({ statusCode: 201, body: { metadata: { name: "mine-connection" }, spec: { ...request.body.spec, secretRef: "mine-connection-llm-gateway-key" } } });
+      expect(request.body.apiKey).to.equal(KEY);
+      request.reply({ statusCode: 201, body: { metadata: { name: "mine-connection" }, spec: { ...request.body.spec, secretRef: "mine-connection-custom-key" } } });
     }).as("connection");
     cy.intercept("POST", "**/api/v1/celln-platform/wrappers*", { body: { backend: "native", runtime: "celln-native", agent: "", connection: "", created: [] } });
     cy.intercept("POST", "**/api/v1/agents*", (request) => {
@@ -285,17 +345,20 @@ describe("Create Agent → Celln: the Agent's own model backend", () => {
     }).as("agent");
 
     openProviderStep();
-    chooseProvider("llm-gateway");
+    chooseProvider("custom");
+    cy.get('[data-testid="celln-protocol"]').should("contain", "OpenAI-compatible");
+    cy.get('[data-testid="celln-endpoint"]').type("https://llm-eu.example.com/openai/v1/chat/completions");
+    cy.get('[data-testid="celln-keyed"]').check();
+    cy.get('[data-testid="celln-route-summary"]').should("contain", "https://llm-eu.example.com").and("contain", "its own key");
     next();
-    // An OpenAI-protocol route fixes OPENAI_API_KEY, whatever the provider is called.
-    cy.get('[data-testid="celln-key-step"]').should("contain", "OPENAI_API_KEY").and("not.contain", "ANTHROPIC_API_KEY");
+    // An OpenAI-protocol endpoint fixes OPENAI_API_KEY, whatever the provider is called.
+    cy.get('[data-testid="celln-key-step"]').should("contain", "OPENAI_API_KEY").and("not.contain", "ANTHROPIC_API_KEY").and("contain", "mine-connection-custom-key");
     cy.get('[data-testid="celln-api-key"]').type(KEY, { log: false });
     next();
-    // The route's only model is already chosen; the origin is the operator's list.
-    cy.get('[data-testid="celln-models"] [data-model="qwen3"]').should("have.attr", "aria-pressed", "true");
-    cy.get('[data-testid="celln-origin-select"]').click();
-    cy.get('[role="option"]').should("have.length", 2).contains("https://llm-eu.example.com").click();
-    cy.get('[data-testid="celln-endpoint-path"]').should("have.value", "/v1/chat/completions").clear().type("/openai/v1/chat/completions");
+    // The typed path is kept; the origin is the one admitted on the Provider step.
+    cy.get('[data-testid="celln-origin"]').should("have.text", "https://llm-eu.example.com");
+    cy.get('[data-testid="celln-endpoint-path"]').should("have.value", "/openai/v1/chat/completions");
+    typeModel("qwen3");
 
     cy.get('[data-testid="celln-model-parameters"] summary').click();
     cy.get('[data-testid="celln-model-parameters"]').should("contain", "this Agent").and("contain", "model gateway").and("not.contain", "fleet backend").and("not.contain", "cannot be changed");
@@ -313,8 +376,34 @@ describe("Create Agent → Celln: the Agent's own model backend", () => {
     cy.wait(["@connection", "@agent"]);
   });
 
+  it("offers the Anthropic protocol on a custom endpoint and fixes ANTHROPIC_API_KEY for it", () => {
+    stub();
+    cy.intercept("POST", "**/api/v1/model-connections*", (request) => {
+      expect(request.body.spec).to.deep.equal({ provider: "custom", protocol: "anthropic-messages", endpoint: "https://claude-proxy.example.com/v1/messages", models: ["claude-opus-5"] });
+      request.reply({ statusCode: 201, body: { metadata: { name: "mine-connection" }, spec: { ...request.body.spec, secretRef: "mine-connection-custom-key" } } });
+    }).as("connection");
+    cy.intercept("POST", "**/api/v1/celln-platform/wrappers*", { body: { runtime: "celln-native", created: [] } });
+    cy.intercept("POST", "**/api/v1/agents*", { statusCode: 201, body: { metadata: { name: "mine" }, spec: {} } }).as("agent");
+    openProviderStep();
+    chooseProvider("custom");
+    cy.get('[data-testid="celln-endpoint"]').type("https://claude-proxy.example.com");
+    cy.get('[data-testid="celln-protocol"]').click();
+    cy.get('[role="option"]').contains("Anthropic-compatible").click();
+    cy.get('[data-testid="celln-keyed"]').check();
+    cy.get('[data-testid="celln-route-summary"]').should("contain", "anthropic-messages");
+    next();
+    cy.get('[data-testid="celln-key-step"]').should("contain", "ANTHROPIC_API_KEY").and("not.contain", "OPENAI_API_KEY");
+    cy.get('[data-testid="celln-api-key"]').type(KEY, { log: false });
+    next();
+    cy.get('[data-testid="celln-endpoint-path"]').should("have.value", "/v1/messages");
+    typeModel("claude-opus-5");
+    next();
+    dialog().contains("button", /Create\s*$/).click();
+    cy.wait(["@connection", "@agent"]);
+  });
+
   it("says exactly what was created when a later step fails, and a retry does not send the key again", () => {
-    stub({ enabled: true, mediateBackends: false, routes: [anthropic], pending: [] });
+    stub();
     const bodies: Record<string, unknown>[] = [];
     cy.intercept("POST", "**/api/v1/model-connections*", (request) => {
       bodies.push(request.body);
@@ -329,11 +418,11 @@ describe("Create Agent → Celln: the Agent's own model backend", () => {
     cy.intercept("POST", "**/api/v1/agents*", { statusCode: 500, body: 'agents.sympozium.ai "mine" already exists' }).as("agent");
 
     openProviderStep();
-    chooseProvider("Anthropic");
+    chooseProvider("anthropic");
     next();
     cy.get('[data-testid="celln-api-key"]').type(KEY, { log: false });
     next();
-    cy.get('[data-testid="celln-models"] [data-model="claude-opus-5"]').click();
+    typeModel("claude-opus-5");
     next();
     dialog().contains("button", /Create\s*$/).click();
     cy.wait("@runtime");
@@ -365,21 +454,41 @@ describe("Create Agent → Celln: the Agent's own model backend", () => {
   });
 
   it("reports a connection the API refused before writing anything", () => {
-    stub({ enabled: true, mediateBackends: false, routes: [anthropic], pending: [] });
+    stub();
     cy.intercept("POST", "**/api/v1/model-connections*", { statusCode: 400, body: "endpoint must be an HTTP(S) API URL without credentials, query or fragment" }).as("connection");
     cy.intercept("POST", "**/api/v1/celln-platform/wrappers*", () => { throw new Error("the runtime step ran after a refused connection"); });
     openProviderStep();
-    chooseProvider("Anthropic");
+    chooseProvider("anthropic");
     next();
     cy.get('[data-testid="celln-api-key"]').type(KEY, { log: false });
     next();
-    cy.get('[data-testid="celln-models"] [data-model="claude-opus-5"]').click();
+    typeModel("claude-opus-5");
     next();
     dialog().contains("button", /Create\s*$/).click();
     cy.wait("@connection");
     cy.get('[data-testid="celln-own-key-progress"] [data-step="secret"]').should("have.attr", "data-state", "not-started");
     cy.get('[data-testid="celln-own-key-progress"] [data-step="connection"]').should("have.attr", "data-state", "failed");
     cy.get('[data-testid="celln-own-key-progress"] [data-step="agent"]').should("have.attr", "data-state", "not-started");
+  });
+
+  it("shows the API's own words when a Secret is already pinned to another origin (409)", () => {
+    stub();
+    const refusal = 'Secret "team-anthropic" is pinned to origin https://api.openai.com and cannot be moved to https://api.anthropic.com; a key used elsewhere needs a new key entered by a person';
+    cy.intercept("GET", "**/api/v1/celln-platform/key-secrets*", { body: [{ name: "team-anthropic", key: "ANTHROPIC_API_KEY" }] });
+    cy.intercept("POST", "**/api/v1/model-connections*", { statusCode: 409, body: refusal }).as("connection");
+    cy.intercept("POST", "**/api/v1/celln-platform/wrappers*", () => { throw new Error("the runtime step ran after a refused connection"); });
+    openProviderStep();
+    chooseProvider("anthropic");
+    next();
+    cy.get('[data-testid="celln-key-mode-existing"]').click();
+    cy.get('[data-testid="celln-key-secrets"] [data-secret="team-anthropic"]').click();
+    next();
+    typeModel("claude-opus-5");
+    next();
+    dialog().contains("button", /Create\s*$/).click();
+    cy.wait("@connection");
+    cy.get('[data-testid="celln-own-key-progress"]').should("contain", refusal);
+    cy.get('[data-testid="celln-own-key-progress"] [data-step="connection"]').should("have.attr", "data-state", "failed");
   });
 });
 
@@ -395,8 +504,8 @@ describe("Agent → Harness: the Agent's own model backend", () => {
   const connection = { metadata: { name: "mine-connection", namespace: "default" }, spec: { provider: "anthropic", protocol: "anthropic-messages", endpoint: "https://api.anthropic.com/v1/messages", secretRef: "mine-connection-anthropic-key", models: ["claude-sonnet-5"], maxOutputTokens: 1024 } };
   const runtime = { metadata: { name: "celln-native", namespace: "default" }, spec: { cellnProfileRef: { name: profile.name, revision: "v1" }, supportOwner: "celln-platform" } };
 
-  function open(mediation: Mediation) {
-    stub(mediation);
+  function open(guardrail: Mediation = mediation()) {
+    stub(guardrail);
     cy.intercept("GET", "**/api/v1/agents/mine*", { body: agent });
     cy.intercept("GET", "**/api/v1/agents?*", { body: [agent] });
     cy.intercept("GET", "**/api/v1/runtimes*", { body: [runtime] });
@@ -405,22 +514,23 @@ describe("Agent → Harness: the Agent's own model backend", () => {
   }
 
   it("shows the provider, model, origin, Secret name and limits, and no fleet-backend controls", () => {
-    open({ enabled: true, mediateBackends: false, routes: [anthropic], pending: [] });
-    cy.get('[data-testid="agent-model-backend"]').should("contain", "anthropic").and("contain", "claude-sonnet-5").and("contain", "https://api.anthropic.com").and("contain", "ANTHROPIC_API_KEY").and("contain", "1024 per request");
+    open();
+    cy.get('[data-testid="agent-model-backend"]').should("contain", "anthropic").and("contain", "claude-sonnet-5").and("contain", "https://api.anthropic.com").and("contain", "ANTHROPIC_API_KEY").and("contain", "pinned to this origin").and("contain", "1024 per request");
     cy.get('[data-testid="agent-model-backend-secret"]').should("have.text", "mine-connection-anthropic-key");
-    cy.get('[data-testid="agent-model-backend-no-route"]').should("not.exist");
+    cy.get('[data-testid="agent-model-backend-origin-denied"]').should("not.exist");
+    cy.get('[data-testid="agent-model-backend-origin-needs-approval"]').should("not.exist");
     cy.get('[data-testid="agent-backend-picker"]').should("not.exist");
     cy.get('[data-testid="celln-add-backend"]').should("not.exist");
-    cy.get('[data-testid="agent-execution-defaults"]').should("not.contain", "Add a fleet backend").and("not.contain", "Add to the fleet");
+    cy.get('[data-testid="agent-execution-defaults"]').should("not.contain", "Add a fleet backend").and("not.contain", "Add to the fleet").and("not.contain", "declared");
   });
 
-  it("warns when no declared route matches the connection any more", () => {
-    open({ enabled: true, mediateBackends: false, routes: [{ ...anthropic, models: ["claude-opus-5"] }], pending: [] });
-    cy.get('[data-testid="agent-model-backend-no-route"]').should("contain", "AUTH_ROUTE_MISMATCH").and("contain", "claude-sonnet-5");
+  it("warns when the policy no longer admits the connection's origin", () => {
+    open(mediation({ deniedOrigins: ["*.anthropic.com"] }));
+    cy.get('[data-testid="agent-model-backend-origin-denied"]').should("contain", "AUTH_ROUTE_MISMATCH").and("contain", "https://api.anthropic.com").and("contain", "*.anthropic.com").and("contain", "celln-fleet-starter");
   });
 
   it("edits the parameters and output tokens of this Agent's connection and says a new conversation is needed", () => {
-    open({ enabled: true, mediateBackends: false, routes: [anthropic], pending: [] });
+    open();
     cy.intercept("POST", "**/api/v1/model-connections*", (request) => {
       expect(request.body).to.deep.equal({
         name: "mine-connection",
@@ -435,7 +545,7 @@ describe("Agent → Harness: the Agent's own model backend", () => {
       request.reply({ body: agent });
     }).as("patch");
     cy.get('[data-testid="agent-model-backend-edit"]').click();
-    cy.get('[data-testid="agent-model-backend-route-changed"]').should("contain", "MODEL_ROUTE_CHANGED").and("contain", "start a new conversation");
+    cy.get('[data-testid="agent-model-backend-route-changed"]').should("contain", "MODEL_ROUTE_CHANGED").and("contain", "start a new conversation").and("contain", "pinned to the origin");
     cy.get('[data-testid="celln-model-parameters"] summary').click();
     cy.get('[data-testid="celln-max-output-tokens"]').should("have.value", "1024").clear().type("4096");
     cy.get('[data-testid="celln-model-parameters-json"]').type('{"temperature": 0.2}', { parseSpecialCharSequences: false });
@@ -444,11 +554,16 @@ describe("Agent → Harness: the Agent's own model backend", () => {
     cy.get('[data-testid="agent-model-backend"]').should("contain", "Start a new conversation");
   });
 
-  it("replaces the key with a pasted one or an existing Secret, never echoing it", () => {
-    open({ enabled: true, mediateBackends: false, routes: [anthropic], pending: [] });
+  it("replaces the key with a pasted one or an existing Secret, never echoing it, and shows a 409 as the API words it", () => {
+    open();
     cy.intercept("GET", "**/api/v1/celln-platform/key-secrets*", { body: [{ name: "team-anthropic", key: "ANTHROPIC_API_KEY" }] });
     const bodies: Record<string, unknown>[] = [];
-    cy.intercept("POST", "**/api/v1/model-connections*", (request) => { bodies.push(request.body); request.reply({ body: { ...connection, spec: { ...request.body.spec, secretRef: request.body.spec.secretRef || "mine-connection-anthropic-key" } } }); }).as("save");
+    const refusal = 'Secret "team-anthropic" is pinned to origin https://api.openai.com; a key moved to another origin needs a new key entered by a person';
+    cy.intercept("POST", "**/api/v1/model-connections*", (request) => {
+      bodies.push(request.body);
+      if (request.body.spec.secretRef === "team-anthropic") request.reply({ statusCode: 409, body: refusal });
+      else request.reply({ body: { ...connection, spec: { ...request.body.spec, secretRef: request.body.spec.secretRef || "mine-connection-anthropic-key" } } });
+    }).as("save");
     cy.intercept("PATCH", "**/api/v1/agents/mine*", { body: agent }).as("patch");
 
     cy.get('[data-testid="agent-model-backend-edit"]').click();
@@ -464,7 +579,7 @@ describe("Agent → Harness: the Agent's own model backend", () => {
     cy.get('[data-testid="celln-key-mode-existing"]').click();
     cy.get('[data-testid="celln-key-secrets"] [data-secret="team-anthropic"]').click();
     cy.get('[data-testid="agent-model-backend-save"]').click();
-    cy.wait(["@save", "@patch"]).then(() => {
+    cy.wait("@save").then(() => {
       // A pasted key goes with no secretRef (the API names the Secret); a linked one with no key.
       expect(bodies[0]).to.have.property("apiKey", KEY);
       expect(bodies[0].spec).not.to.have.property("secretRef");
@@ -472,5 +587,7 @@ describe("Agent → Harness: the Agent's own model backend", () => {
       expect(bodies[1]).not.to.have.property("apiKey");
       expect(bodies[1].spec).to.have.property("secretRef", "team-anthropic");
     });
+    cy.get('[data-testid="agent-model-backend"] [role="alert"]').should("contain", refusal);
+    cy.get("@patch.all").should("have.length", 1);
   });
 });

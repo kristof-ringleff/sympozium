@@ -35,13 +35,6 @@ env:
   RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
-  native-artifacts:
-    uses: ./.github/workflows/native-artifacts.yaml
-    with:
-      tag: ${{ inputs.tag || github.ref_name }}
-      publish: true
-    secrets: inherit
-
   # ── Default Celln starter package ─────────────────────────────────────────────
   # Built from the pinned Celln, signed with a key generated here and
   # discarded, published as a digest-pinned image, and embedded into the CLI so

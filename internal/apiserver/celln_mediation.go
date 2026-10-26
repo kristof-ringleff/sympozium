@@ -1,65 +1,43 @@
 package apiserver
 
 import (
+	"encoding/json"
 	"net/http"
-	"reflect"
-	"slices"
+	"os"
+	"strings"
 
-	api "github.com/sympozium-ai/sympozium/api/v1alpha1"
 	"github.com/sympozium-ai/sympozium/internal/cellninstall"
 	"github.com/sympozium-ai/sympozium/internal/cellnplatform"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 )
 
-// Which providers an Agent in a namespace may bring its own key for. Read
-// only, and nothing here is a credential: provider names, model names and
-// public origins, exactly as the operator declared them. The routes offered
-// are the ones the resolver will match (the namespace's live policies), not
-// the declaration, so a client never offers a route a run would be refused.
-
-// CellnMediatedRoute is one auth "secret" or "none" route. A ModelConnection matches it
-// only with exactly this provider and protocol, one of these models (any
-// model when AnyModel) and an endpoint on one of these origins.
-type CellnMediatedRoute struct {
-	Provider string   `json:"provider"`
-	Protocol string   `json:"protocol"`
-	Models   []string `json:"models"`
-	// AnyModel reports models ["*"]: any model name of this provider at
-	// these exact origins, so a client asks for the name instead of listing.
-	AnyModel        bool     `json:"anyModel,omitempty"`
-	EndpointOrigins []string `json:"endpointOrigins"`
-	// Policy is the execution policy carrying the route; empty on a pending one.
-	Policy string `json:"policy,omitempty"`
-	// SecretKey is the fixed key the provider Secret must hold, empty for auth none.
-	SecretKey     string `json:"secretKey"`
-	Auth          string `json:"auth,omitempty"`
-	AllowInsecure bool   `json:"allowInsecure,omitempty"`
-}
-
-func mediatedAPIRoute(route api.CellnExecutionPolicyRoute, policy string) CellnMediatedRoute {
-	out := CellnMediatedRoute{Provider: route.Provider, Protocol: route.Protocol, Models: route.Models, EndpointOrigins: route.EndpointOrigins, Policy: policy, AllowInsecure: route.AllowInsecure, AnyModel: route.AnyModel()}
-	if route.Auth == "none" {
-		out.Auth = "none"
-	} else {
-		out.SecretKey = connectionSecretKey(route.Protocol)
-	}
-	return out
-}
+// How an Agent in a namespace may use its own model key. Read only, and
+// nothing here is a credential. The Agent's connection is the route; what
+// this reports is the operator's guardrail over it.
 
 // CellnMediation is the answer of GET /api/v1/celln-platform/mediation.
 type CellnMediation struct {
-	// Enabled reports that the release runs with celln.mediation.enabled: the
-	// chart then renders the operator's declaration into celln-system.
+	// Enabled reports that the release runs the model gateway, which is how
+	// every Celln Agent's model requests leave a cell.
 	Enabled bool `json:"enabled"`
-	// MediateBackends reports that the operator also offers every HTTPS fleet
-	// backend's route to an Agent's own key.
-	MediateBackends bool `json:"mediateBackends"`
-	// Routes are the mediated routes the namespace's policies carry now.
-	Routes []CellnMediatedRoute `json:"routes"`
-	// Pending are routes the operator declared that no policy in the cluster
-	// carries yet; `sympozium celln-mediation apply-routes` (or the
-	// next install or added backend) publishes them.
-	Pending []CellnMediatedRoute `json:"pending"`
+	// AllowedOrigins and DeniedOrigins are the host patterns the namespace's
+	// policies place on an Agent's own connection: empty AllowedOrigins
+	// means any origin the gateway reaches. Every policy that selects the
+	// namespace applies, so these are their union (allowed: intersection
+	// is what the resolver enforces; a client treats the lists as advice).
+	AllowedOrigins []string `json:"allowedOrigins"`
+	DeniedOrigins  []string `json:"deniedOrigins"`
+	// Policies names the policies that apply.
+	Policies []string `json:"policies"`
+	// PrivateOrigins are the exact origins (scheme://host[:port]) on
+	// private, loopback or link-local addresses the operator approved for the
+	// gateway (modelGateway.privateOrigins). A connection to any other
+	// private endpoint is refused at the gateway, so a console shows it as
+	// awaiting approval rather than letting a run fail on its first call.
+	PrivateOrigins []string `json:"privateOrigins"`
+	// Routes and Pending are always empty: 0.11 consoles iterated them.
+	Routes  []struct{} `json:"routes"`
+	Pending []struct{} `json:"pending"`
 }
 
 func (s *Server) getCellnMediation(w http.ResponseWriter, r *http.Request) {
@@ -81,36 +59,43 @@ func (s *Server) getCellnMediation(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	out := CellnMediation{Enabled: record.Enabled, MediateBackends: record.MediateBackends, Routes: []CellnMediatedRoute{}, Pending: []CellnMediatedRoute{}}
+	out := CellnMediation{Enabled: record.Enabled, AllowedOrigins: []string{}, DeniedOrigins: []string{}, Policies: []string{}, PrivateOrigins: approvedPrivateOrigins(), Routes: []struct{}{}, Pending: []struct{}{}}
 	seen := map[string]bool{}
 	for _, a := range authorised {
 		if seen[a.Policy.Name] {
 			continue
 		}
 		seen[a.Policy.Name] = true
-		for _, route := range a.Policy.Spec.Routes {
-			if route.Auth == "secret" || route.Auth == "none" {
-				out.Routes = append(out.Routes, mediatedAPIRoute(route, a.Policy.Name))
-			}
-		}
-	}
-	var policies api.CellnExecutionPolicyList
-	if len(record.Routes) != 0 {
-		if err := s.client.List(r.Context(), &policies); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-	}
-	for _, declared := range record.Routes {
-		route, err := declared.PolicyRoute()
-		if err != nil {
-			continue // ReadMediationRecord validated it
-		}
-		if !slices.ContainsFunc(policies.Items, func(policy api.CellnExecutionPolicy) bool {
-			return slices.ContainsFunc(policy.Spec.Routes, func(have api.CellnExecutionPolicyRoute) bool { return reflect.DeepEqual(have, route) })
-		}) {
-			out.Pending = append(out.Pending, mediatedAPIRoute(route, ""))
-		}
+		out.Policies = append(out.Policies, a.Policy.Name)
+		out.AllowedOrigins = append(out.AllowedOrigins, a.Policy.Spec.AllowedOrigins...)
+		out.DeniedOrigins = append(out.DeniedOrigins, a.Policy.Spec.DeniedOrigins...)
 	}
 	writeJSON(w, out)
+}
+
+// privateOriginsEnv carries the gateway's approved private origins to the API
+// server: a JSON array, or a comma-separated list, of exact origins. The chart
+// renders it from the same value the gateway reads (modelGateway.privateOrigins).
+const privateOriginsEnv = "SYMPOZIUM_PRIVATE_ORIGINS"
+
+func approvedPrivateOrigins() []string {
+	raw := strings.TrimSpace(os.Getenv(privateOriginsEnv))
+	origins := []string{}
+	if raw == "" {
+		return origins
+	}
+	if strings.HasPrefix(raw, "[") {
+		if err := json.Unmarshal([]byte(raw), &origins); err != nil {
+			return []string{}
+		}
+	} else {
+		origins = strings.Split(raw, ",")
+	}
+	out := make([]string, 0, len(origins))
+	for _, o := range origins {
+		if o = strings.TrimSpace(o); o != "" {
+			out = append(out, o)
+		}
+	}
+	return out
 }

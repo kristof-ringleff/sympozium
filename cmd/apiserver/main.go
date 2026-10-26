@@ -116,12 +116,6 @@ func main() {
 
 	server := apiserver.NewServer(k8sClient.GetClient(), bus, kubeClient, log.WithName("apiserver"))
 	server.SetVersion(version)
-	if path := os.Getenv("CELLN_PERMISSION_PREVIEW_CONFIG"); path != "" {
-		if err := server.LoadCellnPreview(path, k8sClient.GetAPIReader()); err != nil {
-			log.Error(err, "invalid Celln permission preview configuration")
-			os.Exit(1)
-		}
-	}
 
 	// Start llmfit density poller for fitness API endpoints.
 	{

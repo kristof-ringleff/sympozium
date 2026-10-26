@@ -21,6 +21,7 @@ type Input struct {
 	Provider           string
 	Model              string
 	RuntimeRef         string // top-level harness override; not CellnSelection.RuntimeRef
+	SystemPrompt       string
 }
 
 // Result is the effective configuration after inheritance.
@@ -32,6 +33,8 @@ type Result struct {
 	ModelConnectionRef string
 	Provider           string
 	Model              string
+	// SystemPrompt is the run's persona: the request's, else the Agent's.
+	SystemPrompt string
 	// Inherited records which fields came from Agent defaults (for status/audit).
 	Inherited []string
 }
@@ -46,6 +49,7 @@ func Resolve(agent *api.Agent, in Input) (Result, error) {
 		ModelConnectionRef: strings.TrimSpace(in.ModelConnectionRef),
 		Provider:           strings.TrimSpace(in.Provider),
 		Model:              strings.TrimSpace(in.Model),
+		SystemPrompt:       in.SystemPrompt,
 	}
 	if in.CellnSelection != nil {
 		out.CellnSelection = in.CellnSelection.DeepCopy()
@@ -74,6 +78,10 @@ func Resolve(agent *api.Agent, in Input) (Result, error) {
 		if out.CellnSelection == nil && defaults.CellnSelection != nil {
 			out.CellnSelection = defaults.CellnSelection.DeepCopy()
 			out.Inherited = append(out.Inherited, "cellnSelection")
+		}
+		if out.SystemPrompt == "" && defaults.SystemPrompt != "" {
+			out.SystemPrompt = defaults.SystemPrompt
+			out.Inherited = append(out.Inherited, "systemPrompt")
 		}
 		if out.CellnSelection != nil {
 			if out.ModelConnectionRef == "" && in.Provider == "" {

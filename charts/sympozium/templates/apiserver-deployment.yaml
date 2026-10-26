@@ -34,10 +34,6 @@ spec:
             - --serve-ui=false
           {{- end }}
           env:
-          {{- if .Values.celln.permissionPreviewConfigMap }}
-            - name: CELLN_PERMISSION_PREVIEW_CONFIG
-              value: /etc/sympozium/celln-preview/config.json
-          {{- end }}
           {{- if and .Values.nats.enabled .Values.nats.auth.enabled }}
             - name: NATS_USERNAME
               value: sympozium-control
@@ -69,7 +65,12 @@ spec:
             - name: CELLN_ENABLED
               value: "true"
             - name: CELLN_ENDURING_ENABLED
-              value: {{ .Values.celln.dispatcher.enduring.enabled | quote }}
+              value: {{ (.Values.celln.fleet | default dict).enabled | default false | quote }}
+            # The private origins the gateway accepts (modelGateway.privateOrigins),
+            # so the API can tell a console which private endpoint still awaits
+            # operator approval. Origins only; never a credential.
+            - name: SYMPOZIUM_PRIVATE_ORIGINS
+              value: {{ .Values.modelGateway.privateOrigins | default list | toJson | quote }}
             {{- if .Values.celln.caConfigMap }}
             - name: SSL_CERT_FILE
               value: /etc/sympozium/celln-router-ca/ca-bundle.crt
@@ -130,13 +131,8 @@ spec:
           securityContext:
             {{- toYaml .Values.containerSecurityContext | nindent 12 }}
           {{- /* Gate must match apiserver-ui-secret.yaml */}}
-          {{- if or .Values.celln.permissionPreviewConfigMap .Values.celln.enabled (and .Values.apiserver.webUI.enabled (not .Values.apiserver.webUI.token)) }}
+          {{- if or .Values.celln.enabled (and .Values.apiserver.webUI.enabled (not .Values.apiserver.webUI.token)) }}
           volumeMounts:
-          {{- if .Values.celln.permissionPreviewConfigMap }}
-            - name: celln-permission-preview
-              mountPath: /etc/sympozium/celln-preview
-              readOnly: true
-          {{- end }}
           {{- if .Values.celln.enabled }}
             {{- if .Values.celln.caConfigMap }}
             - name: celln-router-ca
@@ -171,16 +167,8 @@ spec:
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- if or .Values.celln.permissionPreviewConfigMap .Values.celln.enabled (not .Values.apiserver.webUI.token) }}
+      {{- if or .Values.celln.enabled (not .Values.apiserver.webUI.token) }}
       volumes:
-      {{- if .Values.celln.permissionPreviewConfigMap }}
-        - name: celln-permission-preview
-          configMap:
-            name: {{ .Values.celln.permissionPreviewConfigMap | quote }}
-            items:
-              - key: config.json
-                path: config.json
-      {{- end }}
       {{- if .Values.celln.enabled }}
         {{- if .Values.celln.caConfigMap }}
         - name: celln-router-ca

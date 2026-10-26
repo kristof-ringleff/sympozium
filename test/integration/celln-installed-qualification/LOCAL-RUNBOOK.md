@@ -125,7 +125,7 @@ CARGO_BUILD_JOBS=2 cargo build --manifest-path "$CELLN/Cargo.toml" --locked \
   --release --target x86_64-unknown-linux-musl -p celln-cli --bin celln
 mkdir -m 700 "$BUILD"
 install -m 755 "$CELLN/target/x86_64-unknown-linux-musl/release/celln" "$BUILD/celln"
-CGO_ENABLED=0 GOMAXPROCS=2 go build -mod=readonly -p 2 -o "$BUILD/controller" ./cmd/celln-scoped-controller
+CGO_ENABLED=0 GOMAXPROCS=2 go build -mod=readonly -p 2 -o "$BUILD/controller" ./cmd/controller
 CGO_ENABLED=0 GOMAXPROCS=2 go build -mod=readonly -p 2 -o "$BUILD/model-gateway" ./cmd/model-gateway
 CGO_ENABLED=0 GOMAXPROCS=2 go build -mod=readonly -p 2 -o "$BUILD/review-provider" ./test/integration/celln-review-provider
 

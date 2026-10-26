@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"regexp"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -29,9 +30,55 @@ func scopedUncertainExpired(run *api.AgentRun, now time.Time) bool {
 	return c != nil && c.Status == metav1.ConditionUnknown && c.Reason == "NativeOwnerUncertain" && now.Sub(c.LastTransitionTime.Time) > scopedUncertainGrace
 }
 
+// boundedTurnFailure keeps the first line of a failed turn's text, cut to a
+// size that fits a status field.
+func boundedTurnFailure(text string) string {
+	const limit = 512
+	if i := strings.IndexByte(text, '\n'); i >= 0 {
+		text = text[:i]
+	}
+	// The owner's cause comes first, then everything the worker printed. Keep
+	// the cause and the harness's own error line, not the event stream.
+	cause, printed, _ := strings.Cut(text, " CELLN_HARNESS_EVENT ")
+	cause = strings.TrimSuffix(strings.TrimSpace(cause), ":")
+	if i := strings.LastIndex(printed, "CELLN_HARNESS_ERROR "); i >= 0 {
+		cause += ": " + strings.TrimPrefix(printed[i:], "CELLN_HARNESS_ERROR ")
+	}
+	if len(cause) > limit {
+		cause = cause[:limit] + "…"
+	}
+	return cause
+}
+
 // scopedUncertainGrace is how long an owner may report its context
 // unavailable before the run ends.
 var scopedUncertainGrace = 2 * time.Minute
+
+// scopedLeaseElapsed reports an enduring conversation that answered and whose
+// parent lease (the decision's parent deadline, from spec.enduring.leaseSeconds)
+// has passed: its parent ending on the node is the conversation reaching its
+// end, not a failure. A conversation that never answered, a one-shot, or a
+// parent lost before its deadline is not a lease end.
+func scopedLeaseElapsed(run *api.AgentRun, parentDeadlineUnix int64, now time.Time) bool {
+	return run.Spec.ExecutionLifecycle == "enduring" && run.Status.Result != "" && parentDeadlineUnix > 0 && !now.Before(time.Unix(parentDeadlineUnix, 0))
+}
+
+// completeLeasedRun ends an enduring conversation whose lease elapsed as
+// succeeded: its answers stand, its parent is gone and its allowance is fenced
+// by cleanup. The condition says why so it is not read as a lost node.
+func (r *AgentRunReconciler) completeLeasedRun(ctx context.Context, run *api.AgentRun) error {
+	now := metav1.Now()
+	if err := r.updateStatusWithRetry(ctx, run, func(current *api.AgentRun) {
+		current.Status.Phase = api.AgentRunPhaseSucceeded
+		current.Status.CompletedAt = &now
+		current.Status.Error = ""
+		meta.SetStatusCondition(&current.Status.Conditions, metav1.Condition{Type: "CellnScopedExecution", Status: metav1.ConditionTrue, Reason: "LeaseElapsed", Message: "The conversation reached the end of its lease (spec.enduring.leaseSeconds); its parent ended on its node and its answers stand. Start a new run to continue.", ObservedGeneration: current.Generation})
+	}); err != nil {
+		return err
+	}
+	r.Log.Info("Enduring Celln conversation ended at the end of its lease", "run", run.Name, "namespace", run.Namespace)
+	return nil
+}
 
 const scopedOutcomeUnconfirmed = "Scoped execution outcome is uncertain. The controller will only read or clean up the original prepared owner; it will not create replacement authority. Ask an administrator to inspect the configured receiver and gateway."
 
@@ -41,80 +88,34 @@ func scopedCatalogueSelected(run *api.AgentRun) bool {
 	return run.Spec.CellnSelection != nil && (run.Spec.ExecutionLifecycle == "" || run.Spec.ExecutionLifecycle == "one-shot" || run.Spec.ExecutionLifecycle == "enduring")
 }
 
-// Route authority kinds of a run's selected ModelConnection, as the platform
-// resolver will bind them (DecisionRouteBinding.Auth).
+// Refusals for runs that name an execution plane this controller no longer
+// has. Runs that would have taken those planes fail with these messages
+// instead of reaching another backend.
 const (
-	routeAuthHostProfile = "host-profile"
-	routeAuthSecret      = "secret"
-	routeAuthNone        = "none"
+	// cellnCatalogueRemoved refuses the namespaced catalogue path (operator-reviewed
+	// CellnTool catalogue, issuer and host profiles) removed in 0.12.
+	cellnCatalogueRemoved = "Namespaced Celln catalogue selection (cellnSelection.toolRefs issued from namespace grants) is no longer supported on this controller. Select platform tools with cellnSelection.clusterToolRefs or a platform runtime profile so the run executes through the Celln platform and model gateway."
+	// cellnRouterPlaneRemoved refuses a backend=celln run with no catalogue
+	// selection: the one-shot router plane (explicit spec.celln artifacts or a
+	// forged task posted to the router) was removed in 0.12.
+	cellnRouterPlaneRemoved = "Celln runs execute through the Celln platform: backend celln requires a cellnSelection (clusterToolRefs or a platform runtime profile) and a string task. Direct router dispatch of a task or explicit artifacts was removed in 0.12; create a new run with a selection."
+	// cellnNativeParentRemoved ends a run bound to a native parent
+	// (status.cellnParent) by the parent plane removed in 0.12. Its owner can no
+	// longer be observed or stopped from here; nothing is replayed.
+	cellnNativeParentRemoved = "This run was bound to a Celln native parent by the parent plane removed in 0.12; this controller cannot observe or resume it. Create a new run; it executes through the Celln platform and model gateway."
 )
 
-// selectedRouteAuth classifies the model route a run selected, from API reads
-// only: host-profile (an owner-installed credential, served by the fleet's
-// provision path), or secret/none (gateway-mediated, served by the scoped
-// receiver). It returns "" when the run names no connection or the connection
-// does not exist; the caller then keeps its configured default and that path's
-// resolver refuses the run.
+// sharedCatalogueSelected reports whether a run belongs to the scoped platform
+// path, using only API reads. It intentionally runs before model normalization
+// and prerequisite creation. A persisted scoped binding always wins recovery,
+// and a run bound to a native parent by the removed plane never moves to the
+// scoped receiver.
 //
-// This chooses a path, never authority. Each path performs its own single
-// resolution, and each refuses a decision of the other kind: the provision
-// plan requires auth host-profile (cellnparent.BuildPlatformProvisionPlan) and
-// scoped finalisation accepts only secret or none. A route frozen into the run
-// (spec.model.credentialProfile) outranks the live connection so a run cannot
-// change path after it was normalised; if the two disagree the resolver denies.
-func (r *AgentRunReconciler) selectedRouteAuth(ctx context.Context, run *api.AgentRun) (string, error) {
-	if run.Spec.Model.CredentialProfile != "" {
-		return routeAuthHostProfile, nil
-	}
-	if run.Spec.Model.ConnectionRef == "" {
-		return "", nil
-	}
-	reader := r.APIReader
-	if reader == nil {
-		reader = r.Client
-	}
-	var connection api.ModelConnection
-	if err := reader.Get(ctx, client.ObjectKey{Namespace: run.Namespace, Name: run.Spec.Model.ConnectionRef}, &connection); err != nil {
-		if apierrors.IsNotFound(err) {
-			return "", nil
-		}
-		return "", err
-	}
-	switch {
-	case connection.Spec.CredentialProfile != "":
-		return routeAuthHostProfile, nil
-	case connection.Spec.SecretRef != "":
-		return routeAuthSecret, nil
-	}
-	return routeAuthNone, nil
-}
-
-// platformServesOneShot reports whether a one-shot shared selection is a
-// single-turn parent on the fleet. A host-profile route always is when the
-// platform admission is capable, whether or not a scoped receiver is also
-// configured; a gateway-mediated route never is; a route that cannot be
-// classified keeps the configured default (the scoped receiver when present).
-func (r *AgentRunReconciler) platformServesOneShot(ctx context.Context, run *api.AgentRun) (bool, error) {
-	if r.ParentAdmission == nil || !r.ParentAdmission.SupportsPlatform() || !run.Spec.PlatformOneShotShape() {
-		return false, nil
-	}
-	auth, err := r.selectedRouteAuth(ctx, run)
-	if err != nil {
-		return false, err
-	}
-	switch auth {
-	case routeAuthHostProfile:
-		return true, nil
-	case routeAuthSecret, routeAuthNone:
-		return false, nil
-	}
-	return r.ScopedDispatcher == nil, nil
-}
-
-// sharedCatalogueSelected disambiguates tool-free legacy and shared selections
-// using only API reads. It intentionally runs before model normalization and
-// prerequisite creation. A persisted scoped binding always wins recovery, and
-// a bound native parent never moves to the scoped receiver.
+// Every enduring catalogue selection is scoped. A one-shot selection is scoped
+// when it names cluster tools or a platform wrapper runtime (an AgentRuntime
+// with cellnProfileRef and no inline celln profile). Anything else a selection
+// could have meant was namespaced catalogue issuance, which no longer exists;
+// reconcilePending refuses it.
 func (r *AgentRunReconciler) sharedCatalogueSelected(ctx context.Context, run *api.AgentRun) (bool, error) {
 	if run.Status.CellnScoped != nil {
 		return true, nil
@@ -126,51 +127,14 @@ func (r *AgentRunReconciler) sharedCatalogueSelected(ctx context.Context, run *a
 	if selection == nil {
 		return false, nil
 	}
-	platform := r.ParentAdmission != nil && r.ParentAdmission.SupportsPlatform()
 	if run.Spec.ExecutionLifecycle == "enduring" {
-		// With a platform-capable parent admission both enduring paths coexist
-		// and the selected route decides: an owner-installed credential is
-		// provisioned on the fleet, a namespace's own Secret (or no credential)
-		// is executed gateway-mediated by the scoped receiver. A mediated run
-		// is held for the scoped receiver when none is configured
-		// (ScopedDispatchDisabled); it never falls back to provisioning.
-		if platform {
-			auth, err := r.selectedRouteAuth(ctx, run)
-			if err != nil {
-				return false, err
-			}
-			switch auth {
-			case routeAuthHostProfile:
-				return false, nil
-			case routeAuthSecret, routeAuthNone:
-				return true, nil
-			}
-		}
-		// Otherwise a configured scoped receiver owns every enduring catalogue
-		// selection; unsupported wrappers are refused by its resolver rather
-		// than falling through. Without one, an enduring selection is still
-		// held for it unless the prepared native parent path is actually
-		// configured, and even then explicit shared intent (cluster tools, a
-		// platform profile) never reaches legacy parent issuance.
-		if r.ScopedDispatcher != nil || r.ParentAdmission == nil {
-			return true, nil
-		}
-		// A platform-capable parent admission resolves wrapper runtimes and
-		// cluster tools itself (the fleet); it never issues from namespace grants.
-		if platform {
-			return false, nil
-		}
-	}
-	// A platform-capable parent admission also serves one-shot shared
-	// selections on an owner-installed credential (a single-turn parent on the
-	// fleet). A gateway-mediated one is a shared selection like any other: the
-	// scoped receiver executes it, or it is held while none is configured.
-	platformOneShot, err := r.platformServesOneShot(ctx, run)
-	if err != nil {
-		return false, err
+		// The scoped receiver owns every enduring catalogue selection; unsupported
+		// wrappers are refused by its resolver rather than falling through, and
+		// without a configured receiver the run is held (ScopedDispatchDisabled).
+		return true, nil
 	}
 	if len(selection.ClusterToolRefs) != 0 {
-		return !platformOneShot, nil
+		return true, nil
 	}
 	if len(selection.ToolRefs) != 0 {
 		return false, nil
@@ -184,47 +148,8 @@ func (r *AgentRunReconciler) sharedCatalogueSelected(ctx context.Context, run *a
 		var agent api.Agent
 		if err := reader.Get(ctx, client.ObjectKey{Namespace: run.Namespace, Name: run.Spec.AgentRef}, &agent); err != nil {
 			if apierrors.IsNotFound(err) {
-				// An unissued legacy selection without an agent has no shared
-				// wrapper to inspect. Its existing issuance gate still forbids
-				// dispatch; explicit shared intent was handled above.
-				return false, nil
-			}
-			return false, err
-		}
-		runtimeName = agent.Spec.RuntimeRef
-	}
-	if runtimeName == "" {
-		return false, nil
-	}
-	var runtime api.AgentRuntime
-	if err := reader.Get(ctx, client.ObjectKey{Namespace: run.Namespace, Name: runtimeName}, &runtime); err != nil {
-		return false, err
-	}
-	wrapper := runtime.Spec.CellnProfileRef != nil && runtime.Spec.Celln == nil
-	return wrapper && !platformOneShot, nil
-}
-
-// platformOneShotSelected reports whether a pending one-shot run is a shared
-// selection this controller serves as a single-turn parent: the platform
-// admission is capable, the selected route is not gateway-mediated, and the
-// run selects cluster tools or a platform wrapper runtime.
-func (r *AgentRunReconciler) platformOneShotSelected(ctx context.Context, run *api.AgentRun) (bool, error) {
-	if served, err := r.platformServesOneShot(ctx, run); err != nil || !served {
-		return false, err
-	}
-	selection := run.Spec.CellnSelection
-	if len(selection.ClusterToolRefs) != 0 {
-		return true, nil
-	}
-	reader := r.APIReader
-	if reader == nil {
-		reader = r.Client
-	}
-	runtimeName := selection.RuntimeRef
-	if runtimeName == "" {
-		var agent api.Agent
-		if err := reader.Get(ctx, client.ObjectKey{Namespace: run.Namespace, Name: run.Spec.AgentRef}, &agent); err != nil {
-			if apierrors.IsNotFound(err) {
+				// A tool-free selection without an agent has no wrapper to
+				// inspect; reconcilePending refuses it.
 				return false, nil
 			}
 			return false, err
@@ -241,6 +166,14 @@ func (r *AgentRunReconciler) platformOneShotSelected(ctx context.Context, run *a
 	return runtime.Spec.CellnProfileRef != nil && runtime.Spec.Celln == nil, nil
 }
 
+// scopedActiveObservation is how often the controller reads a scoped run's
+// owner record while its answer is outstanding; scopedIdleObservation once an
+// enduring parent has answered and waits for turns.
+const (
+	scopedActiveObservation = time.Second
+	scopedIdleObservation   = 5 * time.Second
+)
+
 func (r *AgentRunReconciler) scopedProgress(ctx context.Context, run *api.AgentRun, status metav1.ConditionStatus, reason, message string) error {
 	return r.updateStatusWithRetry(ctx, run, func(current *api.AgentRun) {
 		meta.SetStatusCondition(&current.Status.Conditions, metav1.Condition{Type: "CellnScopedExecution", Status: status, Reason: reason, Message: message, ObservedGeneration: current.Generation})
@@ -248,8 +181,8 @@ func (r *AgentRunReconciler) scopedProgress(ctx context.Context, run *api.AgentR
 }
 
 func (r *AgentRunReconciler) reconcilePendingScoped(ctx context.Context, log logr.Logger, run *api.AgentRun) (ctrl.Result, error) {
-	if run.Spec.Backend != "celln" || run.Spec.Celln != nil || !run.Spec.Task.IsString() || !scopedCatalogueSelected(run) {
-		return ctrl.Result{}, r.failRun(ctx, run, "Scoped catalogue execution requires backend celln, a supported lifecycle, a string task, and no explicit artifacts")
+	if run.Spec.Backend != "celln" || !run.Spec.Task.IsString() || !scopedCatalogueSelected(run) {
+		return ctrl.Result{}, r.failRun(ctx, run, "Scoped catalogue execution requires backend celln, a supported lifecycle and a string task")
 	}
 	if r.ScopedDispatcher == nil {
 		if err := r.scopedProgress(ctx, run, metav1.ConditionFalse, "ScopedDispatchDisabled", "Operator scoped receiver configuration is absent; no legacy, model, OCI, or native execution was submitted"); err != nil {
@@ -274,7 +207,17 @@ func (r *AgentRunReconciler) reconcilePendingScoped(ctx context.Context, log log
 			return ctrl.Result{}, err
 		}
 	}
+	// Admission timing at debug level: how long each receiver and gateway step
+	// took, and how long after creation the first step ran.
+	step := func(name string, began time.Time) {
+		log.V(1).Info("Scoped Celln admission step", "step", name, "ms", time.Since(began).Milliseconds(), "sinceCreation", time.Since(run.CreationTimestamp.Time).Round(time.Millisecond).String())
+	}
+	if run.Status.CellnScoped == nil {
+		step("first reconcile", time.Now())
+	}
+	began := time.Now()
 	prepared, err := r.ScopedDispatcher.Prepare(ctx, client.ObjectKeyFromObject(run))
+	step("prepare", began)
 	if err != nil {
 		if reason := cellnauthority.PlatformReason(err); reason != "" && run.Status.CellnScoped == nil {
 			// No external enrollment/start can precede the persisted scoped
@@ -287,13 +230,17 @@ func (r *AgentRunReconciler) reconcilePendingScoped(ctx context.Context, log log
 		}
 		return r.scopedUncertain(ctx, run, "PreparationUnconfirmed", err)
 	}
+	began = time.Now()
 	final, err := r.ScopedDispatcher.EnsureFinal(ctx, prepared)
+	step("final decision", began)
 	if err != nil {
 		return r.scopedUncertain(ctx, run, "FinalDecisionUnconfirmed", err)
 	}
+	began = time.Now()
 	if err := r.persistScopedBinding(ctx, run, prepared, final); err != nil {
 		return ctrl.Result{}, err
 	}
+	step("persist binding", began)
 	if run.Status.CellnScoped == nil {
 		return ctrl.Result{Requeue: true}, nil
 	}
@@ -309,14 +256,28 @@ func (r *AgentRunReconciler) reconcilePendingScoped(ctx context.Context, log log
 		return ctrl.Result{}, err
 	}
 
-	if !run.Status.CellnScoped.StartAttempted {
-		if err := r.ScopedDispatcher.RevalidateAdmission(ctx, prepared); err != nil {
+	// Authority is revalidated once, on the pass that starts execution: the
+	// receiver's prepare on the enrolment pass executes nothing, and a change
+	// between prepare and start is caught at start, which is the only side
+	// effect that matters. Revalidating on every pass cost two seconds each.
+	if !run.Status.CellnScoped.StartAttempted && run.Status.CellnScoped.ReceiverID != "" {
+		began = time.Now()
+		err := r.ScopedDispatcher.PreflightArtifacts(ctx, prepared)
+		step("preflight artifacts", began)
+		if err == nil {
+			began = time.Now()
+			err = r.ScopedDispatcher.RevalidateAuthority(ctx, prepared)
+			step("revalidate authority", began)
+		}
+		if err != nil {
 			return ctrl.Result{}, r.failRun(ctx, run, "Scoped authority changed before admission; no replacement execution was submitted")
 		}
 	}
 
 	if run.Status.CellnScoped.ReceiverID == "" {
+		began = time.Now()
 		enrolled, err := r.ScopedDispatcher.Enroll(ctx, prepared, final)
+		step("enroll", began)
 		if err != nil {
 			return r.scopedUncertain(ctx, run, "ReceiverEnrollmentUnconfirmed", err)
 		}
@@ -338,7 +299,7 @@ func (r *AgentRunReconciler) reconcilePendingScoped(ctx context.Context, log log
 	if run.Status.CellnScoped.StartAttempted && (run.Status.CellnScoped.GatewayRegistered || final.Decision.Route.Provider == "none") {
 		observed, readErr := r.ScopedDispatcher.Read(ctx, run.Status.CellnScoped.ReceiverID, final)
 		if readErr == nil {
-			return r.applyScopedStatus(ctx, log, run, prepared, observed)
+			return r.observeScoped(ctx, log, run, prepared, final, observed)
 		}
 		// Absence or loss of the receiver-owned admission journal is not proof
 		// that the persisted attempt never arrived. Never relaunch from a JTI or
@@ -356,9 +317,11 @@ func (r *AgentRunReconciler) reconcilePendingScoped(ctx context.Context, log log
 			}
 			run.Status.CellnScoped.GatewayRegistrationAttempted = true
 		}
+		began = time.Now()
 		if err := r.ScopedDispatcher.RegisterGateway(ctx, final, decision, execution); err != nil {
 			return r.scopedUncertain(ctx, run, "GatewayRegistrationUnconfirmed", err)
 		}
+		step("register gateway", began)
 		if err := r.updateScopedStatus(ctx, run, func(s *api.CellnScopedStatus) error { s.GatewayRegistered = true; return nil }); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -370,7 +333,9 @@ func (r *AgentRunReconciler) reconcilePendingScoped(ctx context.Context, log log
 		}
 		run.Status.CellnScoped.StartAttempted = true
 	}
+	began = time.Now()
 	observed, err := r.ScopedDispatcher.Start(ctx, run.Status.CellnScoped.ReceiverID, run.Status.CellnScoped.Owner, execution, model)
+	step("start", began)
 	if err != nil {
 		return r.scopedUncertain(ctx, run, "ExecutionOutcomeUnconfirmed", err)
 	}
@@ -386,6 +351,41 @@ func (r *AgentRunReconciler) reconcileRunningScoped(ctx context.Context, log log
 	if err != nil {
 		return r.scopedUncertain(ctx, run, "ExecutionOutcomeUnconfirmed", err)
 	}
+	return r.observeScoped(ctx, log, run, prepared, final, observed)
+}
+
+// observeScoped applies an owner record. A single-turn parent (a one-shot the
+// resolver issued as a parent with one turn) that has answered is stopped
+// here, cells returned and model allowance fenced, and its record applied as
+// a success; everything else is applied as observed.
+func (r *AgentRunReconciler) observeScoped(ctx context.Context, log logr.Logger, run *api.AgentRun, prepared *cellnauthority.StoredPreparation, final *cellnauthority.FinalizedPreparation, observed cellnscoped.OperationStatus) (ctrl.Result, error) {
+	singleTurn := run.Spec.ExecutionLifecycle != "enduring" && final.Decision.Parent != nil
+	if singleTurn && observed.Phase == "Cancelled" && run.Status.CellnScoped != nil && run.Status.CellnScoped.CleanupConfirmed && run.Status.CellnScoped.Output != "" && run.Status.CellnScoped.ReceiptDigest != "" {
+		// The owner now reports the parent this controller stopped after its
+		// answer: that is the success already recorded, read again, not a
+		// cancellation of the run.
+		observed.Phase = "Succeeded"
+		if observed.Output == "" {
+			observed.Output = run.Status.CellnScoped.Output
+		}
+	}
+	if singleTurn && observed.Phase == "Running" && observed.Output != "" && observed.ReceiptDigest != "" && run.Status.CellnScoped != nil && !run.Status.CellnScoped.CleanupConfirmed {
+		status, err := r.ScopedDispatcher.Cleanup(ctx, run.Status.CellnScoped.ReceiverID, final, run.Status.CellnScoped.GatewayRegistrationAttempted)
+		if err != nil {
+			return r.scopedUncertain(ctx, run, "SingleTurnParentCleanupUnconfirmed", err)
+		}
+		if status.ID != run.Status.CellnScoped.ReceiverID || !status.CleanupConfirmed {
+			return r.scopedUncertain(ctx, run, "SingleTurnParentCleanupUnconfirmed", errors.New("scoped receiver has not confirmed the single-turn parent's cleanup"))
+		}
+		if err := r.updateScopedStatus(ctx, run, func(s *api.CellnScopedStatus) error {
+			s.CleanupConfirmed = true
+			return nil
+		}); err != nil {
+			return ctrl.Result{}, err
+		}
+		observed.Phase = "Succeeded"
+		log.Info("Single-turn Celln parent answered and was stopped", "run", run.Name)
+	}
 	return r.applyScopedStatus(ctx, log, run, prepared, observed)
 }
 
@@ -393,6 +393,7 @@ func (r *AgentRunReconciler) scopedUncertain(ctx context.Context, run *api.Agent
 	if cellnscoped.IsContextLost(cause) {
 		// The node that held this run's native state is gone. Nothing is
 		// re-placed elsewhere; the run ends and cleanup fences its allowance.
+		r.Log.Info("Scoped Celln run ended: its receiver reported the context lost", "run", run.Name, "namespace", run.Namespace, "step", reason, "cause", cause.Error())
 		return ctrl.Result{}, r.failRun(ctx, run, "Celln node holding this run is gone (AUTH_CONTEXT_LOST); no replacement execution is permitted. Start a new run.")
 	}
 	if cellnscoped.IsReceiverMisconfigured(cause) {
@@ -550,11 +551,15 @@ func (r *AgentRunReconciler) applyScopedStatus(ctx context.Context, log logr.Log
 		// for blips, end the run so it stops looking alive. Nothing is
 		// re-created elsewhere, and cleanup still stops the original owner.
 		if scopedUncertainExpired(run, time.Now()) {
+			if scopedLeaseElapsed(run, prepared.Operation.Resolution.Decision.Budget.ParentDeadlineUnix, time.Now()) {
+				return ctrl.Result{}, r.completeLeasedRun(ctx, run)
+			}
 			return ctrl.Result{}, r.failRun(ctx, run, scopedEndedSummary(observed.Reason))
 		}
 		return r.scopedUncertain(ctx, run, "NativeOwnerUncertain", errors.New("original native owner context is unavailable; no replacement execution is permitted"))
 	}
 	if slices.Contains(active, observed.Phase) {
+		answered := false
 		if err := r.updateStatusWithRetry(ctx, run, func(current *api.AgentRun) {
 			current.Status.Phase = api.AgentRunPhaseRunning
 			if current.Status.StartedAt == nil {
@@ -566,24 +571,44 @@ func (r *AgentRunReconciler) applyScopedStatus(ctx context.Context, log logr.Log
 				reason = "EnduringParentReady"
 				message = "The original native parent completed its initial turn and remains running"
 				current.Status.Result = current.Status.CellnScoped.Output
+				answered = true
 			}
 			meta.SetStatusCondition(&current.Status.Conditions, metav1.Condition{Type: "CellnScopedExecution", Status: metav1.ConditionTrue, Reason: reason, Message: message, ObservedGeneration: current.Generation})
 		}); err != nil {
 			return ctrl.Result{}, err
 		}
-		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+		// Someone is waiting on the first answer: look again every second
+		// until it lands. An enduring parent that has answered is idle between
+		// turns (turns are observed by their own controller), so it is read
+		// less often.
+		if answered {
+			return ctrl.Result{RequeueAfter: scopedIdleObservation}, nil
+		}
+		return ctrl.Result{RequeueAfter: scopedActiveObservation}, nil
 	}
 	if observed.Phase == "Succeeded" && observed.ReceiptDigest == "" {
 		return ctrl.Result{}, errors.New("scoped success lacks a receipt digest")
 	}
 	if err := r.updateStatusWithRetry(ctx, run, func(current *api.AgentRun) {
+		if current.Status.Phase == api.AgentRunPhaseSucceeded || current.Status.Phase == api.AgentRunPhaseFailed {
+			// A reconcile that read a stale cache after another ended this run
+			// must not re-end it: the owner's later record (a stopped parent
+			// reads as Cancelled) never overturns a recorded outcome.
+			return
+		}
 		current.Status.CompletedAt = &now
 		if observed.Phase == "Succeeded" {
 			current.Status.Phase, current.Status.Result, current.Status.Error = api.AgentRunPhaseSucceeded, observed.Output, ""
 		} else {
 			// Never expose raw native diagnostics. Only mapped public refusal
-			// codes are safe for tenant-visible, actionable explanations.
+			// codes are safe for tenant-visible, actionable explanations. A
+			// failed turn's own text is the tenant's: the owner committed it as
+			// the turn's answer, so it says why (a tool budget, a refused call,
+			// a model error) where the native reason only says "Failed".
 			current.Status.Phase, current.Status.Error = api.AgentRunPhaseFailed, scopedFailureSummary(observed.Phase, observed.Reason)
+			if strings.HasPrefix(observed.Output, "Turn failed") || strings.HasPrefix(observed.Output, "Turn refused") {
+				current.Status.Error += ": " + boundedTurnFailure(observed.Output)
+			}
 		}
 		meta.SetStatusCondition(&current.Status.Conditions, metav1.Condition{Type: "CellnScopedExecution", Status: metav1.ConditionTrue, Reason: "TerminalOwnerRecordObserved", Message: "The original prepared owner returned a terminal record; cleanup confirmation is pending", ObservedGeneration: current.Generation})
 	}); err != nil {

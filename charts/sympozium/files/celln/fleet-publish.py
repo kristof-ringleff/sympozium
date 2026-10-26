@@ -9,11 +9,14 @@ non-zero with the reason.
 
 A scope carries one package at a time. A node extends the published
 configuration only with backends it lacks and never rewrites a backend of the
-same package and scope. It replaces the whole configuration only when the
-installer has approved exactly this node's package and scope as the
-replacement (the desired-* annotations); a node still running the previous
-package can therefore never publish over the new one, and an unapproved
-package change is refused.
+same package, scope and Celln binary. A node whose Celln binary differs from
+the one that published (configured-by) derives different files from the same
+package, so it replaces the configuration: an image rollout converges on the
+last node to publish. A different package or scope replaces the whole
+configuration only when the installer has approved exactly this node's
+package and scope as the replacement (the desired-* annotations); a node
+still running the previous package can therefore never publish over the new
+one, and an unapproved package change is refused.
 """
 import json
 import sys
@@ -23,12 +26,32 @@ SCOPE = "celln.sympozium.ai/scope"
 DESIRED_PACKAGE = "celln.sympozium.ai/desired-package"
 DESIRED_SCOPE = "celln.sympozium.ai/desired-scope"
 PUBLISHED_BY = "celln.sympozium.ai/published-by"
+CONFIGURED_BY = "celln.sympozium.ai/configured-by"
 
 
 def normalise(data):
     # Configurations published before backends were named carry unprefixed
     # keys for the single backend named native.
     return {k if k.count(".") > 1 else f"native.{k}": v for k, v in data.items()}
+
+
+def model_bound(data):
+    """Whether any published receipt names a model profile (a fleet-held key)."""
+    for key, value in data.items():
+        if key.endswith("configured.json"):
+            try:
+                if "modelProfile" in json.loads(value):
+                    return True
+            except ValueError:
+                continue
+    return False
+
+
+def replacement_annotations(ours_meta):
+    annotations = {PACKAGE: ours_meta[PACKAGE], SCOPE: ours_meta[SCOPE], PUBLISHED_BY: ours_meta[PUBLISHED_BY]}
+    if ours_meta.get(CONFIGURED_BY):
+        annotations[CONFIGURED_BY] = ours_meta[CONFIGURED_BY]
+    return annotations
 
 
 def decide(published, body):
@@ -42,6 +65,18 @@ def decide(published, body):
 
     if current_package == package and current_scope in (None, scope):
         existing = normalise(raw)
+        # A configuration published with a fleet-held model (before 0.12) is
+        # replaced by this node's model-free one, and backends the scope no
+        # longer configures are dropped: no node holds a model any more.
+        # Likewise a configuration derived by another Celln binary (or before
+        # the binary was recorded) is replaced by this node's.
+        rederived = (annotations.get(CONFIGURED_BY) or "") != (ours_meta.get(CONFIGURED_BY) or "")
+        if (model_bound(existing) and not model_bound(ours)) or rederived:
+            data = {key: None for key in raw if key not in ours}
+            data.update(ours)
+            return {"metadata": {"resourceVersion": meta.get("resourceVersion"),
+                                 "annotations": replacement_annotations(ours_meta)},
+                    "data": data}
         for key, value in ours.items():
             if key in existing and existing[key] != value:
                 sys.exit(
@@ -63,7 +98,7 @@ def decide(published, body):
                 # Optimistic concurrency: two nodes replacing at once conflict
                 # instead of interleaving.
                 "resourceVersion": meta.get("resourceVersion"),
-                "annotations": {PACKAGE: package, SCOPE: scope, PUBLISHED_BY: ours_meta[PUBLISHED_BY]},
+                "annotations": replacement_annotations(ours_meta),
             },
             "data": data,
         }

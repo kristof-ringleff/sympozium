@@ -209,6 +209,28 @@ func verificationKey(key SigningKey) VerificationKey {
 	return VerificationKey{KeyID: key.KeyID, PublicKey: key.PrivateKey.Public().(ed25519.PublicKey)}
 }
 
+// A one-shot decision is one scoped worker turn with no parent lease, the
+// shape the Celln receiver enforces too; a lease or a second turn is invalid.
+func TestOneShotDecisionCarriesNoParentLease(t *testing.T) {
+	decision, _ := fixtureDecisionByVector(t, "harness-one-shot")
+	if decision.Lifecycle != "one-shot" || decision.Budget.ParentDeadlineUnix != 0 || decision.Budget.MaxTurns != 1 {
+		t.Fatalf("fixture is not a parentless one-shot: %+v", decision.Budget)
+	}
+	if reason := validateDecision(decision); reason != "" {
+		t.Fatalf("one-shot: %s", reason)
+	}
+	leased := decision
+	leased.Budget.ParentDeadlineUnix = decision.Budget.TurnDeadlineUnix + 120
+	if reason := validateDecision(leased); reason != ReasonLifecycleInvalid {
+		t.Fatalf("one-shot with a parent lease: %q", reason)
+	}
+	twoTurns := decision
+	twoTurns.Budget.MaxTurns = 2
+	if reason := validateDecision(twoTurns); reason != ReasonLifecycleInvalid {
+		t.Fatalf("two-turn one-shot: %q", reason)
+	}
+}
+
 func TestIssuerAudienceSeparationAndRotation(t *testing.T) {
 	decision, vector := fixtureDecisionByVector(t, "harness-one-shot")
 	key1 := keyFromByte("prod-test-1", 0x33)

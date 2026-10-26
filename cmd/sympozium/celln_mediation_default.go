@@ -60,22 +60,19 @@ func selectModelGatewayImage(flag, set, pinned, deployed string) (image, source 
 
 // mediationInputs is everything the mediation decision reads.
 type mediationInputs struct {
-	fleet     bool
-	optOut    bool
 	flagImage string
 	setValues []string
 	pinned    string
 	// deployedImage is the deployed release's modelGateway.image.
 	deployedImage string
-	// clusterMediated reports that the cluster's release has mediation on
-	// (the chart's ConfigMap celln-system/celln-mediated-routes exists).
+	// clusterMediated reports that the cluster's release already runs the
+	// gateway (the chart's record in celln-system exists).
 	clusterMediated bool
 }
 
 // mediationPlan is the decision for one install.
 type mediationPlan struct {
-	// auto: the installer derives the values, bootstraps the trust, and
-	// gives the installer's key to a starter Agent instead of the fleet.
+	// auto: the installer derives the values and bootstraps the trust.
 	auto bool
 	// operator: --set celln.mediation.enabled=true; the operator's values
 	// are used as given and nothing is derived or bootstrapped.
@@ -84,46 +81,30 @@ type mediationPlan struct {
 	notice   string
 }
 
-func (p mediationPlan) enabled() bool { return p.auto || p.operator }
-
-const mediationOffConsequence = "the installer's provider key is published to every fleet node and any Agent in an admitted namespace runs on it"
-
-// planMediation decides whether this install mediates model access.
+// planMediation decides how this install wires the model gateway. The fleet
+// serves model requests only through the gateway, so there is no "off": a
+// build that pins no gateway image needs --model-gateway-image.
 func planMediation(in mediationInputs) (mediationPlan, error) {
-	if !in.fleet {
-		return mediationPlan{}, nil
-	}
 	vals, err := buildHelmValues("", in.setValues)
 	if err != nil {
 		return mediationPlan{}, err
 	}
 	setEnabled, explicit := nestedValue(vals, "celln", "mediation", "enabled").(bool)
 	setImage, _ := nestedString(vals, "modelGateway", "image")
-	switchedOff := ""
-	if in.clusterMediated {
-		switchedOff = " This switches off the mediated access the cluster had: runs of Agents with their own key are held (ScopedDispatchDisabled)."
-	}
 	switch {
-	case in.optOut && explicit && setEnabled:
-		return mediationPlan{}, fmt.Errorf("--no-celln-mediation contradicts --set celln.mediation.enabled=true")
-	case in.optOut:
-		return mediationPlan{notice: "Mediated model access: off (--no-celln-mediation); " + mediationOffConsequence + "." + switchedOff}, nil
 	case explicit && !setEnabled:
-		return mediationPlan{notice: "Mediated model access: off (--set celln.mediation.enabled=false); " + mediationOffConsequence + "." + switchedOff}, nil
+		return mediationPlan{}, fmt.Errorf("--set celln.mediation.enabled=false: the Celln fleet serves model requests only through the model gateway, so it cannot be installed without one")
 	case explicit:
-		return mediationPlan{operator: true, notice: "Mediated model access: on with the operator's celln.mediation values (--set); the installer bootstraps nothing."}, nil
+		return mediationPlan{operator: true, notice: "Model gateway: wired with the operator's celln.mediation values (--set); the installer bootstraps nothing."}, nil
 	}
 	image, source, err := selectModelGatewayImage(in.flagImage, setImage, in.pinned, in.deployedImage)
 	if err != nil {
 		return mediationPlan{}, err
 	}
 	if image == "" {
-		if in.clusterMediated {
-			return mediationPlan{}, fmt.Errorf("this cluster runs mediated model access, but this build pins no model gateway image and the release names none: pass --model-gateway-image %s@sha256:<digest>, or --no-celln-mediation to switch it off deliberately", defaultModelGatewayRepo)
-		}
-		return mediationPlan{notice: fmt.Sprintf("Mediated model access: off, because this build (a source build) pins no model gateway image; pass --model-gateway-image %s@sha256:<digest> to turn it on. Until then %s.", defaultModelGatewayRepo, mediationOffConsequence)}, nil
+		return mediationPlan{}, fmt.Errorf("this build (a source build) pins no model gateway image and the release names none: pass --model-gateway-image %s@sha256:<digest>; the fleet serves model requests only through the gateway", defaultModelGatewayRepo)
 	}
-	return mediationPlan{auto: true, image: image, notice: fmt.Sprintf("Mediated model access: on (gateway %s from %s); provider keys stay with their Agents, Celln nodes hold none. Opt out with --no-celln-mediation.", image, source)}, nil
+	return mediationPlan{auto: true, image: image, notice: fmt.Sprintf("Model gateway: %s (from %s); every Agent's own key is added there and never reaches a node.", image, source)}, nil
 }
 
 // chartFullname is the chart's sympozium.fullname for the CLI's release.
@@ -171,4 +152,15 @@ func mediationHosts(setValues []string) (gateway, receiver []string, systemNames
 		}
 	}
 	return gateway, receiver, systemNamespace, nil
+}
+
+// deployedModelGatewayImage is the deployed release's modelGateway.image, or
+// "" when there is none (or it cannot be read).
+func deployedModelGatewayImage() string {
+	rel, err := helmReleaseInfo()
+	if err != nil || rel == nil {
+		return ""
+	}
+	image, _ := nestedString(rel.Config, "modelGateway", "image")
+	return image
 }

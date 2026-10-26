@@ -303,6 +303,8 @@ func validateDecisionSemantics(decision Decision) string {
 		return ReasonBudgetMismatch
 	}
 	if decision.Lifecycle == "one-shot" {
+		// A one-shot is a single scoped worker: one turn, no parent lease.
+		// The Celln receiver enforces the same shape (tenancy_credentials).
 		if decision.Budget.MaxTurns != 1 || decision.Budget.ParentDeadlineUnix != 0 {
 			return ReasonLifecycleInvalid
 		}

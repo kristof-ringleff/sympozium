@@ -38,15 +38,10 @@ const (
 	// DefaultBackend is the backend of a scope installed with a single model
 	// route; its wrappers keep the original names.
 	DefaultBackend = "native"
-	// ProtocolAnnotation records the wire protocol a runtime profile's model
-	// route speaks, so a policy carrying several routes to the same origin
-	// and model (one per protocol) binds each backend to its own route.
-	ProtocolAnnotation = "celln.sympozium.ai/protocol"
-	// MediationOnlyLabel marks the runtime profile of a backend whose
-	// provider key never reached the fleet: the nodes hold a placeholder,
-	// the policy carries no host-profile route for it, and it serves only
-	// Agents that bring their own key through the model gateway. A namespace
-	// gets its runtime wrapper alone, never a shared Agent or connection.
+	// MediationOnlyLabel marks every runtime profile of a model-free fleet:
+	// the node holds no model and no key, and the profile serves Agents that
+	// bring their own connection through the model gateway. A namespace
+	// gets the profile's runtime wrapper alone.
 	MediationOnlyLabel = "celln.sympozium.ai/mediation-only"
 
 	// ToolboxLabel marks a backend's toolbox runtime profile and its runtime
@@ -67,10 +62,8 @@ const (
 	// never collide with another backend's names.
 	toolboxSuffix = ".toolbox"
 
-	// The wrapper names of the default backend; a run selects them by name.
-	WrapperRuntimeName    = "celln-native"
-	WrapperAgentName      = "celln-agent"
-	WrapperConnectionName = "celln-native"
+	// The runtime wrapper name of the default backend; a run selects it by name.
+	WrapperRuntimeName = "celln-native"
 
 	AuthoriseAll     = "all"
 	AuthoriseLabeled = "labeled"
@@ -109,7 +102,9 @@ func Selector(mode, scope string, exclusions []string) (metav1.LabelSelector, er
 	return metav1.LabelSelector{}, fmt.Errorf("authorisation mode must be %q or %q", AuthoriseAll, AuthoriseLabeled)
 }
 
-// Wrappers are the names a namespace's runs select.
+// Wrappers are the names a namespace's runs select: the runtime wrapper of a
+// profile. Agent and Connection are always empty (no fleet holds a model, so
+// there is no shared Agent or connection); they stay for 0.11 clients.
 type Wrappers struct {
 	Backend    string   `json:"backend"`
 	Runtime    string   `json:"runtime"`
@@ -127,11 +122,12 @@ func Backend(profile *api.CellnRuntimeProfile) string {
 }
 
 // WrapperNames are the wrapper objects a namespace holds for one backend: the
-// default backend keeps the original names, every other backend carries its
-// name so several backends coexist in one namespace.
+// default backend keeps the original name, every other backend carries its
+// name. Agent and Connection name what a 0.11 fleet-keyed backend had, so a
+// migration can find and retire them; nothing creates them.
 func WrapperNames(backend string) Wrappers {
 	if backend == "" || backend == DefaultBackend {
-		return Wrappers{Backend: DefaultBackend, Runtime: WrapperRuntimeName, Agent: WrapperAgentName, Connection: WrapperConnectionName}
+		return Wrappers{Backend: DefaultBackend, Runtime: WrapperRuntimeName, Agent: "celln-agent", Connection: "celln-native"}
 	}
 	return Wrappers{Backend: backend, Runtime: "celln-" + backend, Agent: "celln-agent-" + backend, Connection: "celln-" + backend}
 }
@@ -327,111 +323,4 @@ func ProfileTools(ctx context.Context, reader client.Reader, namespace, profileN
 // (MediationOnlyLabel): it serves only Agents with their own key.
 func MediationOnly(profile *api.CellnRuntimeProfile) bool {
 	return profile.Labels[MediationOnlyLabel] == "true"
-}
-
-// ProfileRoute finds the policy route with the given auth ("host-profile" or
-// "secret") that admits the profile's own model at its endpoint, and returns
-// it with that endpoint and model.
-func ProfileRoute(profile *api.CellnRuntimeProfile, policy *api.CellnExecutionPolicy, auth string) (*api.CellnExecutionPolicyRoute, string, string, error) {
-	native := profile.Spec.Native
-	if native == nil {
-		return nil, "", "", fmt.Errorf("runtime profile %q is not native", profile.Name)
-	}
-	var harness struct {
-		Model         string `json:"model"`
-		URL           string `json:"url"`
-		AllowInsecure bool   `json:"allow_insecure"`
-	}
-	if json.Unmarshal(native.Template.Raw, &harness) != nil || harness.Model == "" || harness.URL == "" {
-		return nil, "", "", fmt.Errorf("runtime profile %q template names no model route", profile.Name)
-	}
-	insecure := harness.AllowInsecure && auth == "host-profile"
-	origin, err := api.ModelEndpointOriginInsecure(harness.URL, insecure)
-	if err != nil {
-		return nil, "", "", err
-	}
-	// The first matching route wins unless the profile names its protocol,
-	// in which case the route speaking that protocol does.
-	var route *api.CellnExecutionPolicyRoute
-	protocol := profile.Annotations[ProtocolAnnotation]
-	for i := range policy.Spec.Routes {
-		r := &policy.Spec.Routes[i]
-		if r.Auth != auth || (harness.AllowInsecure && !r.AllowInsecure) || !slices.Contains(r.Models, harness.Model) || !slices.Contains(r.EndpointOrigins, origin) {
-			continue
-		}
-		if protocol == "" || r.Protocol == protocol {
-			route = r
-			break
-		}
-		if route == nil {
-			route = r
-		}
-	}
-	if route == nil {
-		return nil, "", "", fmt.Errorf("policy %q has no %s route for %s at %s", policy.Name, auth, harness.Model, origin)
-	}
-	return route, harness.URL, harness.Model, nil
-}
-
-// TenantWrappers builds the three objects a namespace needs to run a native
-// profile: a runtime wrapper, an agent and the host-profile model connection
-// bound to the policy's route for the profile's model.
-func TenantWrappers(namespace string, profile *api.CellnRuntimeProfile, policy *api.CellnExecutionPolicy) ([]client.Object, error) {
-	native := profile.Spec.Native
-	if native == nil || native.CredentialProfile == "" {
-		return nil, fmt.Errorf("runtime profile %q carries no native credential profile", profile.Name)
-	}
-	if Toolbox(profile) {
-		// The fleet's shared Agent runs on the backend's own profile; the
-		// toolbox serves Agents with their own key and gets its runtime
-		// wrapper alone.
-		return nil, fmt.Errorf("runtime profile %q is a toolbox profile: it has a runtime wrapper only", profile.Name)
-	}
-	route, endpoint, model, err := ProfileRoute(profile, policy, "host-profile")
-	if err != nil {
-		return nil, err
-	}
-	var harness struct {
-		AllowInsecure bool `json:"allow_insecure"`
-	}
-	_ = json.Unmarshal(native.Template.Raw, &harness)
-	names := WrapperNames(Backend(profile))
-	meta := func(name string) metav1.ObjectMeta {
-		return metav1.ObjectMeta{Name: name, Namespace: namespace, Labels: map[string]string{ManagedByLabel: ManagedByValue, BackendLabel: names.Backend}}
-	}
-	return []client.Object{
-		RuntimeWrapper(namespace, profile),
-		&api.Agent{ObjectMeta: meta(names.Agent), Spec: api.AgentSpec{RuntimeRef: names.Runtime}},
-		&api.ModelConnection{ObjectMeta: meta(names.Connection), Spec: api.ModelConnectionSpec{Provider: route.Provider, Protocol: route.Protocol, Endpoint: endpoint, CredentialProfile: native.CredentialProfile, Models: []string{model}, AllowInsecure: harness.AllowInsecure}},
-	}, nil
-}
-
-// EnsureWrappers creates the wrappers a namespace lacks for an authorised
-// profile. Existing objects are never modified: a namespace that already
-// prepared its own wrappers keeps them, whatever they say.
-func EnsureWrappers(ctx context.Context, c client.Client, namespace, profileName string) (Wrappers, error) {
-	authorised, err := AuthorisedProfiles(ctx, c, namespace)
-	if err != nil {
-		return Wrappers{}, err
-	}
-	index := slices.IndexFunc(authorised, func(a Authorised) bool { return a.Profile.Name == profileName })
-	if index < 0 {
-		return Wrappers{}, fmt.Errorf("no execution policy admits profile %q in namespace %q", profileName, namespace)
-	}
-	objects, err := TenantWrappers(namespace, &authorised[index].Profile, &authorised[index].Policy)
-	if err != nil {
-		return Wrappers{}, err
-	}
-	result := WrapperNames(Backend(&authorised[index].Profile))
-	result.Created = []string{}
-	for _, object := range objects {
-		if err := c.Create(ctx, object); err != nil {
-			if apierrors.IsAlreadyExists(err) {
-				continue
-			}
-			return Wrappers{}, fmt.Errorf("create %s %s: %w", object.GetObjectKind().GroupVersionKind().Kind, object.GetName(), err)
-		}
-		result.Created = append(result.Created, object.GetName())
-	}
-	return result, nil
 }

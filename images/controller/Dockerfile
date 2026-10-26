@@ -33,12 +33,12 @@ RUN for i in 1 2 3 4 5; do go mod download && break; [ "$i" = 5 ] && exit 1; \
 COPY . .
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -mod=mod -ldflags="-s -w -X main.imageTag=${IMAGE_TAG}" -o /controller ./cmd/controller
 # TLS edge for a fleet node's scoped receiver (celln.mediation): the chart runs
-# it from this image as an unprivileged sidecar beside the plaintext dispatcher.
-RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -mod=mod -ldflags="-s -w" -o /celln-parent-proxy ./cmd/celln-parent-proxy
+# it from this image as an unprivileged sidecar beside the plaintext router.
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -mod=mod -ldflags="-s -w" -o /celln-scoped-receiver ./cmd/celln-scoped-receiver
 
 FROM gcr.io/distroless/static:nonroot
 COPY --from=builder /controller /controller
-COPY --from=builder /celln-parent-proxy /celln-parent-proxy
+COPY --from=builder /celln-scoped-receiver /celln-scoped-receiver
 COPY --from=celln-cli /rootfs/ /
 USER 65532:65532
 ENTRYPOINT ["/controller"]

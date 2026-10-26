@@ -27,14 +27,7 @@ func TestSplitImageRef(t *testing.T) {
 }
 
 func TestCellnInstallSetValues(t *testing.T) {
-	vals, err := cellnInstallSetValues(
-		context.Background(),
-		"ghcr.io/sympozium-ai/celln:v0.5.34",
-		"",
-		[]string{"http://10.0.0.1:8787"},
-		1,
-		true,
-	)
+	vals, err := cellnInstallSetValues(context.Background(), "ghcr.io/sympozium-ai/celln:v0.5.34", "", 1)
 	if err != nil {
 		t.Fatalf("cellnInstallSetValues: %v", err)
 	}
@@ -47,75 +40,23 @@ func TestCellnInstallSetValues(t *testing.T) {
 	if !ok {
 		t.Fatalf("celln values missing: %#v", helmVals["celln"])
 	}
-	for _, key := range []string{"enabled", "installer", "bootstrap", "dispatcher", "router", "tokenSecret", "capabilityTokenSecret"} {
+	for _, key := range []string{"enabled", "bootstrap", "router", "tokenSecret", "capabilityTokenSecret", "image"} {
 		if _, ok := celln[key]; !ok {
 			t.Fatalf("celln.%s missing from %#v", key, celln)
 		}
 	}
-	bootstrap, _ := celln["bootstrap"].(map[string]interface{})
-	if bootstrap["enabled"] != true {
-		t.Fatalf("bootstrap.enabled = %v, want true", bootstrap["enabled"])
-	}
-	installer, _ := celln["installer"].(map[string]interface{})
-	if installer["enabled"] != true {
-		t.Fatalf("installer.enabled = %v, want true (hostInstaller=true)", installer["enabled"])
-	}
-	dispatcher, _ := celln["dispatcher"].(map[string]interface{})
-	if dispatcher["enabled"] != false {
-		t.Fatalf("dispatcher.enabled = %v, want false (hostInstaller=true replaces the in-cluster dispatcher)", dispatcher["enabled"])
-	}
-	router, _ := celln["router"].(map[string]interface{})
-	if router["external"] != false {
-		t.Fatalf("router.external = %v, want false", router["external"])
-	}
-	if router["image"].(map[string]interface{})["tag"] != "v0.5.34" {
-		t.Fatalf("router.image.tag = %v, want v0.5.34", router["image"])
-	}
-	backends, ok := router["backends"].([]interface{})
-	if !ok || len(backends) != 1 || backends[0] != "http://10.0.0.1:8787" {
-		t.Fatalf("router.backends = %#v, want [http://10.0.0.1:8787]", router["backends"])
-	}
-}
-
-func TestCellnInstallSetValuesDefaultBackends(t *testing.T) {
-	vals, err := cellnInstallSetValues(
-		context.Background(),
-		"ghcr.io/sympozium-ai/celln:v0.5.34",
-		"",
-		nil,
-		1,
-		false,
-	)
-	if err != nil {
-		t.Fatalf("cellnInstallSetValues: %v", err)
-	}
-	helmVals, err := buildHelmValues("", vals)
-	if err != nil {
-		t.Fatalf("buildHelmValues: %v", err)
-	}
-	celln := helmVals["celln"].(map[string]interface{})
-	router := celln["router"].(map[string]interface{})
-	backends := router["backends"].([]interface{})
-	if len(backends) != 1 || backends[0] != "http://celln-dispatcher.celln-system.svc.cluster.local:8787" {
-		t.Fatalf("router.backends = %#v, want the in-cluster dispatcher Service", backends)
-	}
-	if _, has := celln["installer"]; has {
-		installer := celln["installer"].(map[string]interface{})
-		if installer["enabled"] == true {
-			t.Fatalf("installer.enabled should be false when hostInstaller=false")
+	// The single in-cluster dispatcher and the host installer are gone: the
+	// fleet (celln.fleet) is the only execution plane behind the router.
+	for _, gone := range []string{"installer", "dispatcher"} {
+		if _, has := celln[gone]; has {
+			t.Fatalf("celln.%s is set: %#v", gone, celln[gone])
 		}
 	}
-}
-
-func TestCellnInstallSetValuesHostInstallerRequiresBackend(t *testing.T) {
-	if _, err := cellnInstallSetValues(
-		context.Background(),
-		"ghcr.io/sympozium-ai/celln:v0.5.34",
-		"",
-		nil,
-		1,
-		true,
-	); err == nil {
-		t.Fatal("hostInstaller without --celln-backend must fail; the host dispatcher is loopback-only")
+	router, _ := celln["router"].(map[string]interface{})
+	if router["external"] != false || router["image"].(map[string]interface{})["tag"] != "v0.5.34" {
+		t.Fatalf("router values: %#v", router)
+	}
+	if _, has := router["backends"]; has {
+		t.Fatalf("router.backends is set; the router discovers fleet nodes by DNS: %#v", router["backends"])
 	}
 }

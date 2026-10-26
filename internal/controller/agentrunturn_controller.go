@@ -11,7 +11,6 @@ import (
 
 	api "github.com/sympozium-ai/sympozium/api/v1alpha1"
 	"github.com/sympozium-ai/sympozium/internal/cellnauthority"
-	"github.com/sympozium-ai/sympozium/internal/cellnparent"
 	"github.com/sympozium-ai/sympozium/internal/cellnscoped"
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -28,36 +27,12 @@ import (
 const agentRunTurnFinalizer = "sympozium.ai/agentrunturn-finalizer"
 
 // AgentRunTurnReconciler admits fresh, bounded operations to an already-owned
-// scoped native parent. It never creates a parent or falls back to a legacy
+// scoped native parent. It never creates a parent or falls back to another
 // dispatcher or standing model grant.
 type AgentRunTurnReconciler struct {
 	client.Client
 	APIReader        client.Reader
 	ScopedDispatcher *cellnscoped.Dispatcher
-	// ParentConfigPath remains source-compatible for the parent-only binary but
-	// is deliberately not an execution fallback for scoped turns.
-	ParentConfigPath string
-}
-
-// turnOnNativeParent reports whether a turn belongs to a run the fleet's
-// provision path admitted (status.cellnParent) rather than to a scoped run.
-// A turn already bound to a scoped operation stays scoped; a turn that carries
-// a parent-path execution record stays on the parent path even after its run
-// is gone. A turn whose run is bound to neither path keeps the scoped handling
-// this manager has always given it.
-func (r *AgentRunTurnReconciler) turnOnNativeParent(ctx context.Context, reader client.Reader, turn *api.AgentRunTurn) (bool, error) {
-	if turn.Status.CellnScoped != nil {
-		return false, nil
-	}
-	if turn.Status.Execution != nil {
-		// The scoped path writes status.execution only beside status.cellnScoped.
-		return true, nil
-	}
-	var run api.AgentRun
-	if err := reader.Get(ctx, client.ObjectKey{Namespace: turn.Namespace, Name: turn.Spec.RunName}, &run); err != nil {
-		return false, client.IgnoreNotFound(err)
-	}
-	return string(run.UID) == turn.Spec.RunUID && run.Status.CellnScoped == nil && run.Status.CellnParent != nil, nil
 }
 
 // +kubebuilder:rbac:groups=sympozium.ai,resources=agentrunturns,verbs=get;list;watch;update;patch
@@ -72,40 +47,6 @@ func (r *AgentRunTurnReconciler) Reconcile(ctx context.Context, request ctrl.Req
 	if err := reader.Get(ctx, request.NamespacedName, &turn); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
-	// The separately deployed parent-only controller is an explicit legacy
-	// mode, not a fallback from scoped reconciliation. The primary manager never
-	// supplies ParentConfigPath to this reconciler.
-	parentPath := r.ScopedDispatcher == nil && r.ParentConfigPath != ""
-	if r.ScopedDispatcher != nil && r.ParentConfigPath != "" {
-		// Both enduring paths on one manager: a turn follows its parent run.
-		onParent, err := r.turnOnNativeParent(ctx, reader, &turn)
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-		parentPath = onParent
-	}
-	if parentPath {
-		if !turn.DeletionTimestamp.IsZero() {
-			// A turn that waited under the scoped finalizer before its run was
-			// bound to a native parent never acquired a scoped operation.
-			if r.ScopedDispatcher != nil && turn.Status.CellnScoped == nil && controllerutil.ContainsFinalizer(&turn, agentRunTurnFinalizer) {
-				return r.removeTurnFinalizer(ctx, &turn)
-			}
-			return ctrl.Result{}, nil
-		}
-		done, err := cellnparent.ReconcileTurn(ctx, r.Client, reader, request.NamespacedName, r.ParentConfigPath)
-		if statusErr := r.recordTurnObservation(ctx, reader, &turn, err); statusErr != nil {
-			return ctrl.Result{}, statusErr
-		}
-		if err != nil {
-			ctrl.LoggerFrom(ctx).Info("Native turn outcome requires reconciliation", "turn", request.NamespacedName, "cause", err.Error())
-			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
-		}
-		if done {
-			return ctrl.Result{}, nil
-		}
-		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
-	}
 	if turn.Status.CellnScoped != nil && turn.Status.CellnScoped.CleanupConfirmed {
 		// Settle a turn cleaned up before this condition was recorded.
 		if err := r.markTurnSettled(ctx, &turn); err != nil {
@@ -113,7 +54,7 @@ func (r *AgentRunTurnReconciler) Reconcile(ctx context.Context, request ctrl.Req
 		}
 		return r.removeTurnFinalizer(ctx, &turn)
 	}
-	if condition := meta.FindStatusCondition(turn.Status.Conditions, "CellnTurnComplete"); condition != nil && condition.Status == metav1.ConditionTrue && condition.Reason == "CancelledBeforeAdmission" {
+	if condition := meta.FindStatusCondition(turn.Status.Conditions, "CellnTurnComplete"); condition != nil && condition.Status == metav1.ConditionTrue && (condition.Reason == "CancelledBeforeAdmission" || condition.Reason == "RefusedBeforeAdmission") {
 		return r.removeTurnFinalizer(ctx, &turn)
 	}
 	if turn.Spec.CancelRequested && turn.Status.CellnScoped == nil {
@@ -188,6 +129,20 @@ func (r *AgentRunTurnReconciler) Reconcile(ctx context.Context, request ctrl.Req
 	if turn.Status.CellnScoped == nil {
 		prepared, err := r.ScopedDispatcher.PrepareTurn(ctx, client.ObjectKeyFromObject(parent), client.ObjectKeyFromObject(&turn), originalFinal, parent.Status.CellnScoped.ParentIncarnation)
 		if err != nil {
+			if reason := cellnauthority.PlatformReason(err); reason != "" {
+				// A definitive refusal of this turn's authority (the Agent, its
+				// connection, policy or tools no longer match what the
+				// conversation was admitted under) is final: nothing native
+				// started, and retrying would wait forever. The conversation
+				// itself stays as it is; the caller starts a new one.
+				if err := r.updateTurnStatus(ctx, &turn, func(current *api.AgentRunTurn) error {
+					meta.SetStatusCondition(&current.Status.Conditions, metav1.Condition{Type: "CellnTurnComplete", Status: metav1.ConditionTrue, Reason: "RefusedBeforeAdmission", Message: reason + ": the turn's authority no longer matches the conversation's admitted authority; no native operation was started. Start a new conversation.", ObservedGeneration: current.Generation})
+					return nil
+				}); err != nil {
+					return ctrl.Result{}, err
+				}
+				return r.removeTurnFinalizer(ctx, &turn)
+			}
 			return r.turnUncertain(ctx, &turn, "PreparationUnconfirmed", err)
 		}
 		final, err := r.ScopedDispatcher.EnsureTurnFinal(ctx, prepared, originalFinal)
@@ -378,8 +333,10 @@ func (r *AgentRunTurnReconciler) applyTurnStatus(ctx context.Context, turn *api.
 		return ctrl.Result{}, err
 	}
 	if slices.Contains(active, observed.Phase) {
-		_ = r.recordTurnObservation(ctx, r.APIReader, turn, nil)
-		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+		_ = r.recordTurnObservationReason(ctx, turn, "Pending")
+		// A caller is waiting on this turn's answer: read the owner record
+		// every second while it is being produced.
+		return ctrl.Result{RequeueAfter: time.Second}, nil
 	}
 	if observed.Phase == "Succeeded" && (observed.ReceiptDigest == "" || observed.Output == "") {
 		return ctrl.Result{}, errors.New("successful scoped turn lacks correlated output or receipt")
@@ -576,19 +533,6 @@ func (r *AgentRunTurnReconciler) turnUncertain(ctx context.Context, turn *api.Ag
 	return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 }
 
-func (r *AgentRunTurnReconciler) recordTurnObservation(ctx context.Context, reader client.Reader, observed *api.AgentRunTurn, reconcileErr error) error {
-	reason := "Pending"
-	if reconcileErr != nil {
-		reason = "ReconciliationRequired"
-	}
-	// An expired original lease is terminal for new turns, not a transient
-	// failure: say so explicitly instead of reporting generic reconciliation.
-	if errors.Is(reconcileErr, cellnparent.ErrParentLeaseExpired) {
-		reason = "LeaseExpired"
-	}
-	return r.recordTurnObservationReason(ctx, observed, reason)
-}
-
 func (r *AgentRunTurnReconciler) recordTurnObservationReason(ctx context.Context, observed *api.AgentRunTurn, reason string) error {
 	reader := r.APIReader
 	if reader == nil {
@@ -603,9 +547,6 @@ func (r *AgentRunTurnReconciler) recordTurnObservationReason(ctx context.Context
 	}
 	before := fresh.DeepCopy()
 	condition := metav1.Condition{Type: "CellnTurnComplete", Status: metav1.ConditionFalse, Reason: reason, Message: "Waiting for the original scoped turn owner; refusal or uncertainty cannot create replacement work.", ObservedGeneration: fresh.Generation}
-	if reason == "LeaseExpired" {
-		condition.Message = "The parent's original execution lease has elapsed; new turns are refused without spending budget. In-flight turns may still reconcile. Create a new run for further work."
-	}
 	if fresh.Status.CellnScoped != nil && slices.Contains([]string{"Succeeded", "Failed", "Refused", "Cancelled"}, fresh.Status.CellnScoped.NativePhase) {
 		condition.Status, condition.Reason, condition.Message = metav1.ConditionTrue, "Committed", "The original scoped turn owner returned a terminal correlated result."
 	}

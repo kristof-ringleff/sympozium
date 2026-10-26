@@ -7,7 +7,7 @@
     instructions; tools are operations. Compatibility and permissions must not
     be inferred from a harness name. See
     [skills, tools and execution](../concepts/skills-tools-and-execution.md)
-    and [native installation](celln-native-installation.md).
+    and [Celln fleet installation](celln-fleet-installation.md).
 
 AgentHarness brings an existing agent harness into Sympozium without turning
 the cluster into a general-purpose container launcher. It solves the gap

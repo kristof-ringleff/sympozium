@@ -12,7 +12,7 @@ import (
 func TestConnectionPinsRouteAndRefusesMutation(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = api.AddToScheme(scheme)
-	connection := &api.ModelConnection{ObjectMeta: metav1.ObjectMeta{Name: "team", Namespace: "test", UID: "original"}, Spec: api.ModelConnectionSpec{Provider: "custom", Protocol: "openai-chat", Endpoint: "https://models.example/v1/chat/completions", CredentialProfile: "team-key", Models: []string{"chosen"}}}
+	connection := &api.ModelConnection{ObjectMeta: metav1.ObjectMeta{Name: "team", Namespace: "test", UID: "original"}, Spec: api.ModelConnectionSpec{Provider: "custom", Protocol: "openai-chat", Endpoint: "https://models.example/v1/chat/completions", Models: []string{"chosen"}}}
 	store := fake.NewClientBuilder().WithScheme(scheme).WithObjects(connection).Build()
 	ctx := context.Background()
 	resolved, err := Resolve(ctx, store, "test", api.ModelSpec{ConnectionRef: "team", Model: "chosen"})

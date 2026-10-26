@@ -70,13 +70,12 @@ curl -fsSL https://deploy.sympozium.ai/install.sh | sh
 Then deploy to your cluster and activate your first agents:
 
 ```bash
-sympozium install          # deploys CRDs, controllers, built-in Ensembles, the Celln plane and ergoz
-# With DEEPSEEK_API_KEY, OPENAI_API_KEY or ANTHROPIC_API_KEY set (or a prompt in a
-# terminal), the same command installs the Celln fleet: every node with KVM runs
-# hardware-isolated, long-running agents for every namespace, on any number of
-# nodes. Model access is mediated by default: a gateway holds provider keys, nodes
-# never do, the key you gave becomes the `starter` Agent's own key, and every other
-# Agent brings its own. No further flags (opt out with --no-celln-mediation).
+sympozium install          # deploys CRDs, controllers, built-in Ensembles, the Celln fleet, the model gateway and ergoz
+# The same command installs the Celln fleet: every node with KVM runs hardware-isolated,
+# one-shot and long-running agents for every namespace, on any number of nodes. The
+# fleet's two DaemonSets are privileged (booting micro-VMs needs /dev/kvm, /boot and
+# /lib/modules) and the install says so first. Nothing about models is asked: each Agent
+# brings its own ModelConnection and key, the gateway adds it per call, nodes never hold it.
 sympozium                  # launch the TUI — go to Ensembles tab, press Enter to onboard
 sympozium serve            # open the web dashboard (port-forwards to the in-cluster UI)
 ```
@@ -159,7 +158,8 @@ Evaluating Google's [AX](https://github.com/google/ax) and [Agent Substrate](htt
 | **TUI & Web UI** | Terminal and browser dashboards with live workflow canvas, or skip the UI entirely with Helm and kubectl |
 | **Policy & Governance** | `SympoziumPolicy` CRD &mdash; tool gating (allow/deny, enforced on every run), sandbox requirements, network egress rules, image-registry allowlists, and whether skills may touch Secrets |
 | **One Key per Agent** | Every Agent uses its own model key; only its sub-agents share it. The key's owner is recorded on its Secret and checked by the controller, the admission webhook and, on every call, the model gateway. Skills cannot read Secrets or start pods that do unless a policy allows it. See [Security](https://deploy.sympozium.ai/docs/concepts/security/#model-keys) |
-| **Mediated Model Access** | By default a model gateway holds provider keys, so hardware-isolated agents never see one. Built-in routes cover OpenAI, Anthropic and DeepSeek (any model), and approved local servers work keyless. See the [mediation guide](https://deploy.sympozium.ai/docs/guides/celln-mediated-model-access/) |
+| **Agent-Bound Model Access** | Celln holds no model. Each Agent's `ModelConnection` (any OpenAI- or Anthropic-compatible endpoint) is its route; its key is owned by that Agent, pinned to that endpoint's origin, and added per call by a model gateway that re-checks everything on every request. Operators may narrow destinations by host pattern and approve private endpoints once. See the [model access guide](https://deploy.sympozium.ai/docs/guides/celln-mediated-model-access/) |
+| **Every Agent is an OpenAI Endpoint** | Point any OpenAI SDK at `/api/v1/agents/{name}/v1` with your Sympozium token: the newest user message reaches the Agent's own conversation (a Celln cell, or a Pi/Hermes session) and the answer comes back as a chat completion, streaming included. See the [model access guide](https://deploy.sympozium.ai/docs/guides/celln-mediated-model-access/) |
 | **Serving Mode** | Run an agent as a long-lived, OpenAI-compatible + MCP HTTP endpoint instead of a one-shot Job &mdash; agents as services |
 | **Observability & Cost** | OpenTelemetry traces and metrics, Prometheus endpoints, per-run trace IDs, and token usage with estimated cost on every AgentRun |
 | **Celln Tool Catalogue** | Hardware-isolated agents borrow real programs (grep, sed, awk, jq, &hellip;) taken from container images pinned by digest, never reimplemented. Every borrowed tool names the image layer it came from, and operators extend the toolbox by adding an image to the catalogue, no rebuild. See [the fleet guide](docs/guides/celln-fleet-installation.md#the-toolbox) |
@@ -185,7 +185,8 @@ Evaluating Google's [AX](https://github.com/google/ax) and [Agent Substrate](htt
 | Agent Sandboxing | [deploy.sympozium.ai/docs/concepts/agent-sandbox](https://deploy.sympozium.ai/docs/concepts/agent-sandbox/) |
 | Hermetic Workloads (Celln) | [deploy.sympozium.ai/docs/concepts/celln-backend](https://deploy.sympozium.ai/docs/concepts/celln-backend/) |
 | Security | [deploy.sympozium.ai/docs/concepts/security](https://deploy.sympozium.ai/docs/concepts/security/) |
-| Mediated Model Access (keys, gateway, routes) | [deploy.sympozium.ai/docs/guides/celln-mediated-model-access](https://deploy.sympozium.ai/docs/guides/celln-mediated-model-access/) |
+| Agent-bound Model Access (connections, keys, gateway) | [deploy.sympozium.ai/docs/guides/celln-mediated-model-access](https://deploy.sympozium.ai/docs/guides/celln-mediated-model-access/) |
+| Celln Fleet Installation | [deploy.sympozium.ai/docs/guides/celln-fleet-installation](https://deploy.sympozium.ai/docs/guides/celln-fleet-installation/) |
 | CLI & TUI Reference | [deploy.sympozium.ai/docs/reference/cli](https://deploy.sympozium.ai/docs/reference/cli/) |
 | Helm Chart | [deploy.sympozium.ai/docs/reference/helm](https://deploy.sympozium.ai/docs/reference/helm/) |
 | Local Models | [deploy.sympozium.ai/docs/guides/local-models](https://deploy.sympozium.ai/docs/guides/local-models/) |

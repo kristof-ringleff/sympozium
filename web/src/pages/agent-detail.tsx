@@ -5,7 +5,6 @@ import {
   useCapabilities,
   usePatchAgent,
   useCreateHarnessSession,
-  useCellnTools,
   useHarnessSessions,
   useSetHarnessSessionState,
   useRuntimes,
@@ -15,9 +14,9 @@ import {
 import { HarnessSessionChatDialog } from "@/components/harness-session-dialog";
 import { CellnAgentConversation } from "@/components/celln-agent-conversation";
 import { isCellnEnduringAgent } from "@/lib/persistent-harness";
-import { CellnStarterTools } from "@/components/celln-starter-tools";
-import { CellnPermissionPreview } from "@/components/celln-permission-preview";
 import { CellnAgentConnection } from "@/components/celln-agent-connection";
+import { AgentOpenAIEndpoint } from "@/components/agent-openai-endpoint";
+import { CellnAgentPersona } from "@/components/celln-agent-persona";
 import { StatusBadge } from "@/components/status-badge";
 import { GithubAuthDialog } from "@/components/github-auth-dialog";
 import {
@@ -273,6 +272,7 @@ export function AgentDetailPage() {
             <CardHeader><CardTitle className="flex items-center gap-2 text-base"><MessageSquare className="h-4 w-4" />Persistent chat</CardTitle></CardHeader>
             <CardContent className="space-y-4 text-sm">
               <p className="text-muted-foreground">This Agent’s harness is a durable conversation pod. Chat turns stay in that harness; use the Runs tab only for explicit one-shot or workflow executions.</p>
+              <AgentOpenAIEndpoint name={inst.metadata.name} />
               {!chatSession ? <Button onClick={startChat} disabled={createHarnessSession.isPending}>{createHarnessSession.isPending ? "Requesting chat…" : "Retry session creation"}</Button> : chatSession.status?.phase === "Ready" ? <div className="flex items-center justify-between rounded border p-3"><div><p className="font-mono text-xs">{chatSession.metadata.name}</p><p className="text-xs text-muted-foreground">Ready · durable {selectedRuntime.metadata.name} conversation</p></div><div className="flex gap-2"><Button variant="outline" onClick={() => setHarnessSessionState.mutate({ name: chatSession.metadata.name, desiredState: "stopped" })} disabled={setHarnessSessionState.isPending}>Stop</Button><Button onClick={() => setChatOpen(true)}><MessageSquare className="mr-2 h-4 w-4" />Open chat</Button></div></div> : chatSession.status?.phase === "Failed" ? <div className="rounded border border-destructive/50 bg-destructive/5 p-3"><p className="font-medium text-destructive">Persistent chat failed to start</p><p className="mt-1 text-xs text-muted-foreground">{chatSession.status.conditions?.find((condition) => condition.type === "Ready")?.message || "The session controller did not provide a failure reason."}</p><div className="mt-3 flex gap-2"><Button variant="outline" onClick={() => setHarnessSessionState.mutate({ name: chatSession.metadata.name, desiredState: "running" })} disabled={setHarnessSessionState.isPending}>Retry</Button></div></div> : chatSession.spec.desiredState === "stopped" || chatSession.status?.phase === "Draining" ? <div className="flex items-center justify-between rounded border p-3"><div><p className="font-mono text-xs">{chatSession.metadata.name}</p><p className="text-xs text-muted-foreground">Chat is stopped. Resume it when you want to continue.</p></div><Button onClick={() => setHarnessSessionState.mutate({ name: chatSession.metadata.name, desiredState: "running" })} disabled={setHarnessSessionState.isPending}>Resume chat</Button></div> : <div className="rounded border p-3 text-muted-foreground">Starting persistent chat session… <span className="font-mono">{chatSession.status?.phase || "Pending"}</span>{(() => { const ready = chatSession.status?.conditions?.find((condition) => condition.type === "Ready"); return ready?.message && ready.reason !== "WaitingForDeployment" ? <p className="mt-1 text-xs">{ready.message}</p> : null; })()}<div className="mt-3"><Button variant="outline" size="sm" onClick={() => setHarnessSessionState.mutate({ name: chatSession.metadata.name, desiredState: "stopped" })} disabled={setHarnessSessionState.isPending}>Stop</Button></div></div>}
             </CardContent>
           </Card>
@@ -521,7 +521,6 @@ function defaultChatSessionName(agentName: string) {
 
 function AgentRuntimeCard({ inst, runtimes }: { inst: Agent; runtimes: import("@/lib/api").AgentRuntime[] }) {
   const patchAgent = usePatchAgent();
-  const catalogue = useCellnTools();
   const capabilities = useCapabilities();
   const platformProfiles = useCellnPlatformProfiles();
   const selected = inst.spec.runtimeRef || "none";
@@ -531,8 +530,9 @@ function AgentRuntimeCard({ inst, runtimes }: { inst: Agent; runtimes: import("@
   const lifecycle =
     execution?.executionLifecycle || (backend === "celln" ? "enduring" : "one-shot");
   const tools = execution?.cellnSelection?.toolRefs || [];
-  // A fleet wrapper (cellnProfileRef) is native Celln too: its tools and model
-  // route come from the shared platform policy rather than namespace grants.
+  // A fleet wrapper (cellnProfileRef) is native Celln too: its tools and
+  // budgets come from the shared platform policy rather than namespace grants;
+  // its model route is the Agent's own connection (CellnAgentConnection).
   const wrapperRuntime = !!selectedRuntime?.spec.cellnProfileRef;
   const wrapperProfile = wrapperRuntime ? (platformProfiles.data || []).find((profile) => profile.name === selectedRuntime?.spec.cellnProfileRef?.name) : undefined;
   const compatibleHarness = selectedRuntime?.spec.celln?.contractVersion === "celln.json-tools/v1" || wrapperRuntime;
@@ -587,7 +587,7 @@ function AgentRuntimeCard({ inst, runtimes }: { inst: Agent; runtimes: import("@
                     executionLifecycle: nextLifecycle,
                     provider: execution?.modelConnectionRef ? undefined : execution?.provider || "deepseek",
                     modelConnectionRef: execution?.modelConnectionRef,
-                    model: execution?.model || wrapperProfile?.model || "deepseek-chat",
+                    model: execution?.model || "deepseek-chat",
                     cellnSelection: selectionWith(tools),
                     enduring: nextLifecycle === "enduring" ? enduringDefaults : undefined,
                   });
@@ -633,6 +633,8 @@ function AgentRuntimeCard({ inst, runtimes }: { inst: Agent; runtimes: import("@
         </div>
 
         {backend === "celln" && <CellnAgentConnection agent={inst} />}
+        {backend === "celln" && <CellnAgentPersona agent={inst} fleetDefault={wrapperProfile?.systemPrompt} />}
+        {backend === "celln" && <AgentOpenAIEndpoint name={inst.metadata.name} />}
 
         {backend === "celln" && (
           <div className="space-y-3 rounded-md border p-3">
@@ -651,7 +653,7 @@ function AgentRuntimeCard({ inst, runtimes }: { inst: Agent; runtimes: import("@
                       executionLifecycle: value,
                       provider: execution?.modelConnectionRef ? undefined : execution?.provider || "deepseek",
                       modelConnectionRef: execution?.modelConnectionRef,
-                      model: execution?.model || wrapperProfile?.model || "deepseek-chat",
+                      model: execution?.model || "deepseek-chat",
                       cellnSelection: selectionWith(tools),
                       enduring: value === "enduring" ? enduringDefaults : undefined,
                     })}
@@ -674,18 +676,6 @@ function AgentRuntimeCard({ inst, runtimes }: { inst: Agent; runtimes: import("@
             <div className="space-y-2">
               <Label>Approved borrowed tools (default)</Label>
               <p className="text-xs text-muted-foreground">An explicit empty selection lends no tools and is distinct from leaving defaults unset. Starter suggestions do not grant permission.</p>
-              {compatibleHarness && !catalogue.isLoading && !catalogue.isError && (
-                <CellnStarterTools agentRef={inst.metadata.name} runtimeRef={inst.spec.runtimeRef || undefined} catalogue={catalogue.data || []} onSelect={(toolRefs) => saveExecution({
-                  backend: "celln",
-                  executionLifecycle: lifecycle === "enduring" ? "enduring" : "one-shot",
-                  provider: execution?.modelConnectionRef ? undefined : execution?.provider || "deepseek",
-                  modelConnectionRef: execution?.modelConnectionRef,
-                  model: execution?.model || "deepseek-chat",
-                  cellnSelection: selectionWith(toolRefs),
-                  enduring: lifecycle === "enduring" ? enduringDefaults : undefined,
-                })} />
-              )}
-              {compatibleHarness && <CellnPermissionPreview enduring={lifecycle === "enduring"} agentRef={inst.metadata.name} selection={{ runtimeRef: inst.spec.runtimeRef || undefined, toolRefs: tools }} />}
               <Button type="button" variant="outline" size="sm" disabled={patchAgent.isPending || !execution?.cellnSelection} onClick={() => saveExecution({
                 backend: "celln",
                 executionLifecycle: lifecycle === "enduring" ? "enduring" : "one-shot",

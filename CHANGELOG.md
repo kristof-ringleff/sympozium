@@ -1,5 +1,55 @@
 # Changelog
 
+## [0.12.0](https://github.com/sympozium-ai/sympozium/compare/v0.11.6...v0.12.0) (2026-10-25)
+
+
+### ⚠ BREAKING CHANGES
+
+* agent-bound model access — model-free Celln fleet, per-Agent keys, direct Agent API
+
+### Features
+
+* agent-bound model access — model-free Celln fleet, per-Agent keys, direct Agent API ([8732156](https://github.com/sympozium-ai/sympozium/commit/8732156242f006a28cb7969c7e68fb6053ff73c7))
+
+
+### Bug Fixes
+
+* **console:** keep the wizard footer in view on the Celln model step ([eef785d](https://github.com/sympozium-ai/sympozium/commit/eef785dff6bd68e7952a1ce1cbbb4e6c5e858f3a))
+* **console:** keep the wizard footer in view on the Celln model step ([8d91210](https://github.com/sympozium-ai/sympozium/commit/8d91210aaf05957cde1ca390e334675f3a5bbcd4))
+
+
+### Performance Improvements
+
+* faster Celln admission and turns; refuse stale turns at once ([29f8dd1](https://github.com/sympozium-ai/sympozium/commit/29f8dd18290d7b35f01e513be2d14b01a2815f55))
+
+## [0.11.6](https://github.com/sympozium-ai/sympozium/compare/v0.11.5...v0.11.6) (2026-10-16)
+
+
+### Features
+
+* Add gate-driven retry to response gates ([#338](https://github.com/sympozium-ai/sympozium/issues/338)) ([2e069a4](https://github.com/sympozium-ai/sympozium/commit/2e069a4dd020e96a7346200c27597edf9a0b8055))
+
+
+### Bug Fixes
+
+* **controller:** honour AgentRuntime.spec.resources on the AgentRun path ([#664](https://github.com/sympozium-ai/sympozium/issues/664)) ([1ca7b18](https://github.com/sympozium-ai/sympozium/commit/1ca7b1893a5597d5d2a7c3bfd3c9c937d525c313))
+* **controller:** let air-gapped clusters override the busybox and kubectl utility images ([#667](https://github.com/sympozium-ai/sympozium/issues/667)) ([3545078](https://github.com/sympozium-ai/sympozium/commit/3545078c45d7adeb135a337bd6612d51f74a2078))
+* **controller:** populate MCPServer tool status from tools/list ([#666](https://github.com/sympozium-ai/sympozium/issues/666)) ([c152185](https://github.com/sympozium-ai/sympozium/commit/c152185ea149cf2c96259c205cf6582895645acf))
+* **controller:** stop retrying a schedule run the API server rejects ([#665](https://github.com/sympozium-ai/sympozium/issues/665)) ([3c197ae](https://github.com/sympozium-ai/sympozium/commit/3c197ae44f5947cd09bbb16ffdb5c8668a9c43c7)), closes [#628](https://github.com/sympozium-ai/sympozium/issues/628)
+
+## [0.11.5](https://github.com/sympozium-ai/sympozium/compare/v0.11.4...v0.11.5) (2026-10-12)
+
+
+### Features
+
+* prove per-Agent keys in the journey; attribute refusals and cells ([#662](https://github.com/sympozium-ai/sympozium/issues/662)) ([7944bba](https://github.com/sympozium-ai/sympozium/commit/7944bba0d27f48a2ef5a01abdd3d2a893ac2cb32))
+
+
+### Bug Fixes
+
+* **celln:** Create Agent → Celln offers the same providers as one-shot ([4315c63](https://github.com/sympozium-ai/sympozium/commit/4315c6388ab0850b496e3b7870e8cbeff94ec28b))
+* **celln:** Create Agent → Celln offers the same providers as one-shot ([a4f131d](https://github.com/sympozium-ai/sympozium/commit/a4f131dbe34906076e998af674c216aa406b0389))
+
 ## [0.11.4](https://github.com/sympozium-ai/sympozium/compare/v0.11.3...v0.11.4) (2026-10-07)
 
 

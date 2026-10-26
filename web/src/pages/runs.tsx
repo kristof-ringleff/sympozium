@@ -42,7 +42,6 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
-import { CellnStarterTools } from "@/components/celln-starter-tools";
 import {
   Plus,
   Trash2,
@@ -64,7 +63,6 @@ import {
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { useRunsSeen } from "@/hooks/use-runs-seen";
 import type { AgentRun } from "@/lib/api";
-import { CellnPermissionPreview } from "@/components/celln-permission-preview";
 
 /** Returns true when a run is in PostRunning with a gate hook awaiting a verdict. */
 function isAwaitingGate(run: AgentRun): boolean {
@@ -397,7 +395,6 @@ export function RunsPage() {
                         {invalidParent && <p role="alert" className="text-xs text-red-400">Correct the bounded integer limits or initial message before submitting.</p>}
                       </div>}
                       <Label>Borrowed catalogue tools (optional, maximum 24)</Label>
-                      {enduringRequest && compatibleHarness && !catalogue.isLoading && !catalogue.isError && <CellnStarterTools agentRef={form.agentRef} runtimeRef={form.runtimeRef || undefined} catalogue={catalogue.data || []} onSelect={setLentTools} />}
                       <p className="text-xs text-muted-foreground" data-testid="celln-tools-explanation">Choose the tools this Harness may request. Selections are pinned to this run; installing a tool does not grant permission to use it. Agent, runtime and operator approvals must all allow it.</p>
                       <p className="text-xs text-muted-foreground">Only installed catalogue tools appear below. Shell, Python, general HTTP access and workspace read/write are not implicitly included. Adding tools to an existing enduring parent requires a new run.</p>
                       {catalogue.isLoading && <p className="text-xs">Loading catalogue…</p>}
@@ -416,7 +413,6 @@ export function RunsPage() {
                         </label>;
                       })}
                       <p className="text-xs">Lending order: {lentTools.map((ref) => `${ref.name}@${ref.revision}`).join(" → ") || "none"}</p>
-                      {compatibleHarness && !staleTools && <CellnPermissionPreview enduring={enduringRequest} agentRef={form.agentRef} selection={{ runtimeRef: form.runtimeRef || undefined, toolRefs: lentTools }} />}
                       {staleTools && <p role="alert" className="text-xs text-red-400">The catalogue changed. Clear and reselect the borrowed tools before submitting.</p>}
                       {!!lentTools.length && <Button type="button" variant="outline" size="sm" onClick={() => setLentTools([])}>Clear borrowed tools</Button>}
                       {!enduringRequest && <p className="text-xs text-amber-500">Selection readiness is not established. Catalogue metadata is not permission to run. Registered compositions can receive trusted issuance automatically; new combinations require operator preparation. Current approvals and effective permissions are checked before execution.</p>}

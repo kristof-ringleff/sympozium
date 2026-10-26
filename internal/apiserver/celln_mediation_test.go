@@ -22,13 +22,10 @@ import (
 )
 
 func mediationFixture() (profile *sympoziumv1alpha1.CellnRuntimeProfile, policy *sympoziumv1alpha1.CellnExecutionPolicy, namespaces []client.Object) {
-	profile = &sympoziumv1alpha1.CellnRuntimeProfile{ObjectMeta: metav1.ObjectMeta{Name: "celln-native-trial"}, Spec: sympoziumv1alpha1.CellnRuntimeProfileSpec{Revision: "v1", Native: &sympoziumv1alpha1.CellnNativeProvisioning{CredentialProfile: "trial", Template: apiextensionsv1.JSON{Raw: []byte(`{"model":"deepseek-chat","url":"https://api.deepseek.com/chat/completions"}`)}}}}
+	profile = &sympoziumv1alpha1.CellnRuntimeProfile{ObjectMeta: metav1.ObjectMeta{Name: "celln-native-trial"}, Spec: sympoziumv1alpha1.CellnRuntimeProfileSpec{Revision: "v1", Native: &sympoziumv1alpha1.CellnNativeProvisioning{Template: apiextensionsv1.JSON{Raw: []byte(`{"model":"deepseek-chat","url":"https://api.deepseek.com/chat/completions"}`)}}}}
 	policy = &sympoziumv1alpha1.CellnExecutionPolicy{ObjectMeta: metav1.ObjectMeta{Name: "celln-fleet-trial"}, Spec: sympoziumv1alpha1.CellnExecutionPolicySpec{
 		NamespaceSelector: cellnplatform.OpenSelector(cellnplatform.SystemNamespaces("sympozium-system")),
 		RuntimeProfiles:   []sympoziumv1alpha1.CellnExecutionPolicyRuntime{{Ref: sympoziumv1alpha1.CellnRuntimeProfileRef{Name: profile.Name, Revision: "v1"}}},
-		Routes: []sympoziumv1alpha1.CellnExecutionPolicyRoute{
-			{Provider: "deepseek", Protocol: "openai-chat", Models: []string{"deepseek-chat"}, EndpointOrigins: []string{"https://api.deepseek.com"}, Auth: "host-profile"},
-		},
 	}}
 	for _, name := range []string{"team-a", "sympozium-system"} {
 		namespaces = append(namespaces, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: name, Labels: map[string]string{cellnplatform.NamespaceNameLabel: name}}})
@@ -36,50 +33,34 @@ func mediationFixture() (profile *sympoziumv1alpha1.CellnRuntimeProfile, policy 
 	return profile, policy, namespaces
 }
 
-func TestCellnMediationReportsWhatAnAgentMayBringAKeyFor(t *testing.T) {
+// The mediation answer names no provider: the Agent's connection is the
+// route. It reports whether the release runs the gateway and the origin
+// guardrail the namespace's policies place on an Agent's own connection.
+func TestCellnMediationReportsTheOriginGuardrail(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = sympoziumv1alpha1.AddToScheme(scheme)
 	_ = corev1.AddToScheme(scheme)
-	anthropic := sympoziumv1alpha1.CellnExecutionPolicyRoute{Provider: "anthropic", Protocol: "anthropic-messages", Models: []string{"claude-a", "claude-b"}, EndpointOrigins: []string{"https://api.anthropic.com"}, Auth: "secret"}
-	record := func(content string) *corev1.ConfigMap {
-		return &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: "celln-system", Name: cellninstall.MediationRecordConfigMap}, Data: map[string]string{"mediation.json": content}}
-	}
-	declared := `{"mediateBackends":true,"routes":[{"provider":"anthropic","protocol":"anthropic-messages","models":["claude-b","claude-a"],"endpointOrigins":["https://api.anthropic.com"]},{"provider":"openai","protocol":"openai-chat","models":["gpt"],"endpointOrigins":["https://api.openai.com"]}]}`
-	published := CellnMediatedRoute{Provider: "anthropic", Protocol: "anthropic-messages", Models: []string{"claude-a", "claude-b"}, EndpointOrigins: []string{"https://api.anthropic.com"}, Policy: "celln-fleet-trial", SecretKey: "ANTHROPIC_API_KEY"}
-	pending := CellnMediatedRoute{Provider: "openai", Protocol: "openai-chat", Models: []string{"gpt"}, EndpointOrigins: []string{"https://api.openai.com"}, SecretKey: "OPENAI_API_KEY"}
-	keyless := sympoziumv1alpha1.CellnExecutionPolicyRoute{Provider: "llama-server", Protocol: "openai-chat", Models: []string{"local"}, EndpointOrigins: []string{"http://framework:8080"}, Auth: "none", AllowInsecure: true}
-	keylessAPI := CellnMediatedRoute{Provider: "llama-server", Protocol: "openai-chat", Models: []string{"local"}, EndpointOrigins: []string{"http://framework:8080"}, Auth: "none", AllowInsecure: true, Policy: "celln-fleet-trial"}
-	anyAnthropic := sympoziumv1alpha1.CellnExecutionPolicyRoute{Provider: "anthropic", Protocol: "anthropic-messages", Models: []string{"*"}, EndpointOrigins: []string{"https://api.anthropic.com"}, Auth: "secret"}
-	anyAnthropicAPI := CellnMediatedRoute{Provider: "anthropic", Protocol: "anthropic-messages", Models: []string{"*"}, AnyModel: true, EndpointOrigins: []string{"https://api.anthropic.com"}, Policy: "celln-fleet-trial", SecretKey: "ANTHROPIC_API_KEY"}
-	anyOpenAIPending := CellnMediatedRoute{Provider: "openai", Protocol: "openai-chat", Models: []string{"*"}, AnyModel: true, EndpointOrigins: []string{"https://api.openai.com"}, SecretKey: "OPENAI_API_KEY"}
+	record := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: "celln-system", Name: cellninstall.MediationRecordConfigMap}, Data: map[string]string{"mediation.json": `{"enabled":true}`}}
 	for _, tc := range []struct {
 		name      string
 		namespace string
 		record    *corev1.ConfigMap
-		routes    []sympoziumv1alpha1.CellnExecutionPolicyRoute
+		allowed   []string
+		denied    []string
 		status    int
 		want      CellnMediation
 	}{
-		{name: "keyless route has no Secret key", namespace: "team-a", record: record(`{"routes":[]}`), routes: []sympoziumv1alpha1.CellnExecutionPolicyRoute{keyless}, status: http.StatusOK,
-			want: CellnMediation{Enabled: true, Routes: []CellnMediatedRoute{keylessAPI}, Pending: []CellnMediatedRoute{}}},
-		{name: "mediation off", namespace: "team-a", status: http.StatusOK, want: CellnMediation{Routes: []CellnMediatedRoute{}, Pending: []CellnMediatedRoute{}}},
-		{name: "enabled, nothing declared", namespace: "team-a", record: record(`{"mediateBackends":false,"routes":[]}`), status: http.StatusOK, want: CellnMediation{Enabled: true, Routes: []CellnMediatedRoute{}, Pending: []CellnMediatedRoute{}}},
-		{name: "declared and partly published", namespace: "team-a", record: record(declared), routes: []sympoziumv1alpha1.CellnExecutionPolicyRoute{anthropic}, status: http.StatusOK,
-			want: CellnMediation{Enabled: true, MediateBackends: true, Routes: []CellnMediatedRoute{published}, Pending: []CellnMediatedRoute{pending}}},
-		{name: "a policy route outlives a disabled release", namespace: "team-a", routes: []sympoziumv1alpha1.CellnExecutionPolicyRoute{anthropic}, status: http.StatusOK,
-			want: CellnMediation{Routes: []CellnMediatedRoute{published}, Pending: []CellnMediatedRoute{}}},
-		{name: "a namespace no policy admits is offered nothing", namespace: "sympozium-system", record: record(declared), routes: []sympoziumv1alpha1.CellnExecutionPolicyRoute{anthropic}, status: http.StatusOK,
-			want: CellnMediation{Enabled: true, MediateBackends: true, Routes: []CellnMediatedRoute{}, Pending: []CellnMediatedRoute{pending}}},
+		{name: "gateway off", namespace: "team-a", status: http.StatusOK, want: CellnMediation{AllowedOrigins: []string{}, DeniedOrigins: []string{}, Policies: []string{"celln-fleet-trial"}}},
+		{name: "any origin", namespace: "team-a", record: record, status: http.StatusOK, want: CellnMediation{Enabled: true, AllowedOrigins: []string{}, DeniedOrigins: []string{}, Policies: []string{"celln-fleet-trial"}}},
+		{name: "narrowed", namespace: "team-a", record: record, allowed: []string{"*.openai.com", "llm.corp.internal:8443"}, denied: []string{"evil.example"}, status: http.StatusOK,
+			want: CellnMediation{Enabled: true, AllowedOrigins: []string{"*.openai.com", "llm.corp.internal:8443"}, DeniedOrigins: []string{"evil.example"}, Policies: []string{"celln-fleet-trial"}}},
+		{name: "a namespace no policy admits", namespace: "sympozium-system", record: record, allowed: []string{"*.openai.com"}, status: http.StatusOK,
+			want: CellnMediation{Enabled: true, AllowedOrigins: []string{}, DeniedOrigins: []string{}, Policies: []string{}}},
 		{name: "unknown namespace", namespace: "nowhere", status: http.StatusNotFound},
-		{name: "unusable record", namespace: "team-a", record: record(`{"routes":[{"provider":"openai","protocol":"openai-chat","models":["*","gpt"],"endpointOrigins":["https://api.openai.com"]}]}`), status: http.StatusServiceUnavailable},
-		// An any-model route says so, published or pending, so a client asks
-		// for a model name instead of offering a list.
-		{name: "any-model route", namespace: "team-a", record: record(`{"routes":[{"provider":"anthropic","protocol":"anthropic-messages","models":["*"],"endpointOrigins":["https://api.anthropic.com"]},{"provider":"openai","protocol":"openai-chat","models":["*"],"endpointOrigins":["https://api.openai.com"]}]}`), routes: []sympoziumv1alpha1.CellnExecutionPolicyRoute{anyAnthropic}, status: http.StatusOK,
-			want: CellnMediation{Enabled: true, Routes: []CellnMediatedRoute{anyAnthropicAPI}, Pending: []CellnMediatedRoute{anyOpenAIPending}}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			profile, policy, objects := mediationFixture()
-			policy.Spec.Routes = append(policy.Spec.Routes, tc.routes...)
+			policy.Spec.AllowedOrigins, policy.Spec.DeniedOrigins = tc.allowed, tc.denied
 			objects = append(objects, profile, policy)
 			if tc.record != nil {
 				objects = append(objects, tc.record)
@@ -94,22 +75,47 @@ func TestCellnMediationReportsWhatAnAgentMayBringAKeyFor(t *testing.T) {
 				return
 			}
 			var got CellnMediation
+			tc.want.Routes, tc.want.Pending, tc.want.PrivateOrigins = []struct{}{}, []struct{}{}, []string{}
 			if err := json.Unmarshal(res.Body.Bytes(), &got); err != nil || !reflect.DeepEqual(got, tc.want) {
 				t.Fatalf("mediation = %s (%v), want %+v", res.Body.String(), err, tc.want)
 			}
-			for _, field := range []string{`"routes":[`, `"pending":[`} {
+			for _, field := range []string{`"allowedOrigins":[`, `"deniedOrigins":[`} {
 				if !strings.Contains(res.Body.String(), field) {
 					t.Fatalf("clients iterate %s; got %s", field, res.Body.String())
 				}
 			}
 		})
 	}
+	// The gateway's approved private origins reach the console from the same
+	// value the gateway reads, as a JSON array or a comma-separated list.
+	for raw, want := range map[string][]string{
+		"": {},
+		`["http://10.0.0.5:8080", "http://llm.corp.internal"]`:      {"http://10.0.0.5:8080", "http://llm.corp.internal"},
+		" http://10.0.0.5:8080 ,, http://ollama.default.svc:11434 ": {"http://10.0.0.5:8080", "http://ollama.default.svc:11434"},
+		`[not json`: {},
+	} {
+		t.Setenv(privateOriginsEnv, raw)
+		if got := approvedPrivateOrigins(); !reflect.DeepEqual(got, want) {
+			t.Fatalf("%q: approved private origins %v, want %v", raw, got, want)
+		}
+	}
+	t.Setenv(privateOriginsEnv, `["http://10.0.0.5:8080"]`)
+	{
+		profile, policy, objects := mediationFixture()
+		objects = append(objects, profile, policy, record)
+		srv := NewServer(fake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).Build(), nil, nil, logr.Discard())
+		res := httptest.NewRecorder()
+		srv.Handler(nil).ServeHTTP(res, httptest.NewRequest(http.MethodGet, "/api/v1/celln-platform/mediation?namespace=team-a", nil))
+		if res.Code != http.StatusOK || !strings.Contains(res.Body.String(), `"privateOrigins":["http://10.0.0.5:8080"]`) {
+			t.Fatalf("private origins not reported: %d %s", res.Code, res.Body.String())
+		}
+	}
 	// Read only: no verb of this path changes anything.
 	profile, policy, objects := mediationFixture()
 	srv := NewServer(fake.NewClientBuilder().WithScheme(scheme).WithObjects(append(objects, profile, policy)...).Build(), nil, nil, logr.Discard())
 	for _, method := range []string{http.MethodPost, http.MethodPut, http.MethodDelete} {
 		res := httptest.NewRecorder()
-		srv.Handler(nil).ServeHTTP(res, httptest.NewRequest(method, "/api/v1/celln-platform/mediation", strings.NewReader(`{"routes":[]}`)))
+		srv.Handler(nil).ServeHTTP(res, httptest.NewRequest(method, "/api/v1/celln-platform/mediation", strings.NewReader(`{}`)))
 		if res.Code == http.StatusOK || res.Code == http.StatusCreated {
 			t.Fatalf("%s accepted: %d", method, res.Code)
 		}

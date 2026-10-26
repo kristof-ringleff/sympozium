@@ -34,7 +34,7 @@ are in the `sympozium.ai/v1alpha1` API group.
 | `CellnRuntimeProfile` | Cluster | Immutable, operator-published runtime revision: executable hashes, lifecycles, ceilings and the native parent/worker material for the fleet |
 | `CellnExecutionPolicy` | Cluster | Which namespaces may run which profiles, tools and model routes, with lease/turn/request/token ceilings |
 | `ClusterCellnTool` | Cluster | Shared, immutable tool revision lent to cells (brokered tools and commands borrowed from pinned images; `spec.sourceImage`) |
-| `CellnTool` | Namespaced | Legacy namespaced tool catalogue metadata, published by `sympozium celln-tool approve` |
+| `CellnTool` | Namespaced | Legacy namespaced tool metadata from the pre-0.12 catalogue; nothing publishes or executes it any more (the fleet lends `ClusterCellnTool`s) |
 | `CellnToolSubmission` | Namespaced | Untrusted request to publish a tool; creating it approves nothing |
 
 The [Celln fleet installer](../guides/celln-fleet-installation.md) creates
@@ -120,6 +120,8 @@ spec:
 ```
 
 Phase transitions: `Pending` → `Running` → `Succeeded` (or `Failed`). When [lifecycle hooks](lifecycle-hooks.md) with `postRun` are defined: `Pending` → `Running` → `PostRunning` → `Succeeded` (or `Failed`).
+
+A [response gate](lifecycle-hooks.md#retrying-a-rejected-response) can retry a rejected run. Each attempt is its own AgentRun, linked by `status.retryOf` and `status.attempt`; a superseded attempt ends `Failed` with `status.gateVerdict: retried`. Use `kubectl get agentruns -o wide` to see the chain.
 
 Setting `spec.backend: celln` routes the run to a hardware-isolated Celln microVM instead of a Job, and `spec.executionLifecycle` chooses `one-shot` or `enduring` (a leased parent cell that takes follow-up `AgentRunTurn`s). Celln runs use the model route of the Agent's Celln backend (`spec.model.connectionRef`), not a key in the run, and do not support SkillPacks, MCP, ensembles, delegation or shared memory. See [Celln Backend](celln-backend.md).
 

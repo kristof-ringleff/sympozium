@@ -11,6 +11,12 @@ import (
 	"k8s.io/apimachinery/pkg/util/validation"
 )
 
+func childIdentity(parent, turn string) string {
+	wire, _ := json.Marshal([]string{parent, turn})
+	sum := blake3.Sum256(wire)
+	return fmt.Sprintf("blake3:%x", sum)
+}
+
 // NewTurn builds a data-only child record after the API authenticates access to
 // this namespaced run. Persist it before using its Kubernetes UID for dispatch.
 // This does not grant authority or assert host readiness.
@@ -35,8 +41,7 @@ func validateTurnMessage(message string) error {
 
 // BindTurn requires a persisted child UID but derives the host identity from
 // parent UID, turn name and exact input, retaining replay exclusion for the same
-// request after name reuse without associating old answers with changed input. Dispatch
-// requires fresh operator approval, a parent serialization claim and readiness.
+// request after name reuse without associating old answers with changed input.
 func BindTurn(run *api.AgentRun, turn *api.AgentRunTurn) (api.CellnParentTurnStatus, error) {
 	var zero api.CellnParentTurnStatus
 	if run.UID == "" || run.Status.CellnParent == nil || run.Status.CellnParent.Binding.RunUID != string(run.UID) || !run.Status.CellnParent.CreateAttempted || !hashPattern.MatchString(run.Status.CellnParent.Binding.Incarnation) || turn.UID == "" || turn.Namespace != run.Namespace || turn.Spec.RunName != run.Name || turn.Spec.RunUID != string(run.UID) || run.DeletionTimestamp != nil || turn.DeletionTimestamp != nil || run.Spec.ExecutionLifecycle != "enduring" || run.Spec.ValidateLifecycle() != "" {

@@ -34,7 +34,7 @@ func validateBrokerLimits(l api.CellnToolLimits) error {
 		}
 	}
 	if h := l.HTTPS; h != nil {
-		if len(h.AllowHosts) < 1 || len(h.AllowHosts) > 16 || h.MaxRequests < 1 || h.MaxRequests > 16 || h.MaxResponseBytes < 1 || h.MaxResponseBytes > 4096 || h.TimeoutMillis < 1 || h.TimeoutMillis > 30000 || h.TimeoutMillis > l.TimeoutMillis || l.Effects != "external-side-effects" {
+		if len(h.AllowHosts) < 1 || len(h.AllowHosts) > 16 || h.MaxRequests < 1 || h.MaxRequests > 16 || h.MaxResponseBytes < 1 || h.MaxResponseBytes > 65536 || h.TimeoutMillis < 1 || h.TimeoutMillis > 30000 || h.TimeoutMillis > l.TimeoutMillis || l.Effects != "external-side-effects" {
 			return fmt.Errorf("invalid HTTPS broker limits")
 		}
 		if AnyPublicHost(h.AllowHosts) {

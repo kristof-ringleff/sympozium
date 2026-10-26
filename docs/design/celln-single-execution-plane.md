@@ -1,5 +1,13 @@
 # Celln: single execution plane
 
+> **Superseded (2026-10-22).** The one-shot router with its in-cluster
+> `celln-dispatcher`, the `--celln-native` single plane and the
+> `celln.nativeParent` parent-only controller this document compares were
+> removed in 0.12. The one plane is the per-node fleet, model-free, with every
+> Agent's `ModelConnection` as its route; see
+> [Agent-bound model access](celln-agent-bound-model-access.md). Kept for the
+> reasoning.
+
 Status: design proposal (no implementation yet).
 Goals: one Kubernetes-managed Celln service, one controller client, one install,
 one credential model — serving both **one-shot** and **enduring** runs.

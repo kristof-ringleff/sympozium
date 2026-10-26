@@ -229,14 +229,14 @@ Without a gate, the agent's response is published to channels (Slack, Telegram, 
 1. The IPC bridge suppresses the completion event
 2. The PostRun Job runs the gate hook container
 3. The gate hook inspects the agent's output (via `AGENT_RESULT` env var)
-4. The gate hook writes a verdict by patching an annotation on the AgentRun
+4. The gate hook posts its verdict to the Sympozium API using the per-run token it was given
 5. The controller reads the verdict, applies it, and publishes the (possibly rewritten) response
 
 If no verdict is written (hook fails, times out, or the hook is designed for manual approval), the `gateDefault` field controls behavior: `"block"` (default) replaces the output with an error, `"allow"` passes it through.
 
 ### Declaring a Gated Instance
 
-Add `gate: true` to one PostRun hook in your instance's lifecycle config. At most one PostRun hook may be a gate. The gate hook needs RBAC permission to patch the AgentRun annotation:
+Add `gate: true` to one PostRun hook in your instance's lifecycle config. At most one PostRun hook may be a gate. The gate hook needs no Kubernetes RBAC — the controller gives it a token scoped to this one run:
 
 ```yaml
 apiVersion: sympozium.ai/v1alpha1
@@ -249,35 +249,218 @@ spec:
       model: gpt-4o
       lifecycle:
         gateDefault: block   # or "allow"
-        rbac:
-          - apiGroups: ["sympozium.ai"]
-            resources: ["agentruns"]
-            verbs: ["get", "patch"]
         postRun:
           - name: content-filter
-            image: my-org/content-filter:latest
+            image: busybox:1.36   # wget is a busybox applet; curl is not
             gate: true
             command: ["sh", "-c"]
             args:
               - |
-                # Inspect $AGENT_RESULT, then patch the verdict:
-                kubectl patch agentrun $AGENT_RUN_ID -n $AGENT_NAMESPACE \
-                  --type=merge \
-                  -p "{\"metadata\":{\"annotations\":{\"sympozium.ai/gate-verdict\":\
-                  \"{\\\"action\\\":\\\"approve\\\"}\"}}}"
+                # Inspect $AGENT_RESULT, then post the verdict:
+                wget -q -O- \
+                  --header "Authorization: Bearer $GATE_VERDICT_TOKEN" \
+                  --header "Content-Type: application/json" \
+                  --post-data '{"action":"approve"}' \
+                  "$SYMPOZIUM_API_URL/api/v1/runs/$AGENT_RUN_ID/gate-verdict?namespace=$AGENT_NAMESPACE"
 ```
+
+### Delivering the Verdict
+
+The controller injects two environment variables into the gate container, and
+into no other container:
+
+| Variable | Meaning |
+|----------|---------|
+| `GATE_VERDICT_TOKEN` | A bearer minted for this run alone. Accepted only for this AgentRun, and only while it is `PostRunning`. |
+| `SYMPOZIUM_API_URL` | The in-cluster API base URL to post to. |
+
+That is the whole contract. The hook needs no `kubectl`, no ServiceAccount
+token and no entry under `lifecycle.rbac` — a gated Agent that declares no
+`rbac:` block gets no Kubernetes credentials in its pod at all.
+
+Any HTTP client will do. The examples below use `wget`, which is a busybox
+applet and so needs no extra layer; an image built on Alpine or Debian is more
+likely to carry `curl`:
+
+```sh
+curl -fsS -X POST \
+  -H "Authorization: Bearer $GATE_VERDICT_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"action":"approve"}' \
+  "$SYMPOZIUM_API_URL/api/v1/runs/$AGENT_RUN_ID/gate-verdict?namespace=$AGENT_NAMESPACE"
+```
+
+Prefer a form that fails loudly — `curl -f`, or checking `wget`'s exit code. A
+POST that quietly fails leaves no verdict, and the run falls back to
+`gateDefault` with nothing to explain why.
+
+A verdict is capped at 32KiB, matching the truncation already applied to
+`AGENT_RESULT`; a larger body is refused with `413` rather than silently cut.
+
+`lifecycle.rbac` still exists for hooks that need the Kubernetes API for other
+reasons. It is simply no longer required to report a verdict.
+
+> **Network note.** The gate container must be able to reach the API server
+> Service. Nothing restricts postRun pod egress today, but if you add a
+> NetworkPolicy covering them, allow the apiserver — otherwise every gate falls
+> back to `gateDefault`.
+
+Treat `AGENT_RESULT` as untrusted: it is whatever the agent produced, and a
+gate is precisely the thing that should not take it on faith.
 
 ### Verdict Format
 
-The gate hook patches the annotation `sympozium.ai/gate-verdict` with a JSON object:
+A verdict is a JSON object, the same on either channel — the hook's POST above, or the annotation `sympozium.ai/gate-verdict` set directly by a human or the API:
 
 | Action | Effect | Fields |
 |--------|--------|--------|
 | `approve` | Passes the original response through unchanged | `{"action":"approve"}` |
 | `reject` | Replaces the response with a custom message | `{"action":"reject","response":"Blocked by policy"}` |
 | `rewrite` | Replaces the response with a sanitized version | `{"action":"rewrite","response":"cleaned output"}` |
+| `retry` | Hands the rejection back to the agent for another attempt — see [Retrying a rejected response](#retrying-a-rejected-response) | `{"action":"retry","reason":"npm run check failed","response":"<gate output>"}` |
 
 All actions accept an optional `reason` field for audit logging.
+
+### Retrying a Rejected Response
+
+`reject` and `rewrite` are terminal: the run ends and the user sees the gate's
+message. `retry` instead feeds the gate's output back to the agent as a **new
+attempt**, so the agent can fix what the gate objected to.
+
+This is not the Job's `backoffLimit` (which is disabled). That replays the pod
+with an identical task and no knowledge of why the last attempt was rejected. A
+retry attempt is a fresh AgentRun whose task carries the feedback.
+
+Enable it with `lifecycle.retry`:
+
+```yaml
+spec:
+  lifecycle:
+    gateDefault: block
+    retry:
+      maxAttempts: 3          # total attempts including the first
+      backoff: 30s            # optional delay before the next attempt starts
+      maxChainTokens: 200000  # cumulative across the chain; 0 = unlimited
+      on: [gate]              # which outcomes may trigger a retry
+    postRun:
+      - name: build-check
+        image: my-org/build-check:latest
+        gate: true
+        command: ["sh", "-c"]
+        args:
+          - |
+            if OUT=$(npm run check 2>&1); then
+              VERDICT='{"action":"approve"}'
+            else
+              VERDICT=$(jq -nc --arg out "$OUT" \
+                '{action:"retry", reason:"npm run check failed", response:$out}')
+            fi
+            wget -q -O- \
+              --header "Authorization: Bearer $GATE_VERDICT_TOKEN" \
+              --header "Content-Type: application/json" \
+              --post-data "$VERDICT" \
+              "$SYMPOZIUM_API_URL/api/v1/runs/$AGENT_RUN_ID/gate-verdict?namespace=$AGENT_NAMESPACE"
+```
+
+The verdict goes over the API, so `response` carries the build log as-is —
+no annotation escaping, and no `jq -Rs` to wrap it in.
+
+The successor attempt receives a structured card in place of its task:
+
+```
+## Retry 2 of 3
+
+### Original Task
+<the original task, with earlier retry cards stripped>
+
+### Your Previous Attempt
+<the rejected output>
+
+### Why It Was Rejected
+npm run check failed
+
+### Gate Output
+<the gate's stdout/stderr>
+```
+
+Gate output is clipped to 4000 characters, with the clip announced in the card.
+Set `SYMPOZIUM_RETRY_GATE_OUTPUT_MAX_CHARS` on the controller to change it — a
+test-suite dump needs more room than a lint summary.
+
+#### Inspecting a chain
+
+Each attempt is named `<run>-retry-<n>` and records its lineage in
+`status.attempt` / `status.retryOf`, plus labels for querying:
+
+```bash
+kubectl get agentruns -l sympozium.ai/retry-of=my-run
+kubectl get agentrun my-run-retry-2 -o jsonpath='{.status.retryOf}{"\n"}'
+```
+
+A superseded attempt ends in the `Failed` phase with
+`status.gateVerdict: retried` and a `Retried` condition naming its successor. It
+publishes nothing — no channel reply, no failure event — because the chain has
+not finished. When the attempts or the token budget run out, the last attempt
+resolves as `retries-exhausted` and `gateDefault` decides whether its output is
+blocked or passed through.
+
+#### What a successor inherits
+
+A successor is the same run again, so it starts from the predecessor's spec and
+keeps the context that says where the work came from and who is waiting on it:
+the reply address of the channel that triggered it, the trace, `spec.parent`,
+and the labels other controllers find live work by — `sympozium.ai/schedule`,
+`sympozium.ai/stimulus`, `sympozium.ai/request-hash`, `sympozium.ai/ensemble`.
+A schedule with `concurrencyPolicy: Forbid` therefore waits for the whole chain,
+not the first attempt.
+
+A caller blocked on the run it created — an OpenAI-compatible request on
+`/v1/chat/completions`, or an MCP tool call — is answered by whichever attempt
+passes the gate. The retired attempts publish nothing, and the proxy follows
+`status.retryOf` to recognise the successor's completion as the answer to the
+request it is holding.
+
+The gate verdict annotation is deliberately *not* carried: a successor
+inheriting it would resolve against its predecessor's verdict before running.
+
+#### Retrying a delegated run
+
+An agent's lifecycle hooks are inherited by the children it delegates to, so a
+delegate child can be gated and retried like any other run. The parent stays
+blocked in its `delegate_to_persona` call throughout: when a child retries, the
+parent's `status.delegates[]` entry is repointed at the successor before the
+retired attempt is marked `Failed`, and the successor's result answers the
+original delegation. The parent never sees the intermediate attempts.
+
+An Ensemble `relationships[].timeout` bounds the delegation, not one attempt of
+it — a chain that outlives the edge timeout is expired at whichever attempt is
+running.
+
+#### Why this is safe
+
+**The retry decision is not agent-controlled.** The gate hook is an
+operator-declared image in `lifecycle.postRun`, and the agent has no permission
+to patch the `sympozium.ai/gate-verdict` annotation for its own run. An agent
+cannot grant itself another attempt. That property is the reason retry is safe
+here and would not be if the agent could self-retry.
+
+Two further bounds on a gate that always says `retry`:
+
+- `maxAttempts` is capped at admission by the bound `SympoziumPolicy`, so an
+  operator sets the ceiling regardless of what a run requests:
+
+  ```yaml
+  apiVersion: sympozium.ai/v1alpha1
+  kind: SympoziumPolicy
+  metadata:
+    name: default-governance
+  spec:
+    lifecyclePolicy:
+      maxRetryAttempts: 3
+  ```
+
+- `maxChainTokens` caps the cumulative `status.tokenUsage.totalTokens` of every
+  attempt in the chain.
 
 ### Manual (Human-in-the-Loop) Approval
 
@@ -297,6 +480,18 @@ postRun:
 ```
 
 The `requireApproval` toggle in the API and UI configures exactly this, with a 24-hour window.
+
+This hook decides nothing itself — it only holds the run open — so it needs
+neither a verdict token nor RBAC. The human's approval arrives through the same
+endpoint, authenticated with the ordinary API token.
+
+A verdict is recorded by last writer, and the endpoint accepts one only while
+the run is `PostRunning`. In practice an approving human ends the gate: the
+controller kills the gate Job as soon as it sees a verdict, and once the run
+leaves `PostRunning` any later post is refused with `409`. A gate hook that
+posts in the short window before that reconcile does still overwrite the
+human's verdict, so pair manual approval with a hook that waits rather than
+one that decides on a timer.
 
 In the web UI, gated runs show an amber "Approval" badge on the runs list and an approval bar on the run detail page with Approve and Reject buttons. A warning toast fires when a run requires approval.
 
@@ -320,10 +515,6 @@ curl -X POST http://localhost:9090/api/v1/runs/my-run/gate-verdict?namespace=def
 spec:
   lifecycle:
     gateDefault: block
-    rbac:
-      - apiGroups: ["sympozium.ai"]
-        resources: ["agentruns"]
-        verbs: ["get", "patch"]
     postRun:
       - name: pii-scanner
         image: my-org/pii-scanner:latest
@@ -336,9 +527,15 @@ spec:
             else
               VERDICT='{"action":"approve","reason":"pii-scanner-clean"}'
             fi
-            kubectl patch agentrun $AGENT_RUN_ID -n $AGENT_NAMESPACE --type=merge \
-              -p "{\"metadata\":{\"annotations\":{\"sympozium.ai/gate-verdict\":$(echo $VERDICT | jq -Rs .)}}}"
+            wget -q -O- \
+              --header "Authorization: Bearer $GATE_VERDICT_TOKEN" \
+              --header "Content-Type: application/json" \
+              --post-data "$VERDICT" \
+              "$SYMPOZIUM_API_URL/api/v1/runs/$AGENT_RUN_ID/gate-verdict?namespace=$AGENT_NAMESPACE"
 ```
+
+A scanner that sees the agent's raw output is exactly the container you least
+want holding Kubernetes credentials. With the per-run token it holds none.
 
 ### Gate Status in the UI
 
@@ -348,6 +545,8 @@ spec:
 | Approved | Green "approved" banner on detail page |
 | Rejected | Red "rejected" banner on detail page |
 | Rewritten | Blue "rewritten" banner on detail page |
+| Retried | Amber "retried" banner on detail page — superseded, not failed |
+| Retries exhausted | Red "retries-exhausted" banner on detail page |
 | Timeout/error | Red "timeout" or "error" banner on detail page |
 
 ## Agent Sandbox Compatibility

@@ -74,6 +74,36 @@ func TestFleetPublishExtendsTheSamePackageOnly(t *testing.T) {
 	}
 }
 
+// A node whose Celln binary differs from the publisher's derives different
+// files from the same package (persona, tool limits), so it replaces the
+// published configuration and records its binary; a publication made before
+// the binary was recorded is replaced the same way. Nodes on the same binary
+// still may not disagree.
+func TestFleetPublishReplacesAConfigurationDerivedByAnotherBinary(t *testing.T) {
+	withBinary := func(body map[string]any, id string) map[string]any {
+		body["metadata"].(map[string]any)["annotations"].(map[string]string)["celln.sympozium.ai/configured-by"] = id
+		return body
+	}
+	published := configMap(map[string]string{"celln.sympozium.ai/package": packageA, "celln.sympozium.ai/scope": "starter", "celln.sympozium.ai/configured-by": "celln-old"},
+		map[string]string{"native.catalogue.json": "cat-old", "native.configured.json": "{}", "claude.catalogue.json": "gone"})
+	patch, refusal := publish(t, published, withBinary(nodeBody(packageA, "starter", map[string]string{"native.catalogue.json": "cat-new", "native.configured.json": "{}"}), "celln-new"))
+	if refusal != "" {
+		t.Fatalf("re-derived configuration refused: %s", refusal)
+	}
+	data := patch["data"].(map[string]any)
+	annotations := patch["metadata"].(map[string]any)["annotations"].(map[string]any)
+	if data["native.catalogue.json"] != "cat-new" || data["claude.catalogue.json"] != nil || annotations["celln.sympozium.ai/configured-by"] != "celln-new" || patch["metadata"].(map[string]any)["resourceVersion"] != "7" {
+		t.Fatalf("re-derived configuration did not replace the published one: %v", patch)
+	}
+	legacy := configMap(map[string]string{"celln.sympozium.ai/package": packageA, "celln.sympozium.ai/scope": "starter"}, map[string]string{"native.catalogue.json": "cat-old"})
+	if patch, refusal := publish(t, legacy, withBinary(nodeBody(packageA, "starter", map[string]string{"native.catalogue.json": "cat-new"}), "celln-new")); refusal != "" || patch["data"].(map[string]any)["native.catalogue.json"] != "cat-new" {
+		t.Fatalf("publication without a recorded binary not replaced: %v %s", patch, refusal)
+	}
+	if _, refusal := publish(t, published, withBinary(nodeBody(packageA, "starter", map[string]string{"native.catalogue.json": "cat-other"}), "celln-old")); !strings.Contains(refusal, "both carry package") {
+		t.Fatalf("same binary, differing files accepted: %s", refusal)
+	}
+}
+
 func TestFleetPublishRecordsTheScopeOfALegacyPublication(t *testing.T) {
 	// Published before backends were named and before scopes were recorded.
 	published := configMap(map[string]string{"celln.sympozium.ai/package": packageA}, map[string]string{"catalogue.json": "cat-a"})

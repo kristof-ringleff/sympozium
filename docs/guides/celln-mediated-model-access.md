@@ -1,141 +1,476 @@
-# Mediated model access for native Celln Agents
+# Agent-bound model access
 
-With mediation on, a native Celln Agent's model requests leave the node for the
-**model gateway**, which adds that Agent's own provider key from the Secret its
-`ModelConnection` names in the Agent's namespace. Celln nodes hold no provider
-key for such runs. The controller signs a short-lived permit per run; the node
-dispatcher's *scoped receiver* and the gateway both verify it against the same
-public keyset.
+A Celln Agent's model requests leave its cell for the **model gateway**,
+which adds that Agent's own provider key and forwards the request to the
+endpoint the Agent's `ModelConnection` names. Celln nodes, guests, run specs
+and the controller never see the key. There is no operator route list and no
+install-time provider: **the Agent's configuration is the binding between a
+key and the running agent**. Any OpenAI-compatible or Anthropic-compatible
+endpoint works.
 
-It is **on by default** for every fleet installed by `sympozium install`:
-the installer bootstraps the trust, sets every value below, and turns the key
-you install with into one Agent's own key (the starter Agent, see
-[the default install](#the-default-install)). Opt out with
-`--no-celln-mediation`. The chart's own default stays
-`celln.mediation.enabled=false`, and then it renders exactly what it rendered
-before this feature existed.
+This is how every Celln run gets its model; it is not optional. The
+[fleet guide](celln-fleet-installation.md) covers installing the fleet and
+the gateway. This guide covers connections, keys, what protects them, and
+the operator's controls.
 
-## The default install
+## What protects the key
+
+| Property | Where it is enforced |
+| --- | --- |
+| **One key, one Agent.** A key Secret is owned by exactly one Agent (or its Ensemble; sub-agents share their parent's). Another Agent is refused | `sympozium.ai/model-key-owner` annotation; the controller's claim before any work, the admission webhook, the API (`409`), and the gateway on every call |
+| **Pinned to one origin.** A key records the endpoint origin it is for and is never sent anywhere else. Moving a connection to another origin is refused; a new origin needs a new key entered by a person | `sympozium.ai/model-key-origin` annotation; written when the key is created through the API or first claimed, checked by the API, the controller and the gateway |
+| **Never on a node.** The gateway adds the key per request; no node, guest, run spec or controller holds it. Agent pods have no RBAC on Secrets or ModelConnections | gateway; chart RBAC |
+| **A run cannot carry or redirect a key.** No inline credential, header, placement or protocol override with a connection; the connection revision is pinned | `modelconnection.Resolve` |
+| **Session binding.** One signed permit per run, bound to the cluster, namespace UID, run UID, spec digest, route and budget; turns cannot widen it | controller (issuer), node receiver, gateway |
+| **Live re-check on every call.** Namespace UID, connection UID and spec digest, endpoint origin, Secret UID and key, Agent UID, owner and pin. Revocation bites mid-run | gateway `liveRoute` |
+| **Network safety.** HTTPS to public addresses by default; private, loopback, link-local, multicast and 100.64/10 refused unless the exact origin is approved; a key never crosses plain HTTP; no redirects; DNS answers validated before connecting; no streaming; provider error bodies hidden; a response that echoes the key is refused | gateway transport and response validation |
+| **Budgets** per run and per turn, reserved before each request | gateway + PostgreSQL |
+
+Multi-team isolation is the namespace: a team's keys are Secrets in its
+namespace, its Agents are there, and namespace RBAC decides who may write
+them. An operator may narrow where any key may go
+([Narrowing origins](#narrowing-origins-operator)).
+
+## Connections
+
+A `ModelConnection` is a namespaced route: provider, protocol, endpoint,
+models and, optionally, the key Secret.
+
+```yaml
+apiVersion: sympozium.ai/v1alpha1
+kind: ModelConnection
+metadata:
+  name: cloud
+  namespace: team-a
+spec:
+  provider: openrouter                 # a free label, 1-64 letters, digits, _ or -
+  protocol: openai-chat                # or anthropic-messages
+  endpoint: https://openrouter.ai/api/v1/chat/completions   # full HTTPS request URL; a port is fine
+  secretRef: cloud-openrouter-key      # the key Secret in this namespace; omit for a keyless endpoint
+  # secretKey: API_KEY                 # key inside the Secret; default OPENAI_API_KEY (openai-chat) or ANTHROPIC_API_KEY (anthropic-messages)
+  models: [qwen/qwen3-235b-a22b]       # exact model identifiers runs may select (1-128)
+  maxOutputTokens: 2048                # optional, 256-4096 per request; 512 when omitted
+  # parameters: {chat_template_kwargs: {enable_thinking: false}}   # merged into every request by the gateway
+  # allowInsecure: true                # plain HTTP or a private CA, private addresses only, keyless only
+```
+
+- `provider` is descriptive. Nothing matches it against a list.
+- `protocol` selects the adapter: `openai-chat` sends `Authorization:
+  Bearer <key>`; `anthropic-messages` sends `x-api-key` and
+  `anthropic-version: 2023-06-01`. Any server speaking either works: OpenAI,
+  Anthropic, DeepSeek (`https://api.deepseek.com/chat/completions`),
+  OpenRouter, Groq, Mistral, Together, xAI, Gemini's OpenAI-compatible
+  endpoint, or a local llama-server, Ollama, LM Studio or vLLM.
+- `endpoint` is the complete request URL, HTTPS, with no credentials, query
+  or fragment. Its origin (`scheme://host[:port]`) is what the key is pinned
+  to.
+- `models` are exact names. A key may be used for any model its provider
+  serves; the signed decision still binds each run to one concrete model.
+- `parameters` is pinned on the host side: the guest never sees it, a guest
+  request that sets one of its keys is refused, and the fields the gateway
+  owns (`model`, `messages`, `max_tokens`, `stream`, `tools`, …) cannot be
+  set. At most 16 top-level keys matching `^[a-z][a-z0-9_]{0,63}$`, 3 levels
+  deep, 2048 bytes. Use it for provider switches such as turning a reasoning
+  phase off.
+- `maxOutputTokens` bounds what one request may ask for; the gateway refuses a
+  request above it. A turn reserves 6 × this value from the run's budget, so
+  a connection created through the API is clamped to what the namespace's
+  policy ceilings can pay for.
+
+## Keys
+
+The key is a Secret in the Agent's namespace, under the connection's
+`secretKey` (default by protocol: `OPENAI_API_KEY` or `ANTHROPIC_API_KEY`;
+`API_KEY` also works when named). Only the gateway reads it.
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: cloud-openrouter-key
+  namespace: team-a
+stringData:
+  OPENAI_API_KEY: "<your key>"
+```
+
+Two annotations on the Secret carry the binding:
+
+| Annotation | Value | Written |
+| --- | --- | --- |
+| `sympozium.ai/model-key-owner` | `Agent/<name>` or `Ensemble/<name>` | by the controller the first time a run of an Agent that grants the Secret uses it (the claim) |
+| `sympozium.ai/model-key-origin` | the endpoint origin, e.g. `https://openrouter.ai` | by the API when it creates or re-saves a connection naming the Secret, or by the controller at the claim (a Secret made by hand is pinned on first use) |
+
+Rules:
+
+- **Grant.** An Agent grants a connection's Secret by selecting the
+  connection in `spec.execution.modelConnectionRef`, or by listing the Secret
+  in `spec.authRefs` (with the connection's `provider`, or an empty provider
+  for any). A run that names a Secret the Agent neither grants nor owns is
+  refused: `model key Secret "x" is not declared in Agent "a" spec.authRefs`.
+- **One owner.** An Agent whose connection names a Secret another live Agent
+  or Ensemble owns is refused: `model key Secret "x" belongs to Agent/other;
+  every Agent needs its own key (sub-agents share their parent's)`. The
+  console does not offer such a Secret, and
+  `GET /api/v1/celln-platform/key-secrets?namespace=<ns>&key=OPENAI_API_KEY`
+  lists only unowned Secrets that hold that key name (never a value). When
+  the owner is deleted its claim goes stale and the next Agent that grants
+  the Secret takes it over.
+- **One origin.** A Secret pinned to one origin and named by a connection to
+  another is refused whoever owns it: `model key Secret "x" is pinned to
+  https://openrouter.ai and cannot be sent to https://attacker.example; a
+  connection to another provider needs its own key`. The API answers `409
+  Conflict` when a connection is saved that way; the controller fails the
+  run before anything starts; the gateway refuses the call
+  (`MODEL_CREDENTIAL_SOURCE_CHANGED`) if the pin and the live connection
+  disagree. The pin outlives the owner; to re-use a Secret for another
+  provider on purpose, a person with write access to the Secret removes the
+  annotation (or, better, creates a new Secret).
+- **HTTPS only.** A connection with a `secretRef` must have an `https://`
+  endpoint: the resolver refuses `credential-bearing model endpoint must use
+  HTTPS` and the gateway refuses `MODEL_DESTINATION_FORBIDDEN`. Plain HTTP
+  is for keyless local endpoints only.
+
+## Create an Agent through the API
+
+Everything below ran against a real cluster
+(`test/integration` keeps the journey; the shapes are the API server's). The
+namespace must be one the fleet admits (any ordinary namespace by default).
 
 ```sh
-export OPENAI_API_KEY=...     # or DEEPSEEK_API_KEY / ANTHROPIC_API_KEY
-sympozium install
+kubectl -n sympozium-system port-forward svc/sympozium-apiserver 18080:8080 &
+API=http://localhost:18080
+TOKEN="$(sympozium token)"
+H=(-H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json")
+NS=team-a
 ```
 
-With a released binary (which pins the model gateway image digest) this:
+**The short way: one call.** `modelConnection` on the Agent create carries the
+connection spec and, when the provider wants one, the key. The server writes
+the Secret (pinned to the endpoint's origin and owned by this Agent from the
+moment it exists), the `ModelConnection` (named after the Agent unless
+`modelConnection.name` says otherwise), picks the namespace's fleet profile,
+creates its toolbox runtime wrapper and sizes the conversation limits from
+the policy's session defaults. Anything you set explicitly (`runtimeRef`,
+`execution.cellnSelection`, `execution.enduring`, `model`) is kept.
 
-- mints the trust described in [section 2](#2-bootstrap-the-trust) right
-  after the chart creates its namespaces, under a key id the installer chose
-  and rendered into the values beforehand; the cluster id is the
-  `kube-system` namespace UID and the certificate names follow the release's
-  actual full name and namespace;
-- sets `celln.mediation.enabled`, `clusterId`, `issuer.keyId`,
-  `mediateBackends=true` and `modelGateway.image` (the bundled PostgreSQL
-  needs a default StorageClass);
-- gives the key to a **starter Agent** in the `-n` namespace (default
-  `default`, or `--celln-starter-namespace`): Secret `starter-model-key`
-  (key `OPENAI_API_KEY` or `ANTHROPIC_API_KEY`, owner-annotated for Agent
-  `starter`), ModelConnection `starter`, the backend's runtime wrapper and
-  Agent `starter` with that Secret in `spec.authRefs`, exactly the objects
-  of [section 6](#6-give-an-agent-its-own-key). A second keyed backend gets
-  `starter-<backend>`;
-- publishes only a placeholder for that backend in
-  `celln-fleet-model-credentials`, so no Celln node holds the key; the
-  backend's profile is labelled `celln.sympozium.ai/mediation-only`, its
-  route is `auth: secret` only, and no namespace gets a shared Agent for it.
-
-Every rerun reads the existing trust's key id back (it is verified, never
-rotated) and derives the same values again, so a rerun never switches
-mediation off; a rerun from a build that knows no gateway image keeps the
-deployed one, or stops if there is none. A source build without
-`--model-gateway-image` installs without mediation and says so. Values passed
-with `--set celln.mediation.enabled=true` select the operator-managed path
-below, in which the installer bootstraps and derives nothing.
-
-The rest of this guide is the operator-managed path, and the reference for
-what the default sets up.
-
-Mediation leaves the fleet's own configuration alone: `celln.fleet.backends`,
-the host profiles and `celln.fleet.modelCredentialsSecret` are rendered and
-configured on every node exactly as before, and the two paths run side by side
-on one controller. Each run takes the path of its resolved model route
-(`internal/controller/celln_scoped.go`):
-
-- a connection with a host `credentialProfile` (a fleet backend, policy auth
-  `host-profile`) starts as a fleet parent exactly as it does today, and its
-  follow-up turns go to that parent;
-- an Agent's own connection with a `secretRef` (policy auth `secret`), or a
-  credential-free one, goes through the scoped receiver and the gateway.
-
-A `secret` run on a controller without mediation is held with the reason
-`ScopedDispatchDisabled`; it is never sent to a fleet parent.
-
-## What the one switch wires
-
-`celln.mediation.enabled=true` (requires `celln.fleet.enabled`) configures four
-things against the same issuer, keyset, CA and tokens, or refuses to render:
-
-| Component | What changes |
-|---|---|
-| Controller | `CELLN_SCOPED_CONFIG` points at a chart-rendered `config.json` (paths and names only). The issuer signing key and both transport tokens come from `controllerSecret`. |
-| Fleet dispatchers (`celln-node`) | `--scoped-operator-token-file`, `--scoped-jwks-file`, `--scoped-issuer`, `--scoped-gateway-origin`, `--scoped-gateway-ca`, and `--scoped-parent-request-file` when the node has one. |
-| Router (`celln-router`) | `--scoped-token-file` (the dispatchers' operator token): it forwards each `/v1/scoped/*` request to the node that prepared that operation. A small unprivileged `scoped-receiver` sidecar terminates TLS in front of it, behind the `celln-scoped-receiver` Service. |
-| Model gateway | Deployed from Secret/ConfigMap volumes; no configuration PVC. |
-
-Why a TLS sidecar: the router speaks plaintext HTTP, and the controller only
-talks to an HTTPS receiver with an explicit CA. The sidecar (`/celln-parent-proxy
---scoped-receiver`, shipped in the controller image) forwards nothing but
-`POST /v1/scoped/{prepare,start,read,cleanup}` to the router on loopback. The
-operator bearer and the signed permits remain the authority, checked by the
-dispatcher on the owning node.
-
-**Any number of nodes.** A prepared operation lives on the node that prepared
-it. The router places each new operation on the node with the most spare
-capacity (an enduring conversation's turns follow its parent) and records that
-binding before forwarding, so an operation never reaches two nodes. If that
-node leaves the cluster, the router answers `AUTH_CONTEXT_LOST`. The controller
-then ends the run, closes its gateway registration, and never re-creates it on
-another node; start a new run. A node that is briefly not ready stays listed,
-so a readiness blip does not end its conversations.
-
-## 1. PostgreSQL
-
-The gateway keeps budgets and registrations in PostgreSQL and refuses to start
-without it.
-
-**Bundled (default).** With `modelGateway.database.secretName` left empty, the
-chart runs its own single-pod PostgreSQL (`<release>-model-gateway-db`, a
-StatefulSet on a 1 Gi PVC, digest-pinned `postgres:17-alpine`). Its password
-is generated on first install and kept across upgrades; the Secret is kept on
-uninstall because the PVC is. Before each gateway start, a `migrate` init
-container waits for the database and applies migrations 002 and 003, which
-are idempotent. A NetworkPolicy admits only the gateway, and the connection
-stays in-cluster without TLS. It holds accounting, never provider keys. Size
-and storage class are under `modelGateway.database.bundled`.
-
-**Your own, for production.** Apply `migrations/002_celln_model_budget.sql`
-then `migrations/003_celln_model_gateway.sql`, publish the connection URL, and
-set `modelGateway.database.secretName=model-gateway-database`. The chart then
-renders no database and runs no migrations. If you restrict
-`modelGateway.egress`, include your database's address.
-
-```bash
-kubectl -n sympozium-system create secret generic model-gateway-database \
-  --from-literal=database-url='postgres://gateway:...@postgres.databases.svc:5432/gateway?sslmode=require'
+```sh
+curl -sf "${H[@]}" -X POST "$API/api/v1/agents?namespace=$NS" -d '{
+  "name": "researcher",
+  "execution": {"backend": "celln"},
+  "modelConnection": {
+    "apiKey": "sk-or-...",
+    "spec": {"provider": "openrouter", "protocol": "openai-chat",
+             "endpoint": "https://openrouter.ai/api/v1/chat/completions",
+             "models": ["qwen/qwen3-235b-a22b"]}}}'
 ```
 
-## 2. Bootstrap the trust
+Then talk to it. `POST /api/v1/agents/{name}/messages` continues the Agent's
+newest live conversation (or the run named by `conversation`) as a turn, and
+starts one when there is none; it answers `201` with the new run or `202`
+with the turn (`200` for a repeated `requestId`). The answer lands on that
+object's status (`.status.result` on the run,
+`.status.execution.result.answer` on the turn), which you poll or watch as
+for any run.
 
-Install the fleet first (`sympozium install --celln-fleet`, see
-[Celln Fleet Installation](celln-fleet-installation.md)); then:
-
-```bash
-sympozium celln-mediation bootstrap --cluster-id my-cluster --values-out mediation-values.yaml
+```sh
+curl -sf "${H[@]}" -X POST "$API/api/v1/agents/researcher/messages?namespace=$NS" \
+  -d '{"message": "Reply with the single word pong."}'
+# {"run": {...}, "started": true}
+curl -sf "${H[@]}" -X POST "$API/api/v1/agents/researcher/messages?namespace=$NS" \
+  -d '{"message": "And now in French.", "requestId": "fr-1"}'
+# {"run": {...}, "turn": {...}, "started": false}
 ```
 
-It mints, once, an Ed25519 issuer key and its public JWKS, two independent
-bearer tokens, and a private CA with one server certificate each for the
-gateway and the receiver (the CA key is discarded). It publishes:
+A namespace no fleet serves gets `409 no Celln fleet profile is offered …`;
+a key another Agent already owns gets `409`; a key over plain HTTP, `400`.
+
+**The persona is the Agent's.** `execution.systemPrompt` on the Agent is the
+system prompt every run it starts carries into its cell; a run may name its
+own instead, and an Agent that names none gets the fleet's default persona
+(the one the starter catalogue ships, which tells the model to fetch a live,
+dated source before answering anything time-sensitive). It is agent
+configuration, editable on the Agent (console: Execution defaults → Persona,
+or `PATCH /api/v1/agents/{name}` with `execution`), not fleet material. A cell
+accepts at most 2048 bytes of system prompt; a longer one is refused with
+that bound named.
+
+```sh
+curl -sf "${H[@]}" -X POST "$API/api/v1/agents?namespace=$NS" -d '{
+  "name": "analyst",
+  "execution": {"backend": "celln",
+                "systemPrompt": "You are a market analyst. Fetch https://news.google.com/rss/search?q=<topic> before answering about recent events and cite dates."},
+  "modelConnection": {"spec": {"provider": "openrouter", "protocol": "openai-chat",
+                               "endpoint": "https://openrouter.ai/api/v1/chat/completions",
+                               "models": ["qwen/qwen3-235b-a22b"]}, "apiKey": "sk-or-..."}}'
+```
+
+**Any OpenAI client.** The same Agent is an OpenAI-compatible endpoint at
+`/api/v1/agents/{name}/v1`. `POST …/chat/completions` sends the newest user
+message to the Agent (as above: a turn of its live conversation, or a new
+one) and waits for the answer, returned as an ordinary completion, or as SSE
+chunks with `stream: true`; `GET …/models` lists the Agent as its one model.
+The Sympozium token is the API key, and the `X-Sympozium-Namespace` header
+names the namespace, since SDKs cannot add a query parameter (the header
+works on every API route; `?namespace=` wins when both are given). Earlier
+messages in the request are not replayed: the Agent holds its own
+conversation. A conversation that is still starting, or answering an
+earlier message, takes the message when it is ready. `?timeout=` (default
+`3m`, at most `10m`) bounds the whole wait; past it the reply is `504` naming
+the run and turn to read, and the conversation continues. `X-Sympozium-Conversation: <run>` continues a named
+run instead of the newest. The completion's `sympozium` field and the
+`X-Sympozium-Run` / `X-Sympozium-Turn` headers name the objects behind it.
+
+```python
+from openai import OpenAI
+client = OpenAI(base_url=f"{API}/api/v1/agents/researcher/v1", api_key=TOKEN,
+                default_headers={"X-Sympozium-Namespace": NS})
+reply = client.chat.completions.create(model="researcher",
+    messages=[{"role": "user", "content": "Reply with the single word pong."}])
+print(reply.choices[0].message.content)   # pong
+```
+
+A Kubernetes Agent on a session runtime (Pi, Hermes) has the same endpoint;
+its request is handed to the running session, history and streaming
+included. The console shows the base URL and a snippet on each Agent.
+
+**The long way** is what that call does, step by step.
+
+**1. The connection, with its key.** `apiKey` makes the server write the
+Secret (`<connection>-<provider>-key`, labelled
+`sympozium.ai/model-connection: <connection>`) and pin it to the endpoint's
+origin; or pass `spec.secretRef` to an existing Secret, which is pinned the
+same way. Re-posting the same name updates the connection.
+
+```sh
+curl -sf "${H[@]}" -X POST "$API/api/v1/model-connections?namespace=$NS" -d '{
+  "name": "cloud",
+  "apiKey": "sk-or-...",
+  "spec": {"provider": "openrouter", "protocol": "openai-chat",
+           "endpoint": "https://openrouter.ai/api/v1/chat/completions",
+           "models": ["qwen/qwen3-235b-a22b"]}}'
+kubectl -n $NS get secret cloud-openrouter-key -o jsonpath='{.metadata.annotations}'
+# {"sympozium.ai/model-key-origin":"https://openrouter.ai"}
+```
+
+Moving it to another origin is refused:
+
+```sh
+curl -s -o /dev/null -w '%{http_code}\n' "${H[@]}" -X POST "$API/api/v1/model-connections?namespace=$NS" -d '{
+  "name": "cloud",
+  "spec": {"provider": "openrouter", "protocol": "openai-chat",
+           "endpoint": "https://attacker.example/v1/chat/completions",
+           "models": ["qwen/qwen3-235b-a22b"], "secretRef": "cloud-openrouter-key"}}'
+# 409
+```
+
+**2. The runtime.** The fleet offers one profile per scope; ask the namespace
+what it may use and have the runtime wrapper created on first use
+(`runtimeOnly: true`; existing objects are never modified). The `.toolbox`
+profile lends the starter toolbox; the plain profile is chat only.
+
+```sh
+curl -sf "${H[@]}" "$API/api/v1/celln-platform/profiles?namespace=$NS"
+# [{"name":"celln-native-starter","wrapper":"celln-native","mediationOnly":true,
+#   "tools":[...],"ceilings":{...},"sessionDefaults":{...},
+#   "toolboxProfile":"celln-native-starter.toolbox","toolboxWrapper":"celln-native.toolbox","toolboxTools":[...]}]
+curl -sf "${H[@]}" -X POST "$API/api/v1/celln-platform/wrappers?namespace=$NS" \
+  -d '{"profile": "celln-native-starter.toolbox", "runtimeOnly": true}'
+# {"backend":"native","runtime":"celln-native.toolbox","agent":"","connection":"","created":["celln-native.toolbox"]}
+```
+
+**3. The Agent.** `execution.modelConnectionRef` is the grant: the server
+resolves the connection, adds its Secret to the Agent's `authRefs`, and
+refuses `apiKey`, `secretName` or `baseURL` alongside it. `cellnSelection`
+selects the wrapper and exactly the toolbox's tools in its order (copy
+`toolboxTools` from the profile; omit them, on `celln-native`, for a chat-only
+Agent). `enduring` is the budget a conversation asks for, within the
+profile's `ceilings`; `sessionDefaults` is a sensible one.
+
+```sh
+TOOLS="$(curl -sf "${H[@]}" "$API/api/v1/celln-platform/profiles?namespace=$NS" \
+  | python3 -c 'import sys,json; print(json.dumps(json.load(sys.stdin)[0]["toolboxTools"]))')"
+curl -sf "${H[@]}" -X POST "$API/api/v1/agents?namespace=$NS" -d "{
+  \"name\": \"researcher\", \"provider\": \"openrouter\", \"model\": \"qwen/qwen3-235b-a22b\",
+  \"runtimeRef\": \"celln-native.toolbox\",
+  \"execution\": {\"backend\": \"celln\", \"executionLifecycle\": \"enduring\",
+                  \"modelConnectionRef\": \"cloud\", \"model\": \"qwen/qwen3-235b-a22b\",
+                  \"cellnSelection\": {\"runtimeRef\": \"celln-native.toolbox\", \"toolRefs\": [], \"clusterToolRefs\": $TOOLS},
+                  \"enduring\": {\"leaseSeconds\": 3600, \"maxTurns\": 8, \"maxModelRequests\": 48, \"maxOutputTokens\": 196608}}}"
+```
+
+**4. A run, and its turns.**
+
+```sh
+RUN="$(curl -sf "${H[@]}" -X POST "$API/api/v1/runs?namespace=$NS" -d "{
+  \"agentRef\": \"researcher\", \"task\": \"Reply with the single word pong.\",
+  \"backend\": \"celln\", \"executionLifecycle\": \"enduring\",
+  \"modelConnectionRef\": \"cloud\", \"model\": \"qwen/qwen3-235b-a22b\",
+  \"cellnSelection\": {\"runtimeRef\": \"celln-native.toolbox\", \"toolRefs\": [], \"clusterToolRefs\": $TOOLS},
+  \"enduring\": {\"leaseSeconds\": 3600, \"maxTurns\": 8, \"maxModelRequests\": 48, \"maxOutputTokens\": 196608}}" \
+  | python3 -c 'import sys,json; print(json.load(sys.stdin)["metadata"]["name"])')"
+kubectl -n $NS get agentrun "$RUN" -o jsonpath='{.status.phase} {.status.result}{"\n"}'
+UID="$(kubectl -n $NS get agentrun "$RUN" -o jsonpath='{.metadata.uid}')"
+curl -sf "${H[@]}" -X POST "$API/api/v1/runs/$RUN/turns?namespace=$NS" \
+  -d "{\"message\": \"And now in French.\", \"requestId\": \"fr-1\", \"runUID\": \"$UID\"}"
+curl -sf "${H[@]}" "$API/api/v1/runs/$RUN/turns?namespace=$NS"
+```
+
+`executionLifecycle: one-shot` answers the task once and stops the parent;
+the console's **Answer once** does the same. `kubectl apply` of the same
+objects works too: the Secret and `ModelConnection` above, the `AgentRuntime`
+the wrapper call created (copy it with `kubectl -n $NS get agentruntime
+celln-native.toolbox -o yaml`), and an `Agent` with `spec.runtimeRef`,
+`spec.authRefs: [{provider: openrouter, secret: cloud-openrouter-key}]` and
+the same `spec.execution`. The Secret is then pinned and claimed by the
+controller on the first run.
+
+### Keyless local models
+
+A local OpenAI-compatible server needs no key. Its address is private, so
+the operator approves the exact origin once
+([Private and local endpoints](#private-and-local-endpoints)); the
+connection then needs no `secretRef` and, for plain HTTP, `allowInsecure`:
+
+```sh
+curl -sf "${H[@]}" -X POST "$API/api/v1/model-connections?namespace=$NS" -d '{
+  "name": "local",
+  "spec": {"provider": "llama-server", "protocol": "openai-chat",
+           "endpoint": "http://192.168.1.237:8080/v1/chat/completions",
+           "models": ["Qwen3.8-27B-UD-Q4_K_XL.gguf"], "allowInsecure": true,
+           "parameters": {"chat_template_kwargs": {"enable_thinking": false}}}}'
+```
+
+The gateway still binds the session, enforces budgets and parameters and
+validates the response; it just sends no credential. Reasoning models served
+by llama-server can spend a whole request thinking and return an empty
+answer; the `parameters` above turn that off, or raise `maxOutputTokens`.
+
+## Narrowing origins (operator)
+
+By default an Agent's own key may go to any public HTTPS origin the gateway
+reaches. The scope's `CellnExecutionPolicy` (`celln-fleet-<scope>`) may
+narrow that with host patterns:
+
+```yaml
+spec:
+  allowedOrigins: ["api.openai.com", "*.anthropic.com", "llm.internal:8443"]   # empty: any origin
+  deniedOrigins: ["*.example.net"]                                              # refused even if allowed
+```
+
+A pattern is an exact lowercase host with an optional port, or `*.` over
+subdomains (`*.example.com` matches `api.example.com` and `example.com`,
+never `notexample.com`); at most 64 each. The resolver checks the
+connection's origin against every policy that selects the namespace when a
+run is admitted and again before each turn, and refuses with
+`AUTH_ROUTE_MISMATCH`: `policy "celln-fleet-starter" denies model requests
+to https://x (pattern)` or `policy "…" allows model requests only to a, b,
+not https://x`.
+
+`sympozium doctor` (**Mediated model access**) summarises the guardrail, and
+the console reads it through the mediation endpoint:
+
+```sh
+curl -sf "${H[@]}" "$API/api/v1/celln-platform/mediation?namespace=$NS"
+# {"enabled":true,"allowedOrigins":[],"deniedOrigins":[],"policies":["celln-fleet-starter"],"routes":[],"pending":[]}
+```
+
+`routes` and `pending` are always empty; they remain for 0.11 clients.
+
+## Private and local endpoints
+
+The gateway sees only an IP, so it cannot tell a LAN model server from a
+pod or Service address. The rules:
+
+- **Public HTTPS** (any address that is not private, loopback, link-local,
+  multicast or 100.64/10): reachable by default. Every DNS answer is checked
+  before connecting; mixed public/private answers fail closed; redirects are
+  refused.
+- **A private destination** (RFC 1918, IPv6 ULA, 100.64/10, loopback) needs
+  its exact origin in `modelGateway.privateOrigins`, once for the cluster:
+
+  ```sh
+  sympozium install --set 'modelGateway.privateOrigins[0]=http://192.168.1.237:8080'
+  ```
+
+  Until then a run to it fails at the gateway with
+  `MODEL_DESTINATION_FORBIDDEN`. A listed HTTPS origin is reachable without
+  the connection setting `allowInsecure`.
+- **Plain HTTP** to a listed origin additionally needs `allowInsecure: true`
+  on the connection, and works only for keyless connections (a Secret never
+  crosses HTTP). Its DNS answers must all be loopback, private or 100.64/10
+  addresses.
+- **A private CA.** For an in-house HTTPS server, put the CA in a ConfigMap
+  in the gateway's namespace and name it in `modelGateway.providerCA`
+  (`configMap`, `key: ca.crt`); it is trusted only for listed origins, and
+  public providers never trust it. If you restrict `modelGateway.egress`,
+  include the server's address.
+
+Celln's own tools (`https-fetch`, `https-post-json`) never reach a private
+address, whatever the model connection allows.
+
+## Refusals
+
+Every refusal names a stable reason. Where a run is refused before it starts,
+the reason is on the `AgentRun`'s conditions and the run fails; where a model
+call is refused, the gateway logs one line (no credential, route or request
+content) and the turn fails:
+
+```text
+model-gateway: refused status=403 reason=MODEL_CREDENTIAL_SOURCE_CHANGED op=invoke claimed_run=team-a/researcher-x7k2p claimed_agent=researcher claimed_turn=researcher-x7k2p-recall
+```
+
+| Reason | Meaning |
+| --- | --- |
+| `model key Secret … belongs to …` / `… is not declared in Agent … spec.authRefs` / `… is pinned to … and cannot be sent to …` | Ownership, grant or origin pin refused by the API (`409`), the webhook or the controller |
+| `AUTH_ROUTE_MISMATCH` | The connection cannot be the route: a policy's `allowedOrigins`/`deniedOrigins` refuses its origin, a keyed endpoint is not HTTPS, the connection is disabled or malformed, or the run's model is not among its `models` |
+| `AUTH_LIMIT_OUT_OF_RANGE` | `spec.enduring` asks for more than the policy's ceilings, or cannot pay for one turn at the connection's `maxOutputTokens` |
+| `AUTH_TOOL_ORDER_MISMATCH`, `AUTH_TOOL_UNKNOWN` | `clusterToolRefs` is not exactly the toolbox's tools in its order |
+| `AUTH_POLICY_WITHDRAWN` | The namespace is not admitted by any policy |
+| `AUTH_PROTOCOL_UNSUPPORTED` | The node runs a Celln release without a contract the run needs |
+| `AUTH_CONTEXT_LOST` | The node holding the run's native state is gone; the run ends and nothing is re-placed |
+| `MODEL_AUTH_UNAUTHORIZED`, `MODEL_AUTH_FORBIDDEN` | The permit does not verify, or the request widens it (a pinned parameter, an unregistered run, output tokens outside the connection's bound or the turn's cap) |
+| `MODEL_ROUTE_CHANGED` | The live connection no longer matches the decision: UID, digest, endpoint origin, provider, protocol, model list, or the namespace changed or is being deleted |
+| `MODEL_CREDENTIAL_SOURCE_CHANGED` | The Secret, its key, its UID, its owner or its pin no longer match; or the Agent is gone or has another UID |
+| `MODEL_DESTINATION_FORBIDDEN` | Private, loopback, link-local or unlisted private address; plain HTTP with a key; a redirect |
+| `MODEL_STREAMING_UNSUPPORTED`, `MODEL_PROTOCOL_UNSUPPORTED`, `MODEL_REQUEST_MALFORMED` | Request shape the gateway does not forward |
+| `MODEL_REQUEST_CONFLICT`, `MODEL_RESPONSE_TOO_LARGE`, `MODEL_PROVIDER_UNAVAILABLE`, `MODEL_GATEWAY_UNAVAILABLE` | Duplicate request id, oversized or invalid provider response, provider unreachable, gateway or its database not ready |
+| `AUTH_BUDGET_EXHAUSTED`, `AUTH_BUDGET_CLOSED`, `AUTH_WORK_DEADLINE_EXPIRED`, `AUTH_BUDGET_NOT_REGISTERED`, `AUTH_PROVIDER_USAGE_EXCEEDS_RESERVATION` | Budget accounting: the run or turn has no reservation left, is closed, past its deadline, unregistered, or the provider reported more usage than was reserved |
+
+A run whose node receiver rejects the controller's token reports
+`ReceiverUnavailable` (`RECEIVER_AUTH_REJECTED`); one that cannot reach it
+over trusted TLS reports `RECEIVER_UNREACHABLE`. Both wait rather than fail,
+because nothing was submitted.
+
+## Budgets
+
+A run's `spec.enduring` (`leaseSeconds`, `maxTurns`, `maxModelRequests`,
+`maxOutputTokens`) is admitted within the scope's policy ceilings. Every turn
+reserves 6 model requests and 6 × the connection's `maxOutputTokens` output
+tokens from the run's totals before its first request, and the gateway
+reserves each request's full output bound before forwarding it; unused
+reservation is reconciled from the provider's reported usage. A run whose
+output tokens run out on a healthy node reports `Uncertain` and does not end
+by itself; size `spec.enduring` for the turns you expect
+(`sessionDefaults` in the profiles API is computed from the ceilings). The
+ceilings themselves are set at install
+([Leases and budgets](celln-fleet-installation.md#leases-and-budgets)).
+
+## Tools on this path
+
+The toolbox does not depend on the model route. An Agent on the `.toolbox`
+profile gets the workspace tools (read, write, list, append, search, delete;
+files live with the parent and end with it), `https-fetch` and
+`https-post-json` to any public HTTPS host (or the scope's
+`--celln-fleet-https-host` list), and the borrowed commands, each with the
+limits the signed decision carries. See
+[The toolbox](celln-fleet-installation.md#the-toolbox).
+
+## How it is wired
+
+`sympozium install` sets `celln.mediation.enabled`, `clusterId` (the
+`kube-system` namespace UID), `issuer.keyId` and `modelGateway.image` on
+every run, and bootstraps the trust right after the chart creates its
+namespaces. The trust is never rendered from Helm values:
 
 | Object | Namespace | Keys | Read by |
 |---|---|---|---|
@@ -144,478 +479,73 @@ gateway and the receiver (the CA key is discarded). It publishes:
 | Secret `celln-mediation-node` | `celln-system` | `operator-token` (= `receiver-token`), `tls.crt`, `tls.key` | dispatcher, receiver sidecar |
 | ConfigMap `celln-mediation-trust` | both | `jwks.json`, `ca.crt` | all three |
 
-The JWKS and CA certificate are public, so they live in a ConfigMap: they can be
-inspected and rotated without Secret access, and the dispatcher and gateway
-re-read the keyset (the gateway on `SIGHUP`). Nothing private is ever rendered
-from Helm values, and the chart generates no keys.
-
-A rerun verifies the five objects still belong together and changes nothing. It
-never repairs or rotates by replacement: to rotate, delete all five
-deliberately, bootstrap again (or rerun `sympozium install`) and restart the
-three components. Certificates last `--validity`, by default **ten years**:
-the CA key is discarded after signing, so nothing renews them in place, and
-rotation is the renewal. `sympozium doctor` warns in the last 60 days and
-fails once they have expired. If your release is not named `sympozium`,
-pass `--release-fullname`; if you set `celln.mediation.receiver.url`, pass its
-host with `--receiver-host`.
-
-You can also create these objects yourself; the table is the whole contract.
-The JWKS is `{"keys":[{"kty":"OKP","crv":"Ed25519","use":"sig","alg":"EdDSA","kid":"...","x":"..."}]}`.
-
-## 3. Enable it
-
-`mediation-values.yaml` from the bootstrap carries `clusterId`, `issuer.keyId`
-and the object names. Add the gateway's operator inputs
-(`charts/testdata/celln-mediation-values.yaml` is a complete sample):
-
-```yaml
-modelGateway:
-  image: ghcr.io/sympozium-ai/sympozium/model-gateway@sha256:<digest>   # digest-pinned
-  # database: {secretName: model-gateway-database}   # omit for the bundled PostgreSQL
-  namespaces: [team-a]        # optional, see "Gateway RBAC"
-  # egress: [...]             # optional: omit to allow any provider; a list restricts it
-```
-
-```bash
-helm upgrade sympozium charts/sympozium -n sympozium-system --reuse-values \
-  -f mediation-values.yaml -f gateway-values.yaml
-```
-
-Rendering fails, naming the value, when anything is missing or contradictory:
-no fleet, no `clusterId`/`issuer.keyId`, another issuer name, an empty object
-name, an unpinned gateway or bundled database image, a configuration
-claim as well, or a receiver URL that is not an HTTPS origin.
-
-Enabling (or disabling) mediation changes the `celln-node` pod template, so the
-owners roll one node at a time and live native parents on each node end.
-
-## 4. Verify
-
-```bash
-kubectl -n sympozium-system rollout status deploy/sympozium-model-gateway      # ready = PostgreSQL, RBAC and keys accepted
-kubectl -n sympozium-system logs deploy/sympozium-controller-manager | grep -i "Scoped Celln"
-kubectl -n celln-system logs ds/celln-node -c dispatcher | grep -i scoped
-```
-
-`/v1/scoped/*` no longer answers `404 scoped receiver disabled`. From the
-controller's network identity, an unauthenticated request to the receiver now
-gets `401` (run it from a debug pod labelled like the controller, or temporarily
-admit your pod in the `celln-node-ingress` NetworkPolicy):
-
-```bash
-curl --cacert ca.crt -X POST https://celln-scoped-receiver.celln-system.svc:9443/v1/scoped/read -d '{}'
-```
-
-The gateway logs one line per refused call: status, reason code, operation
-(`register`, `invoke` or `close`), and the run, Agent and turn the call's
-decision names. A forged decision fails verification, so these are labelled as
-claims. No credential, route or request content is ever logged:
-
-```text
-model-gateway: refused status=403 reason=MODEL_CREDENTIAL_SOURCE_CHANGED op=invoke claimed_run=team-a/agent-a-x7k2p claimed_agent=agent-a claimed_turn=agent-a-x7k2p-recall
-```
-
-A run whose scoped receiver rejects the controller's token reports
-`ReceiverUnavailable` with `RECEIVER_AUTH_REJECTED`. If the receiver can't be
-reached over trusted TLS it reports `RECEIVER_UNREACHABLE` instead. Either way
-it waits rather than fails, because nothing was submitted.
-`AUTH_PROTOCOL_UNSUPPORTED` means only that the node answered without a
-contract the run needs, for example an older Celln.
-
-### A provider with a private CA
-
-A secret route always uses HTTPS. For an in-house model server whose
-certificate comes from a private CA:
-- put that CA in a ConfigMap in the gateway's namespace and name it in
-  `modelGateway.providerCA`;
-- list the server's exact origin in `privateOrigins`.
-
-The CA is trusted only for listed origins. A listed origin is reachable over
-HTTPS without the connection setting `allowInsecure`, while plain HTTP to it
-still needs `allowInsecure` and works only for keyless routes.
-
-```bash
-kubectl -n sympozium-system create configmap models-ca --from-file=ca.crt=./ca.crt
-sympozium install \
-  --celln-mediated-route "provider=vllm,protocol=openai-chat,origin=https://models.internal:8443,models=*" \
-  --set modelGateway.providerCA.configMap=models-ca \
-  --set 'modelGateway.privateOrigins[0]=https://models.internal:8443'
-```
-
-The system roots still apply. Public providers never trust the operator's
-CA.
-
-## 5. Declare which providers Agents may bring a key for
-
-The resolver matches an Agent's `ModelConnection` against the `auth: secret`
-routes of the scope's `CellnExecutionPolicy`, and refuses everything else with
-`AUTH_ROUTE_MISMATCH`.
-
-**Built-in routes.** When mediation is enabled and you declare no route, the
-chart records three, so an Agent can bring its own key for any model of a
-well-known hosted provider without further setup:
-
-| provider    | protocol             | endpoint origin             | models |
-|-------------|----------------------|-----------------------------|--------|
-| `openai`    | `openai-chat`        | `https://api.openai.com`    | `["*"]` (any) |
-| `anthropic` | `anthropic-messages` | `https://api.anthropic.com` | `["*"]` (any) |
-| `deepseek`  | `openai-chat`        | `https://api.deepseek.com`  | `["*"]` (any) |
-
-They grant no key of the cluster's: each Agent still brings its own Secret, and
-that Secret only ever goes to the listed origin. Declaring **any** route
-(`celln.mediation.routes` or `--celln-mediated-route`) replaces the built-in
-routes entirely, so declaring one provider is also how you restrict to it. Set
-`celln.mediation.defaultRoutes=false` to record no route at all until you
-declare one. Like every route, they reach the policy on the next
-`sympozium install --celln-fleet`, added backend or
-`sympozium celln-mediation apply-routes`.
-
-The default install also sets `mediateBackends`, which admits each HTTPS fleet
-backend's provider and exact model (the starter Agent's among them).
-
-Why the operator, and not the Agent's owner: a `ModelConnection` is written by a
-tenant, and a tenant-authored endpoint is not authorisation. If the connection
-alone decided where a namespace's Secret may be sent, anything that can write a
-`ModelConnection` (including a prompt-injected agent with that permission) could
-point a key, or the gateway's egress, at a host of its choosing. The route list
-is the operator's allow-list of destinations; the tenant only picks from it.
-
-Matching is **exact** on provider, protocol and endpoint origin: there is no
-wildcard origin or origin prefix, so a key is only ever sent to an origin the
-operator named. Models are exact names, or the **any-model token** `["*"]`,
-which admits any model name of that provider at those origins. `*` must be the
-route's only model: `[gpt-5, "*"]`, `gpt-*` and other patterns are refused. To
-restrict Agents to particular models, list them instead of `*`. Whatever the
-route, the signed decision binds the run's concrete model, and the gateway
-refuses a request for any other. Secret routes use `https://host` without a
-port: a cluster Secret never crosses plain HTTP. Explicitly keyless local
-routes can approve HTTP and ports as described below.
-
-With the installer (the flags only declare routes; mediation itself must be
-enabled by this install's values, or they are refused before anything changes):
-
-```bash
-sympozium install --celln-fleet ... \
-  --set celln.mediation.enabled=true --set celln.mediation.clusterId=my-cluster ... \
-  --celln-mediated-route provider=anthropic,protocol=anthropic-messages,origin=https://api.anthropic.com,models=claude-sonnet-5+claude-opus-5 \
-  --celln-mediated-route provider=openai,protocol=openai-chat,origin=https://api.openai.com,models=*
-```
-
-`models` and `origin` take several values joined with `+` (or repeat the key);
-`models=*` alone admits any model (quote it in a shell that globs).
-`--celln-mediate-backends` additionally offers every HTTPS backend of the fleet
-(its provider, protocol, origin and model) to an Agent's own key; plain-HTTP and
-port-bearing backends are never offered. A model name that itself contains `+`
-or `,` can only be declared through values.
-
-With values (`celln.mediation.routes` is refused unless `celln.mediation.enabled`
-is true: a route declared while mediation is off would admit nothing and only
-look like it does):
-
-```yaml
-celln:
-  mediation:
-    mediateBackends: false
-    routes:
-      - provider: anthropic
-        protocol: anthropic-messages     # or openai-chat
-        models: [claude-sonnet-5, claude-opus-5]   # exact names, or ["*"] alone for any model
-        endpointOrigins: [https://api.anthropic.com]
-      - provider: openai
-        protocol: openai-chat
-        models: ["*"]
-        endpointOrigins: [https://api.openai.com]
-```
-
-```bash
-helm upgrade sympozium charts/sympozium -n sympozium-system --reuse-values -f routes-values.yaml
-sympozium celln-mediation apply-routes
-```
-
-The chart validates every route the way the installer does and records the
-declaration in ConfigMap `celln-system/celln-mediated-routes` (names and public
-origins only). That record is the single source every platform installer reads:
-`sympozium install --celln-fleet`, the API server when it completes an added
-backend, and `sympozium celln-mediation apply-routes`, which does nothing but
-publish the record into the installed scope's policy. After a Helm-only change
-run `apply-routes`; the installer does the same step itself.
-
-A policy only ever grows. Removing a route from the values stops later installs
-from adding it, but never removes a published route from under running Agents;
-to withdraw one, edit the `CellnExecutionPolicy` deliberately. Note that
-`sympozium install` does not reuse the previous release's values: by default
-it derives the mediation values again on every run; on the operator-managed
-path pass them (`--set`) again on a rerun, or the default takes over.
-
-`sympozium doctor` reports the state ("Mediated model access"): disabled, or
-enabled with the five bootstrap objects present, the gateway ready and the
-routes the policy carries; it warns when no route is published or a declared
-one is not in the policy yet. The console reads the same through
-`GET /api/v1/celln-platform/mediation?namespace=<ns>`:
-
-```json
-{"enabled": true, "mediateBackends": false,
- "routes":  [{"provider": "anthropic", "protocol": "anthropic-messages", "models": ["claude-opus-5", "claude-sonnet-5"],
-              "endpointOrigins": ["https://api.anthropic.com"], "policy": "celln-fleet-starter", "secretKey": "ANTHROPIC_API_KEY"}],
- "pending": []}
-```
-
-`routes` are the ones the namespace's policies carry now (what a run is matched
-against); `pending` are declared routes no policy carries yet. A route with
-`models: ["*"]` also carries `"anyModel": true`, and the console then asks for
-the model name (prefilled with a well-known one) instead of offering a list.
-
-## 6. Give an Agent its own key
-
-Everything below lives in the Agent's namespace (`team-a` here), which must be
-one the scope's policy admits and, with `modelGateway.namespaces` set, one the
-gateway may read.
-
-**The Secret.** The key name is fixed by the connection's protocol:
-`ANTHROPIC_API_KEY` for `anthropic-messages`, `OPENAI_API_KEY` for `openai-chat`
-(whatever the provider is called). Only the gateway reads it.
-
-```yaml
-apiVersion: v1
-kind: Secret
-metadata:
-  name: my-anthropic-key
-  namespace: team-a
-stringData:
-  ANTHROPIC_API_KEY: "<your key>"
-```
-
-**The ModelConnection.** Provider, protocol and the endpoint's origin must
-match one declared route exactly, and every model you intend to run must be one
-of its models (any model, on a `["*"]` route). `parameters`
-and `maxOutputTokens` (256-4096 per request, default 512) are optional.
-
-```yaml
-apiVersion: sympozium.ai/v1alpha1
-kind: ModelConnection
-metadata:
-  name: my-anthropic
-  namespace: team-a
-spec:
-  provider: anthropic
-  protocol: anthropic-messages
-  endpoint: https://api.anthropic.com/v1/messages
-  secretRef: my-anthropic-key
-  models: [claude-sonnet-5]
-  maxOutputTokens: 2048
-```
-
-**The runtime wrapper.** The Agent's `runtimeRef` names an `AgentRuntime` in its
-namespace that binds a fleet runtime profile by `cellnProfileRef`. An Agent
-that lends the starter toolbox runs on the backend's *toolbox* profile
-(`celln-native-starter.toolbox`, wrapper `celln-native.toolbox`; for another
-backend `<its profile>.toolbox` and `celln-<backend>.toolbox`). Its signed
-closure is the runtime composed with every starter tool and borrowed command,
-so the node runs it only for exactly those tools in that order: a cell never
-carries an executable its run did not select. A chat-only Agent uses the
-backend's tool-free profile and wrapper (`celln-native-starter`,
-`celln-native`). Ask the API server for the runtime alone; it is created only
-for a profile the namespace's policy admits, and neither the backend's shared
-Agent nor its host-profile connection is added:
-
-```bash
-curl -X POST "$SYMPOZIUM_API/api/v1/celln-platform/wrappers?namespace=team-a" \
-  -H "Authorization: Bearer $TOKEN" \
-  -d '{"profile": "celln-native-starter.toolbox", "runtimeOnly": true}'
-# {"backend":"native","runtime":"celln-native.toolbox","agent":"","connection":"","created":["celln-native.toolbox"]}
-```
-
-`GET /api/v1/celln-platform/profiles?namespace=team-a` lists each backend's
-profile with its toolbox (`toolboxProfile`, `toolboxWrapper` and the exact
-`toolboxTools`). A scope installed from a starter package without a toolbox
-(Celln v0.5.33 and earlier) publishes none, and an Agent with its own key then
-lends no tools; move the fleet to a current package with
-`--celln-fleet-replace-package`. What the API creates is this object (shown
-for reference; the revision must be the profile's exact one, so prefer the
-API):
-
-```yaml
-apiVersion: sympozium.ai/v1alpha1
-kind: AgentRuntime
-metadata:
-  name: celln-native.toolbox
-  namespace: team-a
-spec:
-  image: ""                     # required by the API; a fleet profile supplies the executable
-  cellnProfileRef:
-    name: celln-native-starter.toolbox
-    revision: "<the profile's spec.revision>"
-  supportOwner: celln-platform
-```
-
-**The Agent.** `authRefs` is the Agent owner's grant that this Secret may be
-used for this Agent (selecting the connection in `spec.execution` grants it
-too); `spec.execution.modelConnectionRef` makes its runs use the connection.
-`cellnSelection.clusterToolRefs` lends the scope's starter toolbox: exactly the
-toolbox profile's tools in its order (`kubectl get cellnruntimeprofile
-celln-native-starter.toolbox -o jsonpath='{.metadata.annotations.celln\.sympozium\.ai/toolbox-tools}'`
-lists them; the installer's starter Agent and the console's Celln Agents fill
-this in for you). A different order or a subset is refused
-`AUTH_TOOL_ORDER_MISMATCH`. Omit it, on `celln-native`, for a chat-only Agent.
-
-```yaml
-apiVersion: sympozium.ai/v1alpha1
-kind: Agent
-metadata:
-  name: my-agent
-  namespace: team-a
-spec:
-  agents:
-    default:
-      model: claude-sonnet-5    # required by the API; the run's model is spec.execution.model
-  runtimeRef: celln-native.toolbox
-  authRefs:
-    - provider: anthropic
-      secret: my-anthropic-key
-  execution:
-    backend: celln
-    modelConnectionRef: my-anthropic
-    model: claude-sonnet-5
-    cellnSelection:
-      runtimeRef: celln-native.toolbox
-      toolRefs: []
-      clusterToolRefs:          # exactly the toolbox's tools, in its order
-        - {name: celln-starter-workspace-read, revision: v1}
-        - {name: celln-starter-workspace-write, revision: v1}
-        - {name: celln-starter-https-fetch, revision: v1}
-        - {name: celln-starter-workspace-list, revision: v1}
-        - {name: celln-starter-workspace-append, revision: v1}
-        - {name: celln-starter-workspace-search, revision: v1}
-        - {name: celln-starter-workspace-delete, revision: v1}
-        - {name: celln-starter-https-post-json, revision: v1}
-        # ...then each borrowed command (grep, jq, ...) in catalogue order
-```
-
-### Tools on the mediated path
-
-A mediated Agent gets the same starter toolbox as a fleet-keyed one. The
-signed decision carries each tool's limits and the node's broker enforces
-them; nothing about a tool depends on the model route:
-
-- **Workspace** (`celln.scoped-artifacts/v2`): read, write, list, append,
-  search and delete. Write, append and delete are approved effects; read, list
-  and search are not. An enduring conversation keeps its files across turns in
-  one store owned by that parent (bounded by the tools' `maxFiles`,
-  `maxFileBytes` and `maxTotalBytes`, the smallest across the selected tools)
-  and loses them with the parent. A one-shot run ("Answer once") gets a
-  private, empty store that lives only as long as its cell.
-- **Web** (`celln.scoped-https/v1`): `https-fetch` (GET) and `https-post-json`
-  (POST, never redirected) reach any public HTTPS host on port 443 by default
-  (`allowHosts: ["*"]`, or the scope's `--celln-fleet-https-host` list), within
-  each tool's `maxRequests`, `maxResponseBytes` and `timeoutMillis` per turn.
-  Private, loopback, link-local and reserved addresses, plain HTTP, other
-  ports and redirects to any of them are refused. A route's `allowInsecure`
-  never applies to tool requests.
-- **Borrowed commands** (`celln.argv/v1`, such as `grep` or `jq`): run in the
-  cell with the argv binding the node itself recorded from the reviewed
-  starter package, never one carried by the run or decision.
-
-Before admitting a run that selects these tools, the controller asks the node
-which contracts it serves (`scopedArtifactContracts`, `scopedHttpsContracts`
-in `GET /v1/capabilities`). A node running an older Celln refuses the run with
-`AUTH_PROTOCOL_UNSUPPORTED` before any model request or native work; upgrade
-the fleet package, or remove the tools from the selection to chat only.
-
-A run of this Agent is resolved against the policy's `secret` routes. If it is
-refused `AUTH_ROUTE_MISMATCH`, compare the connection's provider, protocol,
-endpoint origin and the run's model with the routes `sympozium doctor` lists:
-all four must match one route.
-
-## Keyless local models
-
-For a local OpenAI-compatible server, declare `auth: none` explicitly. HTTP
-also requires `allowInsecure: true` on both the operator route and the tenant
-connection, and the exact origin in `modelGateway.privateOrigins`:
-
-```yaml
-celln:
-  mediation:
-    enabled: true
-    routes:
-      - provider: llama-server
-        protocol: openai-chat
-        auth: none
-        allowInsecure: true
-        models: [local-model]
-        endpointOrigins: [http://192.168.1.237:8080]
-modelGateway:
-  privateOrigins: [http://192.168.1.237:8080]
-```
-
-Merge these settings into the existing mediation values, upgrade with
-`helm upgrade --reuse-values`, then run `sympozium celln-mediation apply-routes`.
-Keep the existing routes in the values list if they are still needed. The
-equivalent installer route is
-`--celln-mediated-route provider=llama-server,protocol=openai-chat,auth=none,allowInsecure=true,origin=http://192.168.1.237:8080,models=local-model`;
-the gateway allow-list (`modelGateway.privateOrigins`) must also permit that destination, and so must `modelGateway.egress` if you restrict it.
-
-Create Agent → Celln offers the declared local provider and explains that no
-key is required. Its ModelConnection sets `allowInsecure: true` and has neither
-`secretRef` nor `credentialProfile`. No compatibility Secret is created. The
-gateway still enforces budgets and model parameters, but sends no credentials.
-
-HTTP DNS answers must all be loopback or private addresses (RFC 1918, IPv6 ULA,
-or the 100.64.0.0/10 shared space Tailscale uses); public, link-local,
-and mixed public/private answers are refused. Use an explicit LAN IP when the
-host name resolves to several address classes. Redirects remain disabled.
-Secret-backed HTTP routes remain forbidden.
-
-## The enduring parent request
-
-Enduring scoped runs need `--scoped-parent-request-file`. Celln's
-`starter-configure` writes `scoped-parent-request.json` beside
-`native-template.json`, and the chart defaults `celln.mediation.parentRequestFile`
-to that file in the first backend's configuration on the node
-(`/var/lib/sympozium-celln/<scope>/configuration-<package>-<backend>/`).
-
-Celln refuses to start when the flag names a missing file, so the owner pod
-waits for that configuration to exist and passes the flag **only if the file is
-there**. Without it the dispatcher logs that enduring scoped runs are disabled
-and serves one-shot scoped dispatch. The file is read once at start: after it
-appears (a newer starter package, or a reconfigured backend), restart the
-`celln-node` pod on that node.
-
-## Gateway RBAC
-
-By default the gateway keeps its existing cluster-wide `get` on Secrets,
-ModelConnections and Namespaces. Set `modelGateway.namespaces` to replace that
-with one Role/RoleBinding per listed namespace plus a ClusterRole limited to
-reading those Namespace objects; the chart then also sets the gateway's
-`readinessNamespaces`, so readiness probes exactly that access. Add a namespace
-to the list before its Agents use mediation.
-
-## Current limits
-
-- **Node loss ends a mediated run.** Its native state lived on that node;
-  there is no automatic continuation on the mediated path yet.
-- **Workspace files live with the parent.** A mediated conversation's files
-  do not survive a dispatcher restart or node loss, and a one-shot run's
-  files end with its cell.
-- **A parent that ends on a healthy node** (for example its run's
-  `maxOutputTokens` is exhausted; the gateway reserves each request's full
-  output bound) reports `Uncertain` and the run does not end by itself.
-  Size `spec.enduring` for the turns you expect.
-- **A dispatcher restart loses live scoped parents**, including the roll caused
-  by toggling mediation or upgrading the fleet package.
-- **Rotation is manual**: delete, then bootstrap or rerun the install. There
-  is no overlap window tooling yet, although the verifiers accept a multi-key
-  JWKS. The default ten-year certificates make rotation rare.
-  - The controller and gateway pods carry a `checksum/mediation-trust`
-    annotation built from the signing key id and the trust objects' UIDs, so
-    the next `helm upgrade` or `sympozium upgrade` rolls them onto the new
-    trust.
-  - Trust recreated outside Helm still needs
-    `kubectl -n sympozium-system rollout restart deploy/sympozium-controller-manager deploy/sympozium-model-gateway`.
-    Until then, runs report `RECEIVER_AUTH_REJECTED`.
-- Secret volumes cannot be owned by a non-root user, and the controller and
-  gateway refuse key or token files that are not owner-only. A non-root init
-  step in each pod therefore copies the operator's files into an in-memory
-  volume with mode `0400`; a changed Secret takes effect on the next pod restart.
-- NetworkPolicies need an enforcing CNI. The gateway admits the controller and
-  the `celln-node` pods on 8443; `celln-node` admits the controller on the
-  receiver port only, and its plaintext 8787 stays router-only.
+Against the same issuer (`sympozium-control-plane`), keyset, CA and tokens:
+the controller signs one permit per run and talks to the
+`celln-scoped-receiver` Service (the router's TLS sidecar, which forwards
+each `/v1/scoped/*` operation to the node that prepared it); the `celln-node`
+dispatchers verify the permit and reach the gateway on 8443; the gateway
+verifies it again, registers the run and serves its model calls. A rerun of
+the installer reads the existing key id back, verifies the objects and
+changes nothing. The chart installs the record ConfigMap
+`celln-system/celln-mediation`, which `doctor` and the API read.
+
+For a Helm-only install the same objects come from
+`sympozium celln-mediation bootstrap --cluster-id <id> --values-out
+mediation-values.yaml` (flags: `--system-namespace`, `--release-fullname`,
+`--gateway-host`, `--receiver-host`, `--validity`), whose output carries the
+credential-free values to pass to `helm upgrade`.
+
+### Rotation
+
+Certificates last ten years (`--validity`) and the CA key is discarded after
+signing, so nothing renews them in place: rotation is the renewal.
+`sympozium doctor` warns in the last 60 days and fails once they have
+expired. To rotate, delete the five objects (the four above; the trust
+ConfigMap exists in both namespaces) deliberately, run `sympozium install`
+(or `celln-mediation bootstrap`), and restart the controller, the model
+gateway and the `celln-node` pods. The controller and gateway pods carry a
+`checksum/mediation-trust` annotation, so the next `helm upgrade` or
+`sympozium upgrade` rolls them onto the new trust; trust recreated outside
+Helm needs `kubectl -n sympozium-system rollout restart
+deploy/sympozium-controller-manager deploy/sympozium-model-gateway`. Until
+then runs report `RECEIVER_AUTH_REJECTED`. Live conversations end with the
+`celln-node` restart.
+
+### PostgreSQL
+
+The gateway keeps budgets and registrations in PostgreSQL and refuses to
+start without it. With `modelGateway.database.secretName` empty the chart
+runs its own single-pod PostgreSQL (`<release>-model-gateway-db`, a
+StatefulSet on a 1 Gi PVC, digest-pinned `postgres:17-alpine`; password
+generated once and kept across upgrades; a NetworkPolicy admits only the
+gateway). It holds accounting, never provider keys. For production, apply
+`migrations/002_celln_model_budget.sql` and
+`migrations/003_celln_model_gateway.sql` to your own database and set
+`modelGateway.database.secretName` to a Secret holding the URL under
+`database-url`; the chart then renders no database. If you restrict
+`modelGateway.egress`, include the database's address.
+
+### Gateway RBAC and egress
+
+By default the gateway keeps a cluster-wide `get` on Secrets,
+ModelConnections and Namespaces. `modelGateway.namespaces` replaces that
+with one Role/RoleBinding per listed namespace (and sets the gateway's
+readiness probe to exactly that access); add a namespace before its Agents
+run. `modelGateway.egress` is the gateway's NetworkPolicy egress: empty
+allows any destination (an Agent may use any provider); a list restricts it.
+
+### Current limits
+
+- **Node loss ends a run** (`AUTH_CONTEXT_LOST`); nothing is re-placed on
+  another node. Workspace files live with the parent and end with it.
+- **A dispatcher restart loses live parents**, including the roll caused by
+  a fleet package move or a trust rotation.
+- **No streaming.** The gateway forwards complete request and response
+  envelopes.
+- Secret volumes cannot be owned by a non-root user, so a non-root init step
+  in the controller and gateway pods copies the operator's files into an
+  in-memory volume with mode `0400`; a changed Secret takes effect on the
+  next pod restart.
+- NetworkPolicies need an enforcing CNI. The gateway admits the controller
+  and the `celln-node` pods on 8443; `celln-node` admits the controller on
+  the receiver port only, and its plaintext 8787 stays router-only.

@@ -13,7 +13,7 @@ import (
 )
 
 func TestAPITurnRBACAllowsCancellationWithoutStatusAuthority(t *testing.T) {
-	raw, err := renderNativeParent(t, nativeParentValues())
+	raw, err := renderNativeParent(t, fleetValues())
 	if err != nil {
 		t.Fatalf("render: %v %s", err, raw)
 	}

@@ -25,7 +25,7 @@ func secretRouteFixture(t *testing.T, mutate func(ctx context.Context, f platfor
 	if err := f.client.Get(ctx, types.NamespacedName{Name: "json-agent-v1"}, &profile); err != nil {
 		t.Fatal(err)
 	}
-	profile.Spec.Native = &api.CellnNativeProvisioning{AdmissionWindowMs: 60000, Parent: raw(`{"workload":{"caller":"sympozium:celln"}}`), Worker: raw(`{"workload":{"caller":"sympozium:celln"}}`), Template: raw(`{"contract":"celln.json-tools/v1"}`), ModelProfile: "blake3:" + strings.Repeat("c", 64), CredentialProfile: "fleet-key", ReservedMemoryBytes: 1, TurnModelRequests: api.TurnModelRequests, TurnOutputTokens: api.TurnOutputTokens}
+	profile.Spec.Native = &api.CellnNativeProvisioning{AdmissionWindowMs: 60000, Parent: raw(`{"workload":{"caller":"sympozium:celln"}}`), Worker: raw(`{"workload":{"caller":"sympozium:celln"}}`), Template: raw(`{"contract":"celln.json-tools/v1"}`), ModelProfile: "blake3:" + strings.Repeat("c", 64), ReservedMemoryBytes: 1, TurnModelRequests: api.TurnModelRequests, TurnOutputTokens: api.TurnOutputTokens}
 	if err := f.client.Update(ctx, &profile); err != nil {
 		t.Fatal(err)
 	}
@@ -35,7 +35,6 @@ func secretRouteFixture(t *testing.T, mutate func(ctx context.Context, f platfor
 	}
 	for i := range policies.Items {
 		p := &policies.Items[i]
-		p.Spec.Routes = append([]api.CellnExecutionPolicyRoute{{Provider: "llama", Protocol: "openai-chat", Models: []string{"fleet-model"}, EndpointOrigins: []string{"https://fleet.example"}, Auth: "host-profile"}}, p.Spec.Routes...)
 		p.Spec.Ceilings = api.CellnExecutionPolicyCeilings{MaxTurns: 64, MaxModelRequests: 384, MaxOutputTokens: 1 << 20, MaxParentLeaseSeconds: 14400, MaxTurnSeconds: 60}
 		if err := f.client.Update(ctx, p); err != nil {
 			t.Fatal(err)
@@ -119,16 +118,6 @@ func TestSecretRouteRunsOnFleetRuntimeProfile(t *testing.T) {
 	// An Anthropic-protocol connection names the Anthropic key of its Secret.
 	f, request = secretRouteFixture(t, func(ctx context.Context, f platformFixture) {
 		updateConnection(t, ctx, f, func(c *api.ModelConnection) { c.Spec.Protocol = "anthropic-messages" })
-		var policies api.CellnExecutionPolicyList
-		if err := f.client.List(ctx, &policies); err != nil {
-			t.Fatal(err)
-		}
-		for i := range policies.Items {
-			policies.Items[i].Spec.Routes[1].Protocol = "anthropic-messages"
-			if err := f.client.Update(ctx, &policies.Items[i]); err != nil {
-				t.Fatal(err)
-			}
-		}
 	})
 	resolution, err = f.resolver.Resolve(t.Context(), f.runKey, request)
 	if err != nil || resolution.Decision.Route.CredentialSourceRef.SecretKey != "ANTHROPIC_API_KEY" {
@@ -146,23 +135,21 @@ func TestSecretRouteRefusals(t *testing.T) {
 		detail string
 		change func(ctx context.Context, t *testing.T, f platformFixture)
 	}{
-		// The host-profile binding to the runtime profile is not relaxed.
-		{name: "host profile other than the runtime profile's", reason: ReasonRouteMismatch, detail: "installed model credential", change: func(ctx context.Context, t *testing.T, f platformFixture) {
-			updateConnection(t, ctx, f, func(c *api.ModelConnection) {
-				c.Spec = api.ModelConnectionSpec{Provider: "llama", Protocol: "openai-chat", Endpoint: "https://fleet.example/v1/chat/completions", CredentialProfile: "someone-elses-key", Models: []string{"gpt-test"}}
-			})
+		// The Agent's connection is the route; the policy's origin guardrail
+		// is the operator's only say over where an own key may go.
+		{name: "origin on the policy's deny-list", reason: ReasonRouteMismatch, detail: "denies model requests to https://model.example (model.example)", change: func(ctx context.Context, t *testing.T, f platformFixture) {
+			setPolicyOrigins(t, ctx, f, nil, []string{"model.example"})
 		}},
-		// Policy routes stay the operator's allow-list; a tenant-authored
-		// connection is never its own authorisation.
-		{name: "provider outside every route", reason: ReasonRouteMismatch, detail: "exact model route", change: func(ctx context.Context, t *testing.T, f platformFixture) {
-			anyProvider(ctx, t, f)
-			updateConnection(t, ctx, f, func(c *api.ModelConnection) { c.Spec.Provider = "anthropic" })
+		{name: "origin outside the policy's allow-list", reason: ReasonRouteMismatch, detail: "allows model requests only to *.openai.com, api.anthropic.com", change: func(ctx context.Context, t *testing.T, f platformFixture) {
+			setPolicyOrigins(t, ctx, f, []string{"*.openai.com", "api.anthropic.com"}, nil)
 		}},
-		{name: "origin outside every route", reason: ReasonRouteMismatch, detail: "exact model route", change: func(ctx context.Context, t *testing.T, f platformFixture) {
-			updateConnection(t, ctx, f, func(c *api.ModelConnection) { c.Spec.Endpoint = "https://attacker.example/v1/chat/completions" })
+		{name: "deny wins over allow", reason: ReasonRouteMismatch, detail: "denies", change: func(ctx context.Context, t *testing.T, f platformFixture) {
+			setPolicyOrigins(t, ctx, f, []string{"*.example"}, []string{"model.example"})
 		}},
-		{name: "model outside every route", reason: ReasonRouteMismatch, detail: "exact model route", change: func(ctx context.Context, t *testing.T, f platformFixture) {
-			updateConnection(t, ctx, f, func(c *api.ModelConnection) { c.Spec.Models = []string{"gpt-test", "unlisted"} })
+		{name: "origin inside the allow-list by wildcard", change: func(ctx context.Context, t *testing.T, f platformFixture) {
+			setPolicyOrigins(t, ctx, f, []string{"*.example"}, nil)
+		}},
+		{name: "a model the connection does not list", reason: ReasonRouteMismatch, detail: "does not list the model", change: func(ctx context.Context, t *testing.T, f platformFixture) {
 			var run api.AgentRun
 			if err := f.client.Get(ctx, f.runKey, &run); err != nil {
 				t.Fatal(err)
@@ -172,10 +159,28 @@ func TestSecretRouteRefusals(t *testing.T) {
 				t.Fatal(err)
 			}
 		}},
-		{name: "fleet origin is a host-profile route only", reason: ReasonRouteMismatch, detail: "exact model route", change: func(ctx context.Context, t *testing.T, f platformFixture) {
+		{name: "the any-model token is never a concrete model", reason: ReasonRouteMismatch, detail: "does not list the model", change: func(ctx context.Context, t *testing.T, f platformFixture) {
+			updateConnection(t, ctx, f, func(c *api.ModelConnection) { c.Spec.Models = []string{"gpt-test", "*"} })
+			var run api.AgentRun
+			if err := f.client.Get(ctx, f.runKey, &run); err != nil {
+				t.Fatal(err)
+			}
+			run.Spec.Model.Model = "*"
+			if err := f.client.Update(ctx, &run); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		// An own key may go to any origin, including one the fleet also uses;
+		// no operator route has to name the provider first.
+		{name: "an own key to a provider no route declares", change: func(ctx context.Context, t *testing.T, f platformFixture) {
 			anyProvider(ctx, t, f)
 			updateConnection(t, ctx, f, func(c *api.ModelConnection) {
-				c.Spec.Provider, c.Spec.Endpoint, c.Spec.Models = "llama", "https://fleet.example/v1/chat/completions", []string{"fleet-model", "gpt-test"}
+				c.Spec.Provider, c.Spec.Endpoint, c.Spec.Models = "openrouter", "https://openrouter.ai/api/v1/chat/completions", []string{"gpt-test"}
+			})
+		}},
+		{name: "an own key to an HTTPS origin with a port", change: func(ctx context.Context, t *testing.T, f platformFixture) {
+			updateConnection(t, ctx, f, func(c *api.ModelConnection) {
+				c.Spec.Endpoint = "https://llm.internal.example:8443/v1/chat/completions"
 			})
 		}},
 		// The Agent owner, not the run author, grants a Secret.
@@ -361,9 +366,6 @@ func TestRequestOutputTokensIsOnlySentOnGatewayMediatedRoutes(t *testing.T) {
 	if err != nil || resolution.Decision.Route.Provider != "none" || resolution.Execution.RequestOutputTokens != 0 {
 		t.Fatalf("model-free operation: %v %+v", err, resolution)
 	}
-	if got := mediatedRequestOutputTokens(&api.ModelConnection{Spec: api.ModelConnectionSpec{CredentialProfile: "fleet-key", MaxOutputTokens: 4096}}); got != 0 {
-		t.Fatalf("host-profile connection carries a request bound: %d", got)
-	}
 	if got := mediatedRequestOutputTokens(&api.ModelConnection{Spec: api.ModelConnectionSpec{MaxOutputTokens: 2048}}); got != 2048 {
 		t.Fatalf("credential-free mediated connection bound = %d", got)
 	}
@@ -372,80 +374,17 @@ func TestRequestOutputTokensIsOnlySentOnGatewayMediatedRoutes(t *testing.T) {
 // An operator route declaring models ["*"] admits any model name of its
 // provider and protocol at its exact origins; the decision still binds the
 // run's concrete model, and nothing else about the route is relaxed.
-func TestAnyModelSecretRoute(t *testing.T) {
-	setRouteModels := func(ctx context.Context, t *testing.T, f platformFixture, models []string) {
-		var policies api.CellnExecutionPolicyList
-		if err := f.client.List(ctx, &policies); err != nil {
-			t.Fatal(err)
-		}
-		for i := range policies.Items {
-			policies.Items[i].Spec.Routes[1].Models = models
-			if err := f.client.Update(ctx, &policies.Items[i]); err != nil {
-				t.Fatal(err)
-			}
-		}
+
+func setPolicyOrigins(t *testing.T, ctx context.Context, f platformFixture, allowed, denied []string) {
+	t.Helper()
+	var policies api.CellnExecutionPolicyList
+	if err := f.client.List(ctx, &policies); err != nil {
+		t.Fatal(err)
 	}
-	runModel := func(ctx context.Context, t *testing.T, f platformFixture, model string) {
-		updateConnection(t, ctx, f, func(c *api.ModelConnection) { c.Spec.Models = []string{"gpt-test", model} })
-		var run api.AgentRun
-		if err := f.client.Get(ctx, f.runKey, &run); err != nil {
+	for i := range policies.Items {
+		policies.Items[i].Spec.AllowedOrigins, policies.Items[i].Spec.DeniedOrigins = allowed, denied
+		if err := f.client.Update(ctx, &policies.Items[i]); err != nil {
 			t.Fatal(err)
 		}
-		run.Spec.Model.Model = model
-		if err := f.client.Update(ctx, &run); err != nil {
-			t.Fatal(err)
-		}
-	}
-	for _, tc := range []struct {
-		name   string
-		models []string
-		change func(ctx context.Context, t *testing.T, f platformFixture)
-		model  string // the bound model when admitted
-	}{
-		{name: "exact list admits a listed model", models: []string{"gpt-test", "gpt-other"}, model: "gpt-test"},
-		{name: "exact list refuses another model", models: []string{"gpt-test"}, change: func(ctx context.Context, t *testing.T, f platformFixture) { runModel(ctx, t, f, "gpt-new") }},
-		{name: "any model admits a model nobody listed", models: []string{"*"}, change: func(ctx context.Context, t *testing.T, f platformFixture) { runModel(ctx, t, f, "gpt-new-2026") }, model: "gpt-new-2026"},
-		{name: "any model is not any origin", models: []string{"*"}, change: func(ctx context.Context, t *testing.T, f platformFixture) {
-			runModel(ctx, t, f, "gpt-new")
-			updateConnection(t, ctx, f, func(c *api.ModelConnection) { c.Spec.Endpoint = "https://attacker.example/v1/chat/completions" })
-		}},
-		{name: "any model is not any provider", models: []string{"*"}, change: func(ctx context.Context, t *testing.T, f platformFixture) {
-			updateAgent(t, ctx, f, func(a *api.Agent) { a.Spec.AuthRefs = []api.SecretRef{{Secret: "model-secret"}} })
-			updateConnection(t, ctx, f, func(c *api.ModelConnection) { c.Spec.Provider = "anthropic" })
-		}},
-		{name: "any model is not the literal token", models: []string{"*"}, change: func(ctx context.Context, t *testing.T, f platformFixture) { runModel(ctx, t, f, "*") }},
-		{name: "a token beside a name is no any-model route", models: []string{"*", "gpt-test"}, change: func(ctx context.Context, t *testing.T, f platformFixture) { runModel(ctx, t, f, "gpt-new") }},
-		{name: "empty model", models: []string{"*"}, change: func(ctx context.Context, t *testing.T, f platformFixture) {
-			var run api.AgentRun
-			if err := f.client.Get(ctx, f.runKey, &run); err != nil {
-				t.Fatal(err)
-			}
-			run.Spec.Model.Model = ""
-			if err := f.client.Update(ctx, &run); err != nil {
-				t.Fatal(err)
-			}
-		}},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			f, request := secretRouteFixture(t, func(ctx context.Context, f platformFixture) {
-				setRouteModels(ctx, t, f, tc.models)
-				if tc.change != nil {
-					tc.change(ctx, t, f)
-				}
-			})
-			resolution, err := f.resolver.Resolve(t.Context(), f.runKey, request)
-			if tc.model == "" {
-				if PlatformReason(err) != ReasonRouteMismatch {
-					t.Fatalf("reason = %q, want %q; error %v", PlatformReason(err), ReasonRouteMismatch, err)
-				}
-				return
-			}
-			if err != nil {
-				t.Fatal(err)
-			}
-			if route := resolution.Decision.Route; route.Model != tc.model || route.EndpointOrigin != "https://model.example" || route.Auth != "secret" {
-				t.Fatalf("route = %+v, want model %q", route, tc.model)
-			}
-		})
 	}
 }

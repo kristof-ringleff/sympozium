@@ -73,7 +73,7 @@ func TestGatewayChartRequiresExplicitTrustAndRestrictsIdentity(t *testing.T) {
 			}
 			// Fleet dispatchers run in the celln-node DaemonSet pods
 			// (charts/sympozium/templates/celln-fleet.yaml).
-			want := []string{"sympozium-system/control-plane=controller-manager", "celln-system/app.kubernetes.io/name=celln-dispatcher", "celln-system/app.kubernetes.io/name=celln-router", "celln-system/app.kubernetes.io/name=celln-node"}
+			want := []string{"sympozium-system/control-plane=controller-manager", "celln-system/app.kubernetes.io/name=celln-router", "celln-system/app.kubernetes.io/name=celln-node"}
 			for _, peer := range want {
 				if !admitted[peer] {
 					t.Fatalf("gateway ingress does not admit %s: %v", peer, admitted)

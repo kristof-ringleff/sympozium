@@ -102,7 +102,8 @@ the chart would create that already exists without belonging to the release
 and namespaces stuck Terminating and what holds them, nodes labelled
 celln.dev/kvm=true, the Celln fleet's pods (including an init container that
 has been waiting, with its last log line), the published fleet package against
-the one this CLI installs, and each model backend's credential.
+the one this CLI installs, and the origin guardrail mediated model access places
+on Agents' own connections.
 
 Exits 1 when any check FAILs.`,
 		SilenceUsage: true,
@@ -226,27 +227,32 @@ func helmReleaseInfo() (*releaseInfo, error) {
 }
 
 // doctorDefaultValues are the values a first `sympozium install` without
-// flags would use here: the one-shot Celln plane, or the fleet when this
-// build pins a starter package and the environment names a model backend.
+// flags would use here: the router and the model-free fleet when this build
+// pins a starter package; without one the install skips Celln.
 func doctorDefaultValues(scope string) ([]string, string, error) {
-	values, err := cellnInstallSetValues(context.Background(), "", "", nil, 1, false)
+	return doctorValuesFor(scope, defaultCellnStarter())
+}
+
+func doctorValuesFor(scope string, starter cellnStarter) ([]string, string, error) {
+	if !starter.complete() {
+		return []string{"celln.enabled=false"}, "a plain 'sympozium install' (this build pins no Celln starter package, so Celln is skipped)", nil
+	}
+	values, err := cellnInstallSetValues(context.Background(), "", "", 1)
 	if err != nil {
 		return nil, "", err
 	}
-	source := "a plain 'sympozium install'"
-	starter := defaultCellnStarter()
-	backends, _, err := backendsFromEnvironment()
-	if !starter.complete() || err != nil || len(backends) == 0 {
-		return values, source, nil
+	limits, _, err := cellninstall.DefaultFleetLimits.ResolveModelFree()
+	if err != nil {
+		return nil, "", err
 	}
 	fleet, err := cellninstall.FleetValues(cellninstall.FleetOptions{
 		Scope: scope, PackageImage: starter.Image, PackageHash: starter.PackageHash, Publisher: starter.Publisher,
-		Principal: "sympozium:celln", Backends: backends, Limits: cellninstall.DefaultFleetLimits,
+		Principal: "sympozium:celln", Limits: limits,
 	})
 	if err != nil {
-		return values, source, nil
+		return nil, "", err
 	}
-	return append(values, fleet...), "a plain 'sympozium install' with the Celln fleet (backend from the environment)", nil
+	return append(values, fleet...), "a plain 'sympozium install' with the Celln fleet", nil
 }
 
 func (d *doctor) run(ctx context.Context) doctorReport {
@@ -260,7 +266,7 @@ func (d *doctor) run(ctx context.Context) doctorReport {
 		rel, releaseFinding := d.checkRelease()
 		findings = append(findings, releaseFinding)
 		findings = append(findings, d.checkLeftovers(ctx, rel)...)
-		findings = append(findings, d.checkKVMNodes(ctx), d.checkFleetPods(ctx), d.checkFleetPackage(ctx), d.checkFleetBudget(ctx), d.checkModelCredentials(ctx), d.checkMediation(ctx, rel))
+		findings = append(findings, d.checkKVMNodes(ctx), d.checkFleetPods(ctx), d.checkFleetPackage(ctx), d.checkFleetBudget(ctx), d.checkMediation(ctx, rel))
 	}
 	report := doctorReport{OK: true, Findings: findings}
 	for _, f := range findings {
@@ -538,58 +544,6 @@ func (d *doctor) checkFleetPackage(ctx context.Context) doctorFinding {
 			"sympozium install --celln-fleet-replace-package   # move the fleet; live parents are lost",
 			fmt.Sprintf("sympozium install --celln-fleet-scope %s --celln-fleet-package-hash %s --celln-fleet-package-image <image> --celln-fleet-publisher <key>   # keep the installed package", publication.Scope, publication.Package),
 		}}
-}
-
-func (d *doctor) checkModelCredentials(ctx context.Context) doctorFinding {
-	const check = "Model credentials"
-	installed, err := d.fleetInstalled(ctx)
-	if err != nil {
-		return failed(check, err)
-	}
-	if !installed {
-		return doctorFinding{Check: check, Status: statusPass, Summary: "no Celln fleet is installed; an install publishes each backend's key"}
-	}
-	facts, err := cellninstall.ReadFleetFacts(ctx, d.client)
-	if err != nil {
-		return failed(check, err)
-	}
-	extra, _, err := cellninstall.ReadExtraBackends(ctx, d.client)
-	if err != nil {
-		return failed(check, err)
-	}
-	var secret corev1.Secret
-	err = d.client.Get(ctx, types.NamespacedName{Namespace: cellnSystemNamespace, Name: cellninstall.FleetModelCredentialSecret}, &secret)
-	if err != nil && !apierrors.IsNotFound(err) {
-		return failed(check, err)
-	}
-	secretMissing := err != nil
-	f := doctorFinding{Check: check, Status: statusPass}
-	backends := append(append([]cellninstall.ExtraBackend{}, facts.InstallBackends...), extra...)
-	for _, b := range backends {
-		if len(secret.Data[b.Name]) != 0 {
-			continue
-		}
-		f.Status = statusFail
-		f.Details = append(f.Details, doctorDetail{
-			Object:  "backend " + b.Name + " (" + b.Provider + "/" + b.Model + ")",
-			Problem: fmt.Sprintf("Secret %s/%s has no key %q, so nodes wait for it and no parent can run on this backend", cellnSystemNamespace, cellninstall.FleetModelCredentialSecret, b.Name),
-			Remedy:  credentialRemedy(b.Name, secretMissing),
-		})
-	}
-	if f.Status == statusPass {
-		f.Summary = fmt.Sprintf("Secret %s/%s carries a key for each of the %d backend(s)", cellnSystemNamespace, cellninstall.FleetModelCredentialSecret, len(backends))
-	} else {
-		f.Summary = fmt.Sprintf("%d of %d backend(s) have no credential", len(f.Details), len(backends))
-	}
-	return f
-}
-
-// credentialRemedy publishes one backend's key without touching the others.
-func credentialRemedy(backend string, secretMissing bool) string {
-	if secretMissing {
-		return fmt.Sprintf("kubectl -n %s create secret generic %s --from-file=%s=/path/to/key", cellnSystemNamespace, cellninstall.FleetModelCredentialSecret, backend)
-	}
-	return fmt.Sprintf(`kubectl -n %s patch secret %s --type=merge -p "{\"data\":{\"%s\":\"$(base64 -w0 </path/to/key)\"}}"`, cellnSystemNamespace, cellninstall.FleetModelCredentialSecret, backend)
 }
 
 func printDoctorReport(out io.Writer, report doctorReport) {

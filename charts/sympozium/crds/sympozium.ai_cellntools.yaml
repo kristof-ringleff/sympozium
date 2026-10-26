@@ -175,7 +175,7 @@ spec:
                         type: integer
                       maxResponseBytes:
                         format: int64
-                        maximum: 4096
+                        maximum: 65536
                         minimum: 1
                         type: integer
                       timeoutMillis:

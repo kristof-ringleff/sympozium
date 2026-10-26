@@ -1,6 +1,7 @@
 package apiserver
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
@@ -58,27 +59,41 @@ func (s *Server) createRunTurn(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	wire, _ := json.Marshal([]string{input.RunUID, input.RequestID})
-	name := fmt.Sprintf("turn-%x", sha256.Sum256(wire))
-	turn, err := cellnparent.NewTurn(run, name, input.Message)
+	turn, code, refusal, err := s.admitTurn(r.Context(), run, input.RequestID, input.Message)
 	if err != nil {
-		http.Error(w, "turn requires bounded text and an enduring run", 400)
+		if refusal != "" {
+			w.Header().Set("X-Sympozium-Turn-Refusal", refusal)
+		}
+		http.Error(w, err.Error(), code)
 		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	writeJSON(w, turn)
+}
+
+// admitTurn records one more turn of an enduring run, or returns the record
+// an identical earlier request created (200). The code is the HTTP status
+// the caller answers with; a parent-readiness refusal also names its reason
+// for the X-Sympozium-Turn-Refusal header.
+func (s *Server) admitTurn(ctx context.Context, run *api.AgentRun, requestID, message string) (*api.AgentRunTurn, int, string, error) {
+	wire, _ := json.Marshal([]string{string(run.UID), requestID})
+	name := fmt.Sprintf("turn-%x", sha256.Sum256(wire))
+	turn, err := cellnparent.NewTurn(run, name, message)
+	if err != nil {
+		return nil, http.StatusBadRequest, "", errors.New("turn requires bounded text and an enduring run")
 	}
 	// A repeated request may observe its original record even if the run later
 	// stopped. It must not create a new record against an inactive parent.
 	var existing api.AgentRunTurn
 	key := client.ObjectKeyFromObject(turn)
-	if err := s.client.Get(r.Context(), key, &existing); err == nil {
+	if err := s.client.Get(ctx, key, &existing); err == nil {
 		if existing.Spec.RunName != turn.Spec.RunName || existing.Spec.RunUID != turn.Spec.RunUID || existing.Spec.Message != turn.Spec.Message || existing.DeletionTimestamp != nil {
-			http.Error(w, "turn identity conflict; reconcile original request", 409)
-			return
+			return nil, http.StatusConflict, "", errors.New("turn identity conflict; reconcile original request")
 		}
-		writeJSON(w, existing)
-		return
+		return &existing, http.StatusOK, "", nil
 	} else if !apierrors.IsNotFound(err) {
-		http.Error(w, "turn storage unavailable", 503)
-		return
+		return nil, http.StatusServiceUnavailable, "", errors.New("turn storage unavailable")
 	}
 	scopedCondition := meta.FindStatusCondition(run.Status.Conditions, "CellnScopedExecution")
 	scopedReady := run.Status.CellnScoped != nil && run.Status.CellnScoped.StartAttempted && run.Status.CellnScoped.ParentIncarnation != "" && run.Status.CellnScoped.NativePhase == "Running" && scopedCondition != nil && scopedCondition.Status == metav1.ConditionTrue && scopedCondition.Reason == "EnduringParentReady" && scopedCondition.ObservedGeneration == run.Generation
@@ -91,20 +106,17 @@ func (s *Server) createRunTurn(w http.ResponseWriter, r *http.Request) {
 		if err := cellnparent.TurnReadiness(run, nil, time.Now().UTC()); err != nil {
 			var refusal *cellnparent.TurnRefusal
 			if errors.As(err, &refusal) {
-				w.Header().Set("X-Sympozium-Turn-Refusal", refusal.Reason)
+				return nil, http.StatusConflict, refusal.Reason, err
 			}
-			http.Error(w, err.Error(), http.StatusConflict)
-			return
+			return nil, http.StatusConflict, "", err
 		}
 	} else {
 		if run.Status.Phase != api.AgentRunPhaseRunning || !scopedReady {
-			http.Error(w, "scoped parent is not ready for subsequent turns", http.StatusConflict)
-			return
+			return nil, http.StatusConflict, cellnparent.TurnRefusedParentNotReady, errors.New("scoped parent is not ready for subsequent turns")
 		}
 		var prior api.AgentRunTurnList
-		if err := s.client.List(r.Context(), &prior, client.InNamespace(run.Namespace), client.Limit(1024)); err != nil {
-			http.Error(w, "turn history unavailable", http.StatusServiceUnavailable)
-			return
+		if err := s.client.List(ctx, &prior, client.InNamespace(run.Namespace), client.Limit(1024)); err != nil {
+			return nil, http.StatusServiceUnavailable, "", errors.New("turn history unavailable")
 		}
 		count := int32(0)
 		for i := range prior.Items {
@@ -113,17 +125,13 @@ func (s *Server) createRunTurn(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if count >= run.Spec.Enduring.MaxTurns-1 {
-			http.Error(w, "parent turn allowance is exhausted", http.StatusConflict)
-			return
+			return nil, http.StatusConflict, "", errors.New("parent turn allowance is exhausted")
 		}
 	}
-	if err := s.client.Create(r.Context(), turn); err != nil {
-		http.Error(w, "turn creation uncertain; query the original request", 409)
-		return
+	if err := s.client.Create(ctx, turn); err != nil {
+		return nil, http.StatusConflict, "", errors.New("turn creation uncertain; query the original request")
 	}
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusAccepted)
-	writeJSON(w, turn)
+	return turn, http.StatusAccepted, "", nil
 }
 
 // cancelRunTurn records intent only. The controller owns delivery and durable

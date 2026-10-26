@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"k8s.io/apimachinery/pkg/util/validation"
+	"net"
 	"net/url"
 	"regexp"
 	"strings"
@@ -31,13 +32,15 @@ type ModelConnectionSpec struct {
 	// Endpoint is an HTTP(S) API base URL or full request URL. Native Celln requires a full HTTPS request URL.
 	// +kubebuilder:validation:MaxLength=2048
 	Endpoint string `json:"endpoint"`
-	// CredentialProfile is an opaque host mapping name, never an API key or file path.
-	// +kubebuilder:validation:Pattern=`^[a-zA-Z0-9_-]{1,64}$`
-	// +optional
-	CredentialProfile string `json:"credentialProfile,omitempty"`
 	// SecretRef selects a Kubernetes credential Secret for container harnesses.
 	// +optional
 	SecretRef string `json:"secretRef,omitempty"`
+	// SecretKey is the key of SecretRef that holds the credential. Omitted,
+	// the protocol fixes it: OPENAI_API_KEY for openai-chat and
+	// ANTHROPIC_API_KEY for anthropic-messages (DefaultSecretKey).
+	// +kubebuilder:validation:Pattern=`^[A-Za-z_][A-Za-z0-9_.-]{0,252}$`
+	// +optional
+	SecretKey string `json:"secretKey,omitempty"`
 	// Models lists the exact model identifiers selectable through this connection.
 	// +kubebuilder:validation:MinItems=1
 	// +kubebuilder:validation:MaxItems=128
@@ -76,12 +79,43 @@ type ModelConnectionSpec struct {
 
 var modelConnectionIdentifier = regexp.MustCompile(`^[a-zA-Z0-9_-]{1,64}$`)
 
+var secretKeyPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_.-]{0,252}$`)
+
+// DefaultSecretKey is the Secret key a protocol's credential is read from
+// when the connection names none.
+func DefaultSecretKey(protocol string) string {
+	if protocol == "anthropic-messages" {
+		return "ANTHROPIC_API_KEY"
+	}
+	return "OPENAI_API_KEY"
+}
+
+// CredentialSecretKey is the Secret key this connection's credential is read
+// from: the one it names, else the protocol's default.
+func (s ModelConnectionSpec) CredentialSecretKey() string {
+	if s.SecretKey != "" {
+		return s.SecretKey
+	}
+	return DefaultSecretKey(s.Protocol)
+}
+
+// Origin is the connection's endpoint origin (scheme://host[:port]), the
+// destination its credential is pinned to. It is the origin whatever the
+// scheme; whether a key may cross plain HTTP is the resolver's and the
+// gateway's rule, not the pin's.
+func (s ModelConnectionSpec) Origin() (string, error) {
+	return ModelEndpointOriginInsecure(s.Endpoint, true)
+}
+
 func (s ModelConnectionSpec) Validate() error {
-	if !modelConnectionIdentifier.MatchString(s.Provider) || (s.CredentialProfile != "" && !modelConnectionIdentifier.MatchString(s.CredentialProfile)) {
-		return fmt.Errorf("provider and host credential profile must be identifiers of 1–64 letters, digits, underscores or hyphens")
+	if !modelConnectionIdentifier.MatchString(s.Provider) {
+		return fmt.Errorf("provider must be an identifier of 1–64 letters, digits, underscores or hyphens")
 	}
 	if s.SecretRef != "" && len(validation.IsDNS1123Subdomain(s.SecretRef)) != 0 {
 		return fmt.Errorf("secretRef must name a Kubernetes Secret in this namespace")
+	}
+	if s.SecretKey != "" && (s.SecretRef == "" || !secretKeyPattern.MatchString(s.SecretKey)) {
+		return fmt.Errorf("secretKey names the key of secretRef and must be a valid Secret key")
 	}
 	if s.Protocol != "openai-chat" && s.Protocol != "anthropic-messages" {
 		return fmt.Errorf("protocol must be openai-chat or anthropic-messages")
@@ -90,24 +124,11 @@ func (s ModelConnectionSpec) Validate() error {
 	if err != nil || len(s.Endpoint) > 2048 || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || strings.ContainsAny(s.Endpoint, "\r\n\x00") {
 		return fmt.Errorf("endpoint must be an HTTP(S) API URL without credentials, query or fragment")
 	}
-	if s.CredentialProfile != "" {
-		if s.SecretRef != "" {
-			return fmt.Errorf("choose a host credential profile or a Kubernetes Secret, not both")
-		}
-		if _, err := ModelEndpointOriginInsecure(s.Endpoint, s.AllowInsecure); err != nil {
-			return err
-		}
-	}
 	if _, err := s.RequestParameters(); err != nil {
 		return err
 	}
 	if err := ValidateRequestOutputTokens(s.MaxOutputTokens); err != nil {
 		return err
-	}
-	if s.CredentialProfile != "" && (s.Parameters != nil || s.MaxOutputTokens != 0) {
-		// A host credential profile is served by the native host broker, which
-		// never reads these fields: refuse instead of silently ignoring policy.
-		return fmt.Errorf("parameters and maxOutputTokens are enforced by the model gateway and cannot be combined with a host credential profile")
 	}
 	if len(s.Models) == 0 || len(s.Models) > 128 {
 		return fmt.Errorf("connection requires 1–128 model identifiers")
@@ -187,9 +208,9 @@ func ModelEndpointOrigin(endpoint string) (string, error) {
 }
 
 // ModelEndpointOriginInsecure returns the egress origin for a model endpoint.
-// The default keeps the public HTTPS transport contract; allowInsecure is an
-// explicit opt-in that also permits HTTP and an explicit port for a private or
-// self-signed endpoint.
+// The default keeps the HTTPS transport contract (an explicit port is fine:
+// the origin, not the port, is what a credential is pinned to); allowInsecure
+// is an explicit opt-in that also permits plain HTTP for a private endpoint.
 func ModelEndpointOriginInsecure(endpoint string, allowInsecure bool) (string, error) {
 	u, err := url.Parse(endpoint)
 	if err != nil || len(endpoint) > 2048 || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || u.Path == "" || strings.ContainsAny(endpoint, "\r\n\x00") {
@@ -199,10 +220,54 @@ func ModelEndpointOriginInsecure(endpoint string, allowInsecure bool) (string, e
 		if u.Scheme != "http" && u.Scheme != "https" {
 			return "", fmt.Errorf("model endpoint must be an HTTP(S) URL")
 		}
-	} else if u.Scheme != "https" || u.Port() != "" {
-		return "", fmt.Errorf("model endpoint must be a complete HTTPS URL without credentials, query, fragment or port")
+	} else if u.Scheme != "https" {
+		return "", fmt.Errorf("model endpoint must be a complete HTTPS URL without credentials, query or fragment")
 	}
-	return u.Scheme + "://" + u.Host, nil
+	return strings.ToLower(u.Scheme + "://" + u.Host), nil
+}
+
+// OriginHost is the host[:port] of an origin or endpoint, lowercased, for
+// matching against an operator's host patterns.
+func OriginHost(origin string) string {
+	u, err := url.Parse(origin)
+	if err != nil {
+		return ""
+	}
+	return strings.ToLower(u.Host)
+}
+
+var originPatternRegexp = regexp.MustCompile(`^(\*\.)?[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*(:[0-9]{1,5})?$`)
+
+// ValidOriginPattern reports whether pattern is an exact lowercase host, with
+// an optional port, or a leading "*." wildcard over one or more labels.
+func ValidOriginPattern(pattern string) bool {
+	return len(pattern) <= 255 && originPatternRegexp.MatchString(pattern)
+}
+
+// OriginMatches reports whether an origin's host matches pattern: the exact
+// host (with its port when the pattern names one), or any subdomain of a
+// "*." pattern. "*.example.com" matches "api.example.com" and "example.com";
+// it never matches "notexample.com".
+func OriginMatches(origin, pattern string) bool {
+	host := OriginHost(origin)
+	if host == "" || !ValidOriginPattern(pattern) {
+		return false
+	}
+	hostname, port := host, ""
+	if h, p, err := net.SplitHostPort(host); err == nil {
+		hostname, port = h, p
+	}
+	patternHost, patternPort := pattern, ""
+	if h, p, err := net.SplitHostPort(pattern); err == nil {
+		patternHost, patternPort = h, p
+	}
+	if patternPort != "" && patternPort != port {
+		return false
+	}
+	if suffix, ok := strings.CutPrefix(patternHost, "*."); ok {
+		return hostname == suffix || strings.HasSuffix(hostname, "."+suffix)
+	}
+	return hostname == patternHost
 }
 
 // +kubebuilder:object:root=true

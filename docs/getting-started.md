@@ -58,21 +58,20 @@ the built-in Ensembles, SkillPacks and policies, the
 (`--no-celln` / `--no-ergoz` skip them). It is idempotent — safe to run again
 to upgrade.
 
-If `DEEPSEEK_API_KEY`, `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` is set (or you
-answer the prompt in a terminal), the same command installs the **Celln
-fleet**: every node with `/dev/kvm` and a kernel under `/boot` runs
-long-running, hardware-isolated agents for every namespace, on any number of
-nodes. On Kind, copy the host kernel into each node first — see
+The same command installs the **Celln fleet**: every node with `/dev/kvm`
+and a kernel under `/boot` runs one-shot and long-running, hardware-isolated
+agents for every namespace, on any number of nodes. The fleet's two
+DaemonSets are privileged (booting micro-VMs needs `/dev/kvm`, `/boot` and
+`/lib/modules`), and the install says so before it proceeds. On Kind, copy
+the host kernel into each node first — see
 [Celln Fleet Installation](guides/celln-fleet-installation.md#prerequisites).
 
-Model access is **mediated** by default: a model gateway (with its own small
-PostgreSQL) holds provider keys, and Celln nodes never do. The key you gave
-becomes the own key of a `starter` Agent in the install namespace; every other
-Agent brings its own key (OpenAI, Anthropic and DeepSeek work out of the box),
-and no two Agents may share one — see
-[Model keys](concepts/security.md#model-keys) and
-[Mediated Model Access](guides/celln-mediated-model-access.md). Pass
-`--no-celln-mediation` to publish the key to the nodes instead.
+Nothing about models is asked. Celln holds no key: each Agent brings its own
+`ModelConnection` (any OpenAI-compatible or Anthropic-compatible endpoint)
+and key, which the model gateway adds to its requests and no node ever
+holds. One key belongs to one Agent and is pinned to the endpoint it was
+created for — see [Model keys](concepts/security.md#model-keys) and
+[Agent-bound model access](guides/celln-mediated-model-access.md).
 
 ---
 
@@ -210,12 +209,11 @@ The web dashboard provides a graphical interface for **all** Sympozium actions:
 
 - **Dashboard** — cluster overview with agent counts, run stats, and recent activity
 - **Agents** — list, create, and delete Agents; choose the execution plane
-  (Kubernetes or Celln), harness runtime and, on the Celln fleet, the
-  **Model backend**
+  (Kubernetes or Celln), harness runtime and the Agent's own model
+  connection and key
 - **Agents → Chat / Harness** — start or resume a persistent conversation:
   an AgentHarness session (Pi, Hermes) or an enduring Celln conversation
-  (with **Answer once** for one-shots and **Restart elsewhere** to continue
-  on another node)
+  (with **Answer once** for one-shots)
 - **Runs** — view all AgentRuns, inspect logs, create new runs
 - **Harnesses** — inspect administrator-approved harness runtimes and advanced
   session state
@@ -604,7 +602,8 @@ kubectl get agentrun quick-check -w   # watch status.phase
 The phase transitions: `Pending` → `Running` → `Succeeded` (or `Failed`).
 
 To run the same task in a hardware-isolated Celln cell instead of a pod, set
-`backend: celln` and select a Celln backend's wrapper Agent and runtime; see
+`backend: celln` on an Agent that has its own `ModelConnection` and a Celln
+runtime wrapper; see
 [Celln Backend](concepts/celln-backend.md#selecting-celln-in-yaml).
 
 ---

@@ -33,13 +33,10 @@ func TestDoctorMediation(t *testing.T) {
 	gateway := func(available int32) client.Object {
 		return &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Namespace: helmNamespace, Name: "sympozium-model-gateway", Generation: 1}, Status: appsv1.DeploymentStatus{ObservedGeneration: 1, AvailableReplicas: available}}
 	}
-	policy := func(routes ...sympoziumv1alpha1.CellnExecutionPolicyRoute) client.Object {
-		return &sympoziumv1alpha1.CellnExecutionPolicy{ObjectMeta: metav1.ObjectMeta{Name: "celln-fleet-starter"}, Spec: sympoziumv1alpha1.CellnExecutionPolicySpec{Routes: append([]sympoziumv1alpha1.CellnExecutionPolicyRoute{
-			{Provider: "deepseek", Protocol: "openai-chat", Models: []string{"deepseek-chat"}, EndpointOrigins: []string{"https://api.deepseek.com"}, Auth: "host-profile"}}, routes...)}}
+	policy := func(allowed, denied []string) client.Object {
+		return &sympoziumv1alpha1.CellnExecutionPolicy{ObjectMeta: metav1.ObjectMeta{Name: "celln-fleet-starter"}, Spec: sympoziumv1alpha1.CellnExecutionPolicySpec{AllowedOrigins: allowed, DeniedOrigins: denied}}
 	}
-	anthropic := sympoziumv1alpha1.CellnExecutionPolicyRoute{Provider: "anthropic", Protocol: "anthropic-messages", Models: []string{"claude-a"}, EndpointOrigins: []string{"https://api.anthropic.com"}, Auth: "secret"}
-	const declared = `{"mediateBackends":false,"routes":[{"provider":"anthropic","protocol":"anthropic-messages","models":["claude-a"],"endpointOrigins":["https://api.anthropic.com"]}]}`
-	const nothing = `{"mediateBackends":false,"routes":[]}`
+	const enabled = `{"enabled":true}`
 	with := func(groups ...[]client.Object) []client.Object {
 		var out []client.Object
 		for _, g := range groups {
@@ -56,23 +53,17 @@ func TestDoctorMediation(t *testing.T) {
 		absent  []string
 	}{
 		{name: "no fleet", status: statusPass, want: []string{"no Celln fleet is installed"}},
-		{name: "disabled", objects: []client.Object{configureDaemonSet()}, status: statusPass, want: []string{"disabled", "ScopedDispatchDisabled"}},
-		{name: "enabled and coherent", objects: with([]client.Object{configureDaemonSet(), record(declared), gateway(1), policy(anthropic)}, defaults), status: statusPass,
-			want: []string{"enabled", "celln-fleet-starter", "anthropic/claude-a (anthropic-messages, auth=secret) at https://api.anthropic.com"}, absent: []string{"AUTH_ROUTE_MISMATCH"}},
-		{name: "enabled without any route", objects: with([]client.Object{configureDaemonSet(), record(nothing), gateway(1), policy()}, defaults), status: statusWarn,
-			want: []string{"Agents with their own key will be refused AUTH_ROUTE_MISMATCH; declare a route with --celln-mediated-route", "sympozium install --celln-fleet"}},
-		{name: "declared but not published", objects: with([]client.Object{configureDaemonSet(), record(declared), gateway(1), policy()}, defaults), status: statusWarn,
-			want: []string{"declared but not in policy celln-fleet-starter yet: anthropic/claude-a", "sympozium celln-mediation apply-routes"}},
-		{name: "backends declared but not published", objects: with([]client.Object{configureDaemonSet(), record(`{"mediateBackends":true,"routes":[]}`), gateway(1), policy()}, defaults), status: statusWarn,
-			want: []string{"celln.mediation.mediateBackends", "apply-routes"}},
-		{name: "a published route outlives its declaration", objects: with([]client.Object{configureDaemonSet(), record(nothing), gateway(1), policy(anthropic)}, defaults), status: statusPass, want: []string{"anthropic/claude-a"}},
-		{name: "no bootstrap", objects: []client.Object{configureDaemonSet(), record(declared), gateway(1), policy(anthropic)}, status: statusFail,
+		{name: "no gateway recorded", objects: []client.Object{configureDaemonSet()}, status: statusFail, want: []string{"records no model gateway", "sympozium install"}},
+		{name: "enabled and coherent, any origin", objects: with([]client.Object{configureDaemonSet(), record(enabled), gateway(1), policy(nil, nil)}, defaults), status: statusPass,
+			want: []string{"enabled", "every Agent brings its own connection and key", "any origin the gateway reaches"}, absent: []string{"AUTH_ROUTE_MISMATCH", "route"}},
+		{name: "enabled and narrowed", objects: with([]client.Object{configureDaemonSet(), record(enabled), gateway(1), policy([]string{"*.openai.com"}, []string{"evil.example"})}, defaults), status: statusPass,
+			want: []string{"only to *.openai.com", "never to evil.example"}},
+		{name: "no bootstrap", objects: []client.Object{configureDaemonSet(), record(enabled), gateway(1), policy(nil, nil)}, status: statusFail,
 			want: []string{"Secret " + helmNamespace + "/celln-mediation-controller", "Secret celln-system/celln-mediation-node", "ConfigMap celln-system/celln-mediation-trust", "sympozium install"}},
-		{name: "bootstrap objects under the release's names", objects: with([]client.Object{configureDaemonSet(), record(declared), gateway(1), policy(anthropic)}, trust("own-controller", "own-gateway", "own-node", "own-trust")),
+		{name: "bootstrap objects under the release's names", objects: with([]client.Object{configureDaemonSet(), record(enabled), gateway(1), policy(nil, nil)}, trust("own-controller", "own-gateway", "own-node", "own-trust")),
 			release: &releaseInfo{Config: map[string]interface{}{"celln": map[string]interface{}{"mediation": map[string]interface{}{"controllerSecret": "own-controller", "gatewaySecret": "own-gateway", "nodeSecret": "own-node", "trustConfigMap": "own-trust"}}}}, status: statusPass, want: []string{"enabled"}},
-		{name: "no gateway", objects: with([]client.Object{configureDaemonSet(), record(declared), policy(anthropic)}, defaults), status: statusFail, want: []string{"deploys no model gateway"}},
-		{name: "gateway not ready", objects: with([]client.Object{configureDaemonSet(), record(declared), gateway(0), policy(anthropic)}, defaults), status: statusFail, want: []string{"sympozium-model-gateway", "not ready", "logs deploy/sympozium-model-gateway"}},
-		{name: "unusable record", objects: with([]client.Object{configureDaemonSet(), record(`{"routes":[{"provider":"openai","protocol":"openai-chat","models":["*","gpt"],"endpointOrigins":["https://api.openai.com"]}]}`)}, defaults), status: statusFail, want: []string{"no other pattern", "celln.mediation.routes"}},
+		{name: "no gateway", objects: with([]client.Object{configureDaemonSet(), record(enabled), policy(nil, nil)}, defaults), status: statusFail, want: []string{"deploys no model gateway"}},
+		{name: "gateway not ready", objects: with([]client.Object{configureDaemonSet(), record(enabled), gateway(0), policy(nil, nil)}, defaults), status: statusFail, want: []string{"sympozium-model-gateway", "not ready", "logs deploy/sympozium-model-gateway"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			d := testDoctor(t, append([]client.Object{kvmNode("node-a")}, tc.objects...)...)
@@ -132,7 +123,7 @@ func TestDoctorMediationCertificateExpiry(t *testing.T) {
 		}
 		return out
 	}
-	record := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: cellnSystemNamespace, Name: cellninstall.MediationRecordConfigMap}, Data: map[string]string{"mediation.json": `{"mediateBackends":true,"routes":[]}`}}
+	record := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Namespace: cellnSystemNamespace, Name: cellninstall.MediationRecordConfigMap}, Data: map[string]string{"mediation.json": `{"enabled":true}`}}
 	gateway := &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Namespace: helmNamespace, Name: "sympozium-model-gateway", Generation: 1}, Status: appsv1.DeploymentStatus{ObservedGeneration: 1, AvailableReplicas: 1}}
 	for _, tc := range []struct {
 		name     string
@@ -140,7 +131,7 @@ func TestDoctorMediationCertificateExpiry(t *testing.T) {
 		status   string
 		want     string
 	}{
-		{name: "the default ten years", validity: cellninstall.DefaultMediationValidity, status: statusWarn /* no route published in this fixture */, want: "celln.mediation.mediateBackends"},
+		{name: "the default ten years", validity: cellninstall.DefaultMediationValidity, status: statusPass, want: "every Agent brings its own connection"},
 		{name: "inside the last 60 days", validity: 30 * 24 * time.Hour, status: statusWarn, want: "mediation certificates expire"},
 		{name: "expired", validity: 30 * time.Minute, status: statusFail, want: "expired"},
 	} {

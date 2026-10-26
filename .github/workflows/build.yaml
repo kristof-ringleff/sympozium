@@ -41,8 +41,6 @@ jobs:
               - 'images/**'
               - 'web/**'
               - '.github/workflows/build.yaml'
-              - '.github/workflows/native-artifacts.yaml'
-              - 'config/host/**'
               - 'config/celln/**'
             web:
               - 'web/**'
@@ -179,19 +177,6 @@ jobs:
           name: cypress-screenshots
           path: web/cypress/screenshots
           if-no-files-found: ignore
-
-  native-artifacts:
-    needs: [changes, verify]
-    if: >-
-      always() && needs.verify.result == 'success' &&
-      (needs.changes.outputs.code == 'true' || github.event_name == 'workflow_dispatch')
-    uses: ./.github/workflows/native-artifacts.yaml
-    permissions:
-      contents: write
-      packages: write
-    with:
-      publish: ${{ github.event_name != 'pull_request' }}
-    secrets: inherit
 
   build-and-push:
     runs-on: ubuntu-latest
