@@ -93,14 +93,9 @@ func TestModelConnectionRequestPolicyValidation(t *testing.T) {
 		{"not an object", `[1]`, 0, false, "JSON object is required"},
 		{"null", `null`, 0, false, "JSON object is required"},
 		{"too large", `{"a":"` + strings.Repeat("x", 250) + `","b":"` + strings.Repeat("x", 250) + `","c":"` + strings.Repeat("x", 250) + `","d":"` + strings.Repeat("x", 250) + `","e":"` + strings.Repeat("x", 250) + `","f":"` + strings.Repeat("x", 250) + `","g":"` + strings.Repeat("x", 250) + `","h":"` + strings.Repeat("x", 250) + `","i":"` + strings.Repeat("x", 250) + `"}`, 0, false, "exceeds 2048"},
-		{"parameters with a host credential profile", `{"seed":1}`, 0, true, "host credential profile"},
-		{"bound with a host credential profile", "", 1024, true, "host credential profile"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			spec := gatewayConnectionSpec()
-			if tc.profile {
-				spec.SecretRef, spec.CredentialProfile = "", "profile"
-			}
 			spec.MaxOutputTokens = tc.tokens
 			if tc.parameters != "" {
 				spec.Parameters = &apiextensionsv1.JSON{Raw: []byte(tc.parameters)}

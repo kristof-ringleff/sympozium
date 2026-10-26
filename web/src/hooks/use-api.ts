@@ -81,11 +81,12 @@ export function useModelConnections() {
   return useQuery({ queryKey: ["model-connections"], queryFn: api.modelConnections.list });
 }
 
-export function useCellnPlatformProfiles(enabled = true) {
-  return useQuery({ queryKey: ["celln-platform-profiles"], queryFn: api.cellnPlatform.profiles, enabled });
+/** pollMs re-reads the profiles, e.g. while waiting for a fleet install to land. */
+export function useCellnPlatformProfiles(enabled = true, pollMs: number | false = false) {
+  return useQuery({ queryKey: ["celln-platform-profiles"], queryFn: api.cellnPlatform.profiles, enabled, refetchInterval: pollMs });
 }
 
-/** Provider routes the operator declared for Agents that bring their own key. */
+/** The namespace's guardrail over an Agent's own model connection: origin globs and approved private origins. */
 export function useCellnMediation(enabled = true) {
   return useQuery({ queryKey: ["celln-mediation"], queryFn: api.cellnPlatform.mediation, enabled, retry: false });
 }

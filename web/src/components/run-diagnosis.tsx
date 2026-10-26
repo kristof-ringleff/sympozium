@@ -18,12 +18,12 @@ const severityStyle = {
 /**
  * The run's diagnosis. Fleet profiles are fetched only for an admission
  * refusal, where they let the explanation name the tool or ceiling at fault,
- * and the declared provider routes only for a route refusal.
+ * and the namespace's origin guardrail only for a route refusal.
  */
 export function useRunDiagnosis(run: AgentRun, turns?: AgentRunTurn[]): Diagnosis | null {
   const base = useMemo(() => diagnoseRun(run, turns), [run, turns]);
   const profiles = useCellnPlatformProfiles(base?.kind === "admission-refused");
-  // The declared routes let a route refusal say whether anything matches.
+  // The policy's origin guardrail lets a route refusal say why the origin was refused.
   const mediation = useCellnMediation(base?.code === "AUTH_ROUTE_MISMATCH");
   return useMemo(() => (profiles.data || mediation.data ? diagnoseRun(run, turns, { profiles: profiles.data, mediation: mediation.data }) : base), [base, profiles.data, mediation.data, run, turns]);
 }

@@ -5,7 +5,6 @@ package main
 import (
 	"context"
 	"flag"
-	"fmt"
 	"os"
 	"time"
 
@@ -24,8 +23,6 @@ import (
 	llmfitv1alpha1 "github.com/sympozium-ai/llmfit-dra/api/v1alpha1"
 
 	sympoziumv1alpha1 "github.com/sympozium-ai/sympozium/api/v1alpha1"
-	"github.com/sympozium-ai/sympozium/internal/cellnparent"
-	"github.com/sympozium-ai/sympozium/internal/cellnreview"
 	"github.com/sympozium-ai/sympozium/internal/cellnscoped"
 	"github.com/sympozium-ai/sympozium/internal/controller"
 	"github.com/sympozium-ai/sympozium/internal/dra"
@@ -57,8 +54,6 @@ func main() {
 	var delegationControllerExecutor bool
 	var watchNamespace string
 	var excludedNamespaces string
-	var parentOnly bool
-	flag.BoolVar(&parentOnly, "celln-parent-only", false, "Run only native Celln parent/turn controllers; requires an explicit watch namespace and parent configuration.")
 
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metric endpoint binds to.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
@@ -76,10 +71,6 @@ func main() {
 			"tool-driven delegation path is unchanged. Also enabled via "+
 			"SYMPOZIUM_DELEGATION_CONTROLLER_EXECUTOR=true.")
 	flag.Parse()
-	if parentOnly && (watchNamespace == "" || os.Getenv("CELLN_PARENT_CONFIG") == "" || os.Getenv("CELLN_PARENT_REGISTRATIONS") == "") {
-		fmt.Fprintln(os.Stderr, "parent-only mode requires an explicit watch namespace, CELLN_PARENT_CONFIG and CELLN_PARENT_REGISTRATIONS")
-		os.Exit(1)
-	}
 
 	// Resolve the image tag used for runtime-spawned pods (agent-runner,
 	// memory-server, MCP servers, channel sidecars). The package-level
@@ -135,14 +126,6 @@ func main() {
 	if err != nil {
 		setupLog.Error(err, "unable to start manager")
 		os.Exit(1)
-	}
-
-	if parentOnly {
-		if err := runParentOnly(mgr, natsURL); err != nil {
-			setupLog.Error(err, "parent-only manager stopped")
-			os.Exit(1)
-		}
-		return
 	}
 
 	// Set up the PodBuilder used by AgentRunReconciler
@@ -201,7 +184,6 @@ func main() {
 	}
 
 	agentRunReconciler := &controller.AgentRunReconciler{
-		ParentConfigPath:             os.Getenv("CELLN_PARENT_CONFIG"),
 		Client:                       mgr.GetClient(),
 		APIReader:                    mgr.GetAPIReader(),
 		Scheme:                       mgr.GetScheme(),
@@ -214,9 +196,10 @@ func main() {
 		DynamicClient:                dynamicClient,
 		Pricing:                      pricingLoader,
 	}
-	// The shared-catalogue native lifecycle path is disabled unless an operator
-	// supplies the complete receiver/gateway/issuer configuration. A malformed
-	// explicit configuration is a startup error, never a legacy fallback.
+	// Celln execution (one-shot and enduring) is disabled unless an operator
+	// supplies the complete receiver/gateway configuration; Celln runs are then
+	// held, never executed another way. A malformed explicit configuration is a
+	// startup error.
 	if configPath := os.Getenv("CELLN_SCOPED_CONFIG"); configPath != "" {
 		dispatcher, err := cellnscoped.LoadDispatcher(configPath, mgr.GetClient(), mgr.GetAPIReader())
 		if err != nil {
@@ -226,33 +209,13 @@ func main() {
 		agentRunReconciler.ScopedDispatcher = dispatcher
 		setupLog.Info("Scoped Celln one-shot and enduring execution enabled")
 	}
-	if configPath := os.Getenv("CELLN_PARENT_REGISTRATIONS"); configPath != "" {
-		dispatcher, err := cellnparent.LoadRegistrationDispatcher(configPath, agentRunReconciler.ParentConfigPath, mgr.GetAPIReader())
-		if err != nil {
-			setupLog.Error(err, "invalid prepared Celln parent admission configuration")
-			os.Exit(1)
-		}
-		agentRunReconciler.ParentAdmission = dispatcher
-	}
-	if configPath := os.Getenv("CELLN_CATALOGUE_CONFIG"); configPath != "" {
-		dispatcher, closeDispatcher, err := cellnreview.LoadRunDispatcher(configPath, mgr.GetClient(), mgr.GetAPIReader())
-		if err != nil {
-			setupLog.Error(err, "invalid Celln catalogue controller configuration")
-			os.Exit(1)
-		}
-		defer closeDispatcher()
-		agentRunReconciler.CatalogueDispatcher = dispatcher
-		setupLog.Info("Celln catalogue execution recovery enabled; new submission requires CELLN_HARNESS_ENABLED=true")
-	}
 	if err := agentRunReconciler.SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "AgentRun")
 		os.Exit(1)
 	}
-	// Follow-up turns are served by whichever enduring path is configured: the
-	// scoped receiver, or the prepared native parent path folded into this
-	// manager (docs/design/celln-single-execution-plane.md).
-	if agentRunReconciler.ScopedDispatcher != nil || agentRunReconciler.ParentAdmission != nil {
-		if err := (&controller.AgentRunTurnReconciler{Client: mgr.GetClient(), APIReader: mgr.GetAPIReader(), ScopedDispatcher: agentRunReconciler.ScopedDispatcher, ParentConfigPath: agentRunReconciler.ParentConfigPath}).SetupWithManager(mgr); err != nil {
+	// Follow-up turns of enduring runs are served by the scoped receiver.
+	if agentRunReconciler.ScopedDispatcher != nil {
+		if err := (&controller.AgentRunTurnReconciler{Client: mgr.GetClient(), APIReader: mgr.GetAPIReader(), ScopedDispatcher: agentRunReconciler.ScopedDispatcher}).SetupWithManager(mgr); err != nil {
 			setupLog.Error(err, "unable to create AgentRunTurn controller")
 			os.Exit(1)
 		}

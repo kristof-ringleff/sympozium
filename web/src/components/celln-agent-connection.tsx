@@ -3,21 +3,19 @@ import { useQueryClient } from "@tanstack/react-query";
 import { api, type Agent, type ModelConnection } from "@/lib/api";
 import { useCellnMediation, useCellnPlatformProfiles, useModelConnections, usePatchAgent } from "@/hooks/use-api";
 import { enduringForOutputTokens, keyChoiceReady, managedSecretName, offersThinkingSwitch, routeForConnection, type KeyChoice } from "@/lib/celln-own-key";
+import { denyingPattern, originStatus } from "@/lib/celln-providers";
 import { DEFAULT_MAX_OUTPUT_TOKENS, parseMaxOutputTokens, parseModelParameters } from "@/lib/model-parameters";
 import { CellnKeyStep } from "@/components/celln-own-key";
 import { CellnModelParametersField, CellnModelParametersSummary } from "@/components/celln-model-parameters";
 import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
 
-function origin(endpoint: string): string {
-  try { return new URL(endpoint).origin; } catch { return endpoint; }
-}
-
 /**
  * The model backend a Celln Agent owns: its provider, model, endpoint and the
  * name of its Secret (never the value), with an edit for the model parameters,
  * the output-token limit and the key. Saving rewrites this Agent's
- * ModelConnection only; no other Agent shares it.
+ * ModelConnection only; no other Agent shares it. The connection is the route;
+ * the namespace's policy is shown only where it would refuse the origin.
  */
 export function CellnAgentConnection({ agent }: { agent: Agent }) {
   const qc = useQueryClient();
@@ -45,23 +43,16 @@ export function CellnAgentConnection({ agent }: { agent: Agent }) {
       </div>
     );
   }
-  if (connection.spec.credentialProfile) {
-    return (
-      <div className="space-y-1 rounded-md border p-3 text-xs text-muted-foreground" data-testid="agent-model-backend">
-        <Label>Model backend</Label>
-        <p>Connection <code>{connection.metadata.name}</code> ({connection.spec.provider} / {execution?.model}) {connection.spec.credentialProfile ? <>uses the fleet's host credential profile <code>{connection.spec.credentialProfile}</code>, not a key of this Agent</> : "carries no key"}. The console no longer manages such backends; create the Agent again with Create Agent → Celln to give it its own key.</p>
-      </div>
-    );
-  }
-
   const model = execution?.model || connection.spec.models[0];
-  const route = mediation.data ? routeForConnection(connection, model, mediation.data.routes, mediation.data.open) : undefined;
+  const route = routeForConnection(connection, model);
+  const origin = route.endpointOrigins[0];
+  const verdict = mediation.data?.enabled ? originStatus(origin, mediation.data) : undefined;
+  const denied = mediation.data ? denyingPattern(origin, mediation.data) : undefined;
   const runtimeRef = agent.spec.runtimeRef || execution?.cellnSelection?.runtimeRef || "";
   const profile = (profiles.data || []).find((candidate) => candidate.wrapper === runtimeRef);
   const parsedParameters = parseModelParameters(parameters);
   const parsedTokens = parseMaxOutputTokens(maxOutputTokens);
-  const secretKey = connection.spec.protocol === "anthropic-messages" ? "ANTHROPIC_API_KEY" : "OPENAI_API_KEY";
-  const keyRoute = route || { provider: connection.spec.provider, protocol: connection.spec.protocol, models: connection.spec.models, endpointOrigins: [origin(connection.spec.endpoint)], secretKey };
+  const secretKey = route.secretKey || (connection.spec.protocol === "anthropic-messages" ? "ANTHROPIC_API_KEY" : "OPENAI_API_KEY");
 
   function startEditing(current: ModelConnection) {
     setParameters(current.spec.parameters && Object.keys(current.spec.parameters).length ? JSON.stringify(current.spec.parameters, null, 2) : "");
@@ -78,6 +69,8 @@ export function CellnAgentConnection({ agent }: { agent: Agent }) {
     setSaving(true);
     setError("");
     // The whole spec is sent again: the API replaces it, and keeps the route.
+    // Its refusals are shown in its own words, in particular the 409 when the
+    // Secret is already pinned to another origin.
     const { parameters: _oldParameters, maxOutputTokens: _oldTokens, secretRef, ...fixed } = current.spec;
     const pasted = replaceKey && key.mode === "create";
     const nextSecret = replaceKey && key.mode === "existing" ? key.secretName : secretRef;
@@ -127,15 +120,25 @@ export function CellnAgentConnection({ agent }: { agent: Agent }) {
       <dl className="grid grid-cols-[8rem_1fr] gap-x-3 gap-y-1 text-xs">
         <dt className="text-muted-foreground">Provider</dt><dd>{connection.spec.provider} <span className="text-muted-foreground">({connection.spec.protocol})</span></dd>
         <dt className="text-muted-foreground">Model</dt><dd className="font-mono">{model}</dd>
-        <dt className="text-muted-foreground">Endpoint origin</dt><dd className="break-all font-mono" title={connection.spec.endpoint}>{origin(connection.spec.endpoint)}</dd>
-        <dt className="text-muted-foreground">Secret</dt><dd>{connection.spec.secretRef ? <><code data-testid="agent-model-backend-secret">{connection.spec.secretRef}</code> <span className="text-muted-foreground">holding {secretKey}; the value is never shown</span></> : "Not required — keyless route"}</dd>
+        <dt className="text-muted-foreground">Endpoint origin</dt><dd className="break-all font-mono" title={connection.spec.endpoint}>{origin}{connection.spec.allowInsecure ? <span className="font-sans text-muted-foreground"> (allowInsecure)</span> : null}</dd>
+        <dt className="text-muted-foreground">Secret</dt><dd>{connection.spec.secretRef ? <><code data-testid="agent-model-backend-secret">{connection.spec.secretRef}</code> <span className="text-muted-foreground">holding {secretKey}, pinned to this origin; the value is never shown</span></> : "Not required — keyless endpoint"}</dd>
         <dt className="text-muted-foreground">Connection</dt><dd><code>{connection.metadata.name}</code></dd>
         <dt className="text-muted-foreground">Parameters</dt><dd>{connection.spec.parameters && Object.keys(connection.spec.parameters).length ? <CellnModelParametersSummary parameters={connection.spec.parameters} testId="agent-model-backend-parameters" /> : <span className="text-muted-foreground">none</span>}</dd>
         <dt className="text-muted-foreground">Max output tokens</dt><dd data-testid="agent-model-backend-tokens">{connection.spec.maxOutputTokens || DEFAULT_MAX_OUTPUT_TOKENS} per request{connection.spec.maxOutputTokens ? "" : " (default)"}</dd>
       </dl>
-      {mediation.data && !route && (
-        <p role="alert" className="text-xs text-red-400" data-testid="agent-model-backend-no-route">
-          {mediation.data.open ? "Open model access covers only public HTTPS endpoints, and no" : "No"} route the operator declared for this namespace matches {connection.spec.provider} / {connection.spec.protocol} / {model} on {origin(connection.spec.endpoint)}{mediation.data.enabled ? "" : " (mediated model access is disabled)"}, so this Agent's runs are refused AUTH_ROUTE_MISMATCH until an operator declares it.
+      {mediation.data && !mediation.data.enabled && (
+        <p role="alert" className="text-xs text-red-400" data-testid="agent-model-backend-mediation-disabled">
+          Mediated model access is disabled on this cluster (no model gateway), so this Agent's requests to {origin} cannot leave a cell and its runs are held.
+        </p>
+      )}
+      {mediation.data && verdict === "denied" && (
+        <p role="alert" className="break-words text-xs text-red-400" data-testid="agent-model-backend-origin-denied">
+          Policy {mediation.data.policies.join(", ") || "for this namespace"} does not admit origin {origin}{denied ? ` (denied pattern ${denied})` : ""}: allowed {mediation.data.allowedOrigins.join(", ") || "any public origin"}; denied {mediation.data.deniedOrigins.join(", ") || "none"}. Runs on this connection are refused AUTH_ROUTE_MISMATCH until the policy admits it.
+        </p>
+      )}
+      {mediation.data && verdict === "needs-approval" && (
+        <p role="alert" className="break-words text-xs text-amber-500" data-testid="agent-model-backend-origin-needs-approval">
+          {origin} is a private, LAN or loopback endpoint. The model gateway reaches it only once an operator adds exactly <code>{origin}</code> to <code>modelGateway.privateOrigins</code>; until then runs on this connection are refused.
         </p>
       )}
       {saved && !editing && <p role="status" className="text-xs text-emerald-400">Saved. Start a new conversation to use it.</p>}
@@ -146,9 +149,9 @@ export function CellnAgentConnection({ agent }: { agent: Agent }) {
             <input type="checkbox" data-testid="agent-model-backend-replace-key" checked={replaceKey} onChange={(e) => setReplaceKey(e.target.checked)} />
             Replace the key
           </label>}
-          {replaceKey && <CellnKeyStep route={keyRoute} value={key} onChange={setKey} managedSecretName={managedSecretName(connection.metadata.name, connection.spec.provider)} />}
+          {replaceKey && <CellnKeyStep route={route} value={key} onChange={setKey} managedSecretName={managedSecretName(connection.metadata.name, connection.spec.provider)} />}
           <p className="text-xs text-amber-500" data-testid="agent-model-backend-route-changed">
-            A conversation already running on this Agent is pinned to the connection as it was. After a change to the parameters, the output-token limit or the Secret it names, the model gateway refuses that conversation's next request (MODEL_ROUTE_CHANGED): start a new conversation. The provider, model and endpoint cannot be edited; create another Agent for those.
+            A conversation already running on this Agent is pinned to the connection as it was. After a change to the parameters, the output-token limit or the Secret it names, the model gateway refuses that conversation's next request (MODEL_ROUTE_CHANGED): start a new conversation. The provider, model and endpoint cannot be edited; create another Agent for those. A key stays pinned to the origin it was first used with: the API refuses to move it elsewhere.
           </p>
           {error && <p role="alert" className="break-words text-xs text-red-400">{error}</p>}
           <div className="flex gap-2">

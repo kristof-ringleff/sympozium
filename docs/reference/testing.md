@@ -51,8 +51,8 @@ into each node first (see
 
 | Script / target | What it proves |
 |-----------------|----------------|
-| `test/integration/test-celln-fleet.sh` | The fleet on multi-node Kind: backends (including one added from the API), one-shot and enduring runs, the toolbox, tenancy, node loss and continuation |
-| `test/integration/test-celln-oneliner.sh` | A bare `sympozium install` brings up the fleet |
+| `test/integration/test-celln-fleet.sh` | The model-free fleet on multi-node Kind: install with no model input, two teams' own connections and keys through the API, a key canary proving each Agent's key and no other reaches the provider, refused key reuse and origin move, the package gate, node loss |
+| `test/integration/test-celln-oneliner.sh` | A bare `sympozium install` brings up the fleet and the gateway; `sympozium doctor` passes |
 | `make test-celln-authorisation-contract` | Namespace-authorisation fixtures (no cluster, no KVM) |
 | `make test-celln-model-budget` | Model-budget accounting against a real PostgreSQL (`DATABASE_URL`) |
 | `make test-celln-model-gateway-live` | The model gateway against a live API server and PostgreSQL |

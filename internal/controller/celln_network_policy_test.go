@@ -16,6 +16,10 @@ import (
 
 // Render the actual chart, then check Kubernetes selector semantics. This is
 // not a substitute for the M0 cross-namespace test on a policy-enforcing CNI.
+// cellnDeploymentTestSettings render the Celln router with explicit backends;
+// a fake digest and endpoints are render fixtures only.
+const cellnDeploymentTestSettings = "celln.enabled=true,celln.allowInsecureHttp=true,celln.tokenSecret=controller-client,celln.router.clientTokenSecret=router-client,celln.router.backendTokenSecret=dispatcher,celln.router.ownershipClaim=owners,celln.router.allowInsecureBackends=true,celln.router.backends[0]=http://node-a:8787,celln.router.backends[1]=http://node-b:8787,celln.router.image.digest=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,celln.capabilityTokenSecret=api-discovery,celln.router.capabilityTokenSecret=router-discovery"
+
 func TestCellnNetworkPolicy(t *testing.T) {
 	if _, err := exec.LookPath("helm"); err != nil {
 		t.Skip("helm required for chart rendering")

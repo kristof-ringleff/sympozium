@@ -13,6 +13,7 @@ import (
 	api "github.com/sympozium-ai/sympozium/api/v1alpha1"
 	"github.com/sympozium-ai/sympozium/internal/cellnplatform"
 	"github.com/sympozium-ai/sympozium/internal/modelconnection"
+	"github.com/sympozium-ai/sympozium/internal/modelkey"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
@@ -248,7 +249,7 @@ func (r PlatformResolver) load(ctx context.Context, runKey types.NamespacedName,
 	if !liveMeta(snapshot.Agent.ObjectMeta, true) || snapshot.Agent.Namespace != runKey.Namespace {
 		return snapshot, deny(ReasonPolicyContracted, "Agent identity is invalid or deleting")
 	}
-	if snapshot.Run.Spec.CellnSelection == nil || snapshot.Run.Spec.Backend != "celln" || snapshot.Run.Spec.Celln != nil {
+	if snapshot.Run.Spec.CellnSelection == nil || snapshot.Run.Spec.Backend != "celln" {
 		return snapshot, deny(ReasonLifecycle, "run must use the explicit Celln catalogue path")
 	}
 	runtimeName := snapshot.Run.Spec.CellnSelection.RuntimeRef
@@ -275,20 +276,33 @@ func (r PlatformResolver) load(ctx context.Context, runKey types.NamespacedName,
 	if len(selection.ToolRefs) != 0 || len(selection.ClusterToolRefs) > 24 {
 		return snapshot, deny(ReasonPolicyContracted, "shared catalogue resolution cannot mix legacy namespaced tools")
 	}
+	// One List serves every selected tool: the resolver reads through the
+	// uncached API reader, and a toolbox selects two dozen tools, so a Get per
+	// tool (taken twice per resolution) was most of a two-second admission.
+	var tools api.ClusterCellnToolList
+	if len(selection.ClusterToolRefs) > 0 {
+		if err := r.Reader.List(ctx, &tools); err != nil {
+			return snapshot, deny(ReasonToolUnknown, "cluster tools unavailable: %v", err)
+		}
+	}
+	byName := make(map[string]*api.ClusterCellnTool, len(tools.Items))
+	for i := range tools.Items {
+		byName[tools.Items[i].Name] = &tools.Items[i]
+	}
 	seen := map[string]bool{}
 	for _, ref := range selection.ClusterToolRefs {
 		if ref.Name == "" || ref.Revision == "" || seen[ref.Name] {
 			return snapshot, deny(ReasonToolOrder, "cluster tool refs require unique names and exact revisions")
 		}
 		seen[ref.Name] = true
-		var tool api.ClusterCellnTool
-		if err := r.Reader.Get(ctx, types.NamespacedName{Name: ref.Name}, &tool); err != nil {
-			return snapshot, deny(ReasonToolUnknown, "cluster tool %q unavailable: %v", ref.Name, err)
+		tool, ok := byName[ref.Name]
+		if !ok {
+			return snapshot, deny(ReasonToolUnknown, "cluster tool %q unavailable: not found", ref.Name)
 		}
 		if !liveMeta(tool.ObjectMeta, true) || tool.Namespace != "" || tool.Spec.Revision != ref.Revision {
 			return snapshot, deny(ReasonToolUnknown, "cluster tool %q revision changed", ref.Name)
 		}
-		snapshot.Tools = append(snapshot.Tools, tool)
+		snapshot.Tools = append(snapshot.Tools, *tool)
 	}
 
 	var policies api.CellnExecutionPolicyList
@@ -357,8 +371,15 @@ func evaluatePlatform(s platformSnapshot, request PlatformResolveRequest) (*Plat
 	} else if modelRequired {
 		lifecycle = "harness-one-shot"
 	}
+	// A one-shot with a model on a native (fleet) profile is a single-turn
+	// parent: the fleet's worker only runs as a parent's turn, so the run is
+	// issued as an enduring parent with one turn and a lease covering it, and
+	// the controller stops the parent once that turn has answered. The policy
+	// still admits it as a harness-one-shot.
+	singleTurnParent := lifecycle == "harness-one-shot" && s.Profile.Spec.Native != nil
+	parentShape := lifecycle == "enduring" || singleTurnParent
 	profileLifecycle := "disposable-one-shot"
-	if lifecycle == "enduring" {
+	if parentShape {
 		profileLifecycle = "enduring"
 	}
 	if err := validateRuntimeProfile(s.Profile, profileLifecycle); err != nil {
@@ -401,6 +422,12 @@ func evaluatePlatform(s platformSnapshot, request PlatformResolveRequest) (*Plat
 	// refused here rather than later as an unexplained invalid turn.
 	if int64(len(s.Run.Spec.Task.GetPrompt())) > min(runtimeLimits.TaskBytes, api.MaxConversationMessageBytes) {
 		return nil, deny(ReasonLimitRange, "task exceeds effective runtime limit")
+	}
+	// The persona travels into the cell as the harness's system prompt, which
+	// the native harness bounds; refused here with a reason rather than in
+	// the cell as an unexplained invalid configuration.
+	if !api.ValidCellnSystemPrompt(s.Run.Spec.SystemPrompt) {
+		return nil, deny(ReasonLimitRange, "system prompt exceeds the cell's bound of %d bytes", api.MaxCellnSystemPromptBytes)
 	}
 
 	// A toolbox runtime's closure lends exactly its recorded tools in that
@@ -450,13 +477,12 @@ func evaluatePlatform(s platformSnapshot, request PlatformResolveRequest) (*Plat
 	if err != nil {
 		return nil, err
 	}
-	// A host-profile route runs on the node's own broker. A mediated route
-	// runs on the scoped receiver, which serves the same starter toolbox
-	// (ScopedArtifactsV2: all six run-data operations, one-shot and enduring;
-	// ScopedHTTPS: the public-only web tools) once the node advertises it.
-	// Either way the broker rides the model transport: a model-free run has
-	// none, so it cannot carry brokered tools.
-	if route.Auth != "host-profile" && route.Provider == "none" {
+	// The scoped receiver serves the starter toolbox (ScopedArtifactsV2: all
+	// six run-data operations, one-shot and enduring; ScopedHTTPS: the
+	// public-only web tools) once the node advertises it. The broker rides
+	// the model transport: a model-free run has none, so it cannot carry
+	// brokered tools.
+	if route.Provider == "none" {
 		for _, tool := range tools {
 			if tool.Limits.Artifacts != nil || tool.Limits.HTTPS != nil {
 				return nil, deny(ReasonRouteMismatch, "brokered tool %q requires a model route", tool.Name)
@@ -506,7 +532,7 @@ func evaluatePlatform(s platformSnapshot, request PlatformResolveRequest) (*Plat
 		}
 		parent = &ParentBinding{Incarnation: request.ParentIncarnation, TurnID: &turnID}
 		payload = s.Turn.Spec.Message
-	} else if lifecycle == "enduring" {
+	} else if parentShape {
 		if operation != "execution.start" || !hashPattern.MatchString(request.ParentIncarnation) {
 			return nil, deny(ReasonParentTurn, "enduring parent start requires its persisted incarnation")
 		}
@@ -515,7 +541,7 @@ func evaluatePlatform(s platformSnapshot, request PlatformResolveRequest) (*Plat
 		return nil, deny(ReasonLifecycle, "one-shot resolution only permits execution.start")
 	}
 
-	budget, err := resolveBudget(s, request, modelRequired, runtimeLimits)
+	budget, err := resolveBudget(s, request, modelRequired, singleTurnParent, runtimeLimits)
 	if err != nil {
 		return nil, err
 	}
@@ -534,7 +560,7 @@ func evaluatePlatform(s platformSnapshot, request PlatformResolveRequest) (*Plat
 		APIVersion: PlatformDecisionAPIVersion, Kind: "CellnAuthorisationDecision", ClusterID: request.ClusterID,
 		Run:       RunBinding{Namespace: s.Run.Namespace, NamespaceUID: string(s.Namespace.UID), Name: s.Run.Name, UID: string(s.Run.UID), SpecSHA256: runDigest},
 		Subject:   SubjectBinding{Kind: "AgentRun", Namespace: s.Run.Namespace, Name: s.Run.Name, UID: string(s.Run.UID), SpecSHA256: runDigest},
-		Operation: operation, Lifecycle: decisionLifecycle(lifecycle, s.Turn != nil), Parent: parent,
+		Operation: operation, Lifecycle: decisionLifecycle(parentShape, s.Turn != nil), Parent: parent,
 		Runtime: RuntimeBinding{Name: s.Runtime.Name, UID: string(s.Runtime.UID), Revision: s.Profile.Spec.Revision, SpecSHA256: runtimeDigest},
 		Agent:   SubjectBinding{Kind: "Agent", Namespace: s.Agent.Namespace, Name: s.Agent.Name, UID: string(s.Agent.UID), SpecSHA256: agentDigest},
 		Policy:  policyBinding, Tools: tools, Route: route, Budget: budget,
@@ -560,12 +586,12 @@ func resolveDecisionRoute(s platformSnapshot, required bool) (DecisionRouteBindi
 		return empty, deny(ReasonRouteMismatch, "model-using execution requires a namespaced ModelConnection and model")
 	}
 	c := s.Connection
-	if err := c.Spec.Validate(); err != nil || c.Spec.Disabled || c.DeletionTimestamp != nil || !slices.Contains(c.Spec.Models, s.Run.Spec.Model.Model) {
+	if err := c.Spec.Validate(); err != nil || c.Spec.Disabled || c.DeletionTimestamp != nil || s.Run.Spec.Model.Model == api.CellnAnyModel || !slices.Contains(c.Spec.Models, s.Run.Spec.Model.Model) {
 		return empty, deny(ReasonRouteMismatch, "model connection is disabled, incompatible, or does not list the model")
 	}
 	// The controller persists the connection's own route into spec.model when it
 	// freezes the run; values that mirror the connection are not overrides.
-	if s.Run.Spec.Model.Provider != "" && s.Run.Spec.Model.Provider != c.Spec.Provider || s.Run.Spec.Model.BaseURL != "" && s.Run.Spec.Model.BaseURL != c.Spec.Endpoint || s.Run.Spec.Model.Protocol != "" && s.Run.Spec.Model.Protocol != c.Spec.Protocol || s.Run.Spec.Model.AuthSecretRef != "" || s.Run.Spec.Model.CredentialProfile != "" && s.Run.Spec.Model.CredentialProfile != c.Spec.CredentialProfile || s.Run.Spec.Model.ModelRef != "" || s.Run.Spec.Model.AllowInsecure && !c.Spec.AllowInsecure || len(s.Run.Spec.Model.ProviderHeaders) != 0 || s.Run.Spec.Model.ProviderHeadersSecretRef != "" || len(s.Run.Spec.Model.NodeSelector) != 0 || (s.Run.Spec.Model.Thinking != "" && s.Run.Spec.Model.Thinking != "off") {
+	if s.Run.Spec.Model.Provider != "" && s.Run.Spec.Model.Provider != c.Spec.Provider || s.Run.Spec.Model.BaseURL != "" && s.Run.Spec.Model.BaseURL != c.Spec.Endpoint || s.Run.Spec.Model.Protocol != "" && s.Run.Spec.Model.Protocol != c.Spec.Protocol || s.Run.Spec.Model.AuthSecretRef != "" || s.Run.Spec.Model.ModelRef != "" || s.Run.Spec.Model.AllowInsecure && !c.Spec.AllowInsecure || len(s.Run.Spec.Model.ProviderHeaders) != 0 || s.Run.Spec.Model.ProviderHeadersSecretRef != "" || len(s.Run.Spec.Model.NodeSelector) != 0 || (s.Run.Spec.Model.Thinking != "" && s.Run.Spec.Model.Thinking != "off") {
 		return empty, deny(ReasonRouteMismatch, "inline model authority or route override is forbidden")
 	}
 	auth := "none"
@@ -573,59 +599,29 @@ func resolveDecisionRoute(s platformSnapshot, required bool) (DecisionRouteBindi
 		auth = "secret"
 		// The run author names the connection; the Agent owner grants the key.
 		// Without this a run could borrow any Secret-backed connection in its
-		// namespace, a credential its Agent was never given.
-		if !agentGrantsConnectionSecret(s.Agent, c) {
+		// namespace, a credential its Agent was never given. The controller's
+		// claim and the API apply the same rule (modelkey.GrantsConnection).
+		if !modelkey.GrantsConnection(&s.Agent, c) {
 			return empty, deny(ReasonRouteMismatch, "Agent %q does not grant the model connection's Secret; add it to the Agent's authRefs or select the connection in the Agent's execution defaults", s.Agent.Name)
 		}
 	}
-	if c.Spec.CredentialProfile != "" {
-		// An owner-installed credential profile is an explicit operator route
-		// (policy auth "host-profile"), never tenant custody: the runtime
-		// profile's native material names the only profile a wrapper may use.
-		if s.Profile.Spec.Native == nil || s.Profile.Spec.Native.CredentialProfile != c.Spec.CredentialProfile {
-			return empty, deny(ReasonRouteMismatch, "host credential profile is not the runtime profile's installed model credential")
-		}
-		auth = "host-profile"
-	}
-	var origin string
-	var err error
-	if auth != "none" {
-		origin, err = api.ModelEndpointOriginInsecure(c.Spec.Endpoint, c.Spec.AllowInsecure)
-		// A cluster Secret never crosses plain HTTP. A host-profile credential
-		// stays on the node and the operator approved this insecure endpoint
-		// when configuring the node's model profile (e.g. a LAN llama-server).
-		if err == nil && !strings.HasPrefix(strings.ToLower(origin), "https://") && !(auth == "host-profile" && c.Spec.AllowInsecure) {
-			err = fmt.Errorf("credential-bearing model endpoint must use HTTPS")
-		}
-	} else {
-		origin, err = api.ModelEndpointOriginInsecure(c.Spec.Endpoint, c.Spec.AllowInsecure)
-	}
+	origin, err := api.ModelEndpointOriginInsecure(c.Spec.Endpoint, c.Spec.AllowInsecure)
 	if err != nil {
 		return empty, deny(ReasonRouteMismatch, "%v", err)
 	}
-	// An Agent's own route to a public HTTPS endpoint (its own key, or none)
-	// needs no declared entry under open model access: the gateway still dials
-	// only public addresses for it. Host-profile credentials, plain HTTP and
-	// private origins are operator authority and always need an exact route.
-	public := auth != "host-profile" && strings.HasPrefix(strings.ToLower(origin), "https://") && !c.Spec.AllowInsecure
+	// A cluster Secret never crosses plain HTTP.
+	if auth == "secret" && !strings.HasPrefix(strings.ToLower(origin), "https://") {
+		return empty, deny(ReasonRouteMismatch, "credential-bearing model endpoint must use HTTPS")
+	}
+	// The Agent's connection is the route: its own key (or none) goes to the
+	// origin it names. The policy may narrow where, by host pattern; it never
+	// has to list a provider for a key to work.
 	for _, policy := range s.Policies {
-		allowed := public && policy.Spec.OpenModelAccess()
-		for _, candidate := range policy.Spec.Routes {
-			if allowed {
-				break
+		if ok, denied := policy.Spec.AdmitsOrigin(origin); !ok {
+			if denied != "" {
+				return empty, deny(ReasonRouteMismatch, "policy %q denies model requests to %s (%s)", policy.Name, origin, denied)
 			}
-			// A plain-HTTP origin needs the operator's approval on the policy
-			// route itself, not only on the tenant's connection. Origins are
-			// always exact; the model is exact unless the route admits any
-			// model (["*"]), and the decision binds the concrete model either way.
-			insecureApproved := strings.HasPrefix(strings.ToLower(origin), "https://") || candidate.AllowInsecure
-			if candidate.Provider == c.Spec.Provider && candidate.Protocol == c.Spec.Protocol && candidate.Auth == auth && insecureApproved && candidate.AllowsModel(s.Run.Spec.Model.Model) && slices.Contains(candidate.EndpointOrigins, origin) {
-				allowed = true
-				break
-			}
-		}
-		if !allowed {
-			return empty, deny(ReasonRouteMismatch, "policy %q does not permit the exact model route", policy.Name)
+			return empty, deny(ReasonRouteMismatch, "policy %q allows model requests only to %s, not %s", policy.Name, strings.Join(policy.Spec.AllowedOrigins, ", "), origin)
 		}
 	}
 	uid := string(c.UID)
@@ -644,30 +640,9 @@ func resolveDecisionRoute(s platformSnapshot, required bool) (DecisionRouteBindi
 	}
 	route := DecisionRouteBinding{ModelConnectionUID: &uid, ModelConnectionSpecSHA256: specDigest, Provider: c.Spec.Provider, Protocol: c.Spec.Protocol, Model: s.Run.Spec.Model.Model, EndpointOrigin: origin, Auth: auth}
 	if auth == "secret" {
-		secretKey := "OPENAI_API_KEY"
-		if c.Spec.Protocol == "anthropic-messages" {
-			secretKey = "ANTHROPIC_API_KEY"
-		}
-		route.CredentialSourceRef = &CredentialSourceRef{Kind: "Secret", SecretName: c.Spec.SecretRef, SecretKey: secretKey}
+		route.CredentialSourceRef = &CredentialSourceRef{Kind: "Secret", SecretName: c.Spec.SecretRef, SecretKey: c.Spec.CredentialSecretKey()}
 	}
 	return route, nil
-}
-
-// agentGrantsConnectionSecret is the Agent-owned allow-list applied to a
-// Secret-backed connection, the same rule the pod and harness paths apply to
-// spec.model.authSecretRef: the Secret is listed in the Agent's authRefs (an
-// empty provider grants it for any provider), or the Agent's own execution
-// defaults select this connection, which is the Agent owner naming it.
-func agentGrantsConnectionSecret(agent api.Agent, connection *api.ModelConnection) bool {
-	if execution := agent.Spec.Execution; execution != nil && execution.ModelConnectionRef != "" && execution.ModelConnectionRef == connection.Name {
-		return true
-	}
-	for _, ref := range agent.Spec.AuthRefs {
-		if ref.Secret == connection.Spec.SecretRef && (ref.Provider == "" || strings.EqualFold(ref.Provider, connection.Spec.Provider)) {
-			return true
-		}
-	}
-	return false
 }
 
 // mediatedRequestOutputTokens is the per-request output bound a gateway-mediated
@@ -678,7 +653,7 @@ func agentGrantsConnectionSecret(agent api.Agent, connection *api.ModelConnectio
 // derived from the connection spec alone, which the decision binds by digest,
 // so every turn of a run derives the same value.
 func mediatedRequestOutputTokens(connection *api.ModelConnection) int64 {
-	if connection == nil || connection.Spec.CredentialProfile != "" {
+	if connection == nil {
 		return 0
 	}
 	if bound := connection.Spec.RequestOutputTokens(); bound != api.DefaultRequestOutputTokens {
@@ -704,11 +679,11 @@ func mediatedTurnAllowance(s platformSnapshot) (requests, outputTokens int64, ok
 	return requests, requests * bound, true
 }
 
-// OneShotParentGraceSeconds is added to a native one-shot's turn allowance so
-// the parent's lease also covers its admission and startup.
-const OneShotParentGraceSeconds int64 = 120
+// SingleTurnParentGraceSeconds is added to a single-turn parent's turn
+// allowance so its lease also covers admission and startup.
+const SingleTurnParentGraceSeconds int64 = 120
 
-func resolveBudget(s platformSnapshot, request PlatformResolveRequest, modelRequired bool, runtime api.AgentRuntimeCellnLimits) (DecisionBudgetBinding, error) {
+func resolveBudget(s platformSnapshot, request PlatformResolveRequest, modelRequired, singleTurnParent bool, runtime api.AgentRuntimeCellnLimits) (DecisionBudgetBinding, error) {
 	ceilings := s.Policies[0].Spec.Ceilings
 	for _, policy := range s.Policies[1:] {
 		ceilings.MaxTurns = min(ceilings.MaxTurns, policy.Spec.Ceilings.MaxTurns)
@@ -745,10 +720,10 @@ func resolveBudget(s platformSnapshot, request PlatformResolveRequest, modelRequ
 		turnSeconds = min(turnSeconds, max(int64(1), int64(s.Run.Spec.Timeout.Duration/time.Second)))
 	}
 	turnDeadline := request.Now.Unix() + turnSeconds
-	if s.Run.Spec.ExecutionLifecycle != "enduring" && modelRequired && s.Profile.Spec.Native != nil {
-		// A native one-shot is a single-turn parent: its lease covers parent
-		// admission plus the one turn, within the policy's parent ceiling.
-		lease := min(ceilings.MaxParentLeaseSeconds, turnSeconds+OneShotParentGraceSeconds)
+	if singleTurnParent {
+		// One turn, and a lease that covers admission plus that turn, within
+		// the policy's parent ceiling. The run's whole budget is that turn's.
+		lease := min(ceilings.MaxParentLeaseSeconds, turnSeconds+SingleTurnParentGraceSeconds)
 		parentDeadline = request.Now.Unix() + lease
 	}
 	turnCap := runCap
@@ -782,6 +757,9 @@ func resolveBudget(s platformSnapshot, request PlatformResolveRequest, modelRequ
 		}
 		turnCap.Requests = min(turnCap.Requests, original.TurnCap.Requests)
 		turnCap.OutputTokens = min(turnCap.OutputTokens, original.TurnCap.OutputTokens)
+	}
+	if singleTurnParent {
+		runCap = turnCap
 	}
 	return DecisionBudgetBinding{BudgetID: budgetID, RunCap: runCap, TurnCap: turnCap, MaxTurns: maxTurns, ParentDeadlineUnix: parentDeadline, TurnDeadlineUnix: turnDeadline}, nil
 }
@@ -961,8 +939,8 @@ func decisionTool(tool api.ClusterCellnTool, limits api.CellnToolLimits) Decisio
 	return DecisionToolBinding{Name: tool.Name, Revision: tool.Spec.Revision, Hash: tool.Spec.Executable.Hash, Limits: DecisionToolLimits{TimeoutMillis: limits.TimeoutMillis, MemoryBytes: limits.MemoryBytes, ArgumentBytes: limits.ArgumentBytes, OutputBytes: limits.OutputBytes, Workspace: limits.Workspace, Effects: limits.Effects, Artifacts: limits.Artifacts.DeepCopy(), HTTPS: limits.HTTPS.DeepCopy()}}
 }
 
-func decisionLifecycle(lifecycle string, turn bool) string {
-	if lifecycle != "enduring" {
+func decisionLifecycle(parentShape bool, turn bool) string {
+	if !parentShape {
 		return "one-shot"
 	}
 	if turn {

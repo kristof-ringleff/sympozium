@@ -36,7 +36,7 @@ func TestSharedCatalogueDisabledStopsBeforeLegacyModelAndOCIPaths(t *testing.T) 
 		t.Fatal(err)
 	}
 	condition := meta.FindStatusCondition(current.Status.Conditions, "CellnScopedExecution")
-	if condition == nil || condition.Reason != "ScopedDispatchDisabled" || current.Status.JobName != "" || current.Status.CellnActionID != "" || current.Status.CellnIssuance != nil {
+	if condition == nil || condition.Reason != "ScopedDispatchDisabled" || current.Status.JobName != "" || current.Status.CellnIssuance != nil {
 		t.Fatalf("shared selection escaped fail-closed boundary: status=%#v", current.Status)
 	}
 	var jobs batchv1.JobList
@@ -57,36 +57,29 @@ func TestLegacyNamespacedCatalogueSelectionIsNotMisrepresentedAsScoped(t *testin
 	}
 }
 
-func TestLegacyEnduringSelectionReachesParentDispatcherWithoutScopedReceiver(t *testing.T) {
+// Every enduring catalogue selection is scoped, whether or not a receiver is
+// configured: an unconfigured receiver holds the run (ScopedDispatchDisabled)
+// rather than letting it reach another execution plane.
+func TestEnduringSelectionIsAlwaysScoped(t *testing.T) {
 	legacy := &api.AgentRun{Spec: api.AgentRunSpec{ExecutionLifecycle: "enduring", CellnSelection: &api.CellnCatalogueSelection{RuntimeRef: "celln-native", ToolRefs: []api.CellnCatalogueToolRef{{Name: "workspace-read", Revision: "v1"}}}}}
 	shared := &api.AgentRun{Spec: api.AgentRunSpec{ExecutionLifecycle: "enduring", CellnSelection: &api.CellnCatalogueSelection{ClusterToolRefs: []api.ClusterCellnToolRef{{Name: "shared-tool", Revision: "v1"}}}}}
-	prepared := &AgentRunReconciler{ParentAdmission: stubParentAdmission{}}
-	if scoped, err := prepared.sharedCatalogueSelected(context.Background(), legacy); err != nil || scoped {
-		t.Fatalf("legacy enduring selection held although the parent path is prepared: scoped=%v err=%v", scoped, err)
-	}
-	if scoped, err := prepared.sharedCatalogueSelected(context.Background(), shared); err != nil || !scoped {
-		t.Fatalf("shared enduring intent reached namespace-grant issuance: scoped=%v err=%v", scoped, err)
-	}
-	platform := &AgentRunReconciler{ParentAdmission: stubParentAdmission{platform: true}}
-	for name, run := range map[string]*api.AgentRun{"legacy": legacy, "shared": shared} {
-		if scoped, err := platform.sharedCatalogueSelected(context.Background(), run); err != nil || scoped {
-			t.Fatalf("%s: platform-capable admission did not take the enduring selection: scoped=%v err=%v", name, scoped, err)
-		}
-	}
 	for name, r := range map[string]*AgentRunReconciler{
 		"nothing-configured": {},
-		"scoped-receiver":    {ScopedDispatcher: &cellnscoped.Dispatcher{}, ParentAdmission: stubParentAdmission{platform: true}},
+		"scoped-receiver":    {ScopedDispatcher: &cellnscoped.Dispatcher{}},
 	} {
-		if scoped, err := r.sharedCatalogueSelected(context.Background(), legacy); err != nil || !scoped {
-			t.Fatalf("%s: enduring selection escaped to legacy issuance: scoped=%v err=%v", name, scoped, err)
+		for kind, run := range map[string]*api.AgentRun{"legacy": legacy, "shared": shared} {
+			if scoped, err := r.sharedCatalogueSelected(context.Background(), run); err != nil || !scoped {
+				t.Fatalf("%s/%s: enduring selection escaped the scoped path: scoped=%v err=%v", name, kind, scoped, err)
+			}
 		}
 	}
+	// A run the removed native parent plane bound stays off the scoped path.
+	parentBound := shared.DeepCopy()
+	parentBound.Status.CellnParent = &api.CellnParentStatus{}
+	if scoped, err := (&AgentRunReconciler{}).sharedCatalogueSelected(context.Background(), parentBound); err != nil || scoped {
+		t.Fatalf("parent-bound run moved to the scoped receiver: scoped=%v err=%v", scoped, err)
+	}
 }
-
-type stubParentAdmission struct{ platform bool }
-
-func (stubParentAdmission) Admit(context.Context, types.NamespacedName) error { return nil }
-func (s stubParentAdmission) SupportsPlatform() bool                          { return s.platform }
 
 func TestScopedTerminalRetainsFinalizerWhenCleanupIsUnconfirmed(t *testing.T) {
 	run := &api.AgentRun{

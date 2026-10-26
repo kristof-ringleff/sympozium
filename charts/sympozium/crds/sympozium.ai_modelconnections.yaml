@@ -46,11 +46,6 @@ spec:
                   address. This is an explicit operator opt-in that weakens the default
                   public-HTTPS transport contract. It never bypasses host admission.
                 type: boolean
-              credentialProfile:
-                description: CredentialProfile is an opaque host mapping name, never
-                  an API key or file path.
-                pattern: ^[a-zA-Z0-9_-]{1,64}$
-                type: string
               disabled:
                 description: Disabled prevents new connection resolution. Host profile
                   withdrawal stops live use.
@@ -103,6 +98,13 @@ spec:
                 description: Provider is a descriptive provider identifier, including
                   custom providers.
                 pattern: ^[a-zA-Z0-9_-]{1,64}$
+                type: string
+              secretKey:
+                description: |-
+                  SecretKey is the key of SecretRef that holds the credential. Omitted,
+                  the protocol fixes it: OPENAI_API_KEY for openai-chat and
+                  ANTHROPIC_API_KEY for anthropic-messages (DefaultSecretKey).
+                pattern: ^[A-Za-z_][A-Za-z0-9_.-]{0,252}$
                 type: string
               secretRef:
                 description: SecretRef selects a Kubernetes credential Secret for

@@ -3,7 +3,7 @@
 // and browser-only — it reads nothing the API has not already returned, and it
 // is the single source for failure wording in the console.
 import type { AgentRun, AgentRunTurn, CellnMediation, CellnPlatformProfile, Condition } from "@/lib/api";
-import { routeAllowsModel, routeModelsLabel } from "./celln-routes";
+import { denyingPattern, originStatus, type OriginStatus } from "./celln-providers";
 
 export type DiagnosisSeverity = "error" | "warning" | "info";
 
@@ -129,7 +129,7 @@ interface AuthFacts {
   /** Tools the run borrows that the fleet profile does not lend. */
   unknownTools: string[];
   profile?: CellnPlatformProfile;
-  /** What the run asked for, and what the operator declared, for AUTH_ROUTE_MISMATCH. */
+  /** What the run asked for, and what the namespace's policy says of its origin, for AUTH_ROUTE_MISMATCH. */
   route?: RouteFacts;
 }
 
@@ -139,10 +139,19 @@ interface RouteFacts {
   model: string;
   origin: string;
   connection: string;
-  /** Known only once the namespace's declared routes were read. */
-  declared?: boolean;
+  /** Known only once the namespace's policy was read (api.cellnPlatform.mediation). */
+  originStatus?: OriginStatus;
+  /** The denied pattern that refused the origin, if one did. */
+  deniedBy?: string;
   mediationEnabled?: boolean;
-  offered: string[];
+  policies: string[];
+  allowedOrigins: string[];
+  deniedOrigins: string[];
+}
+
+/** The policy's origin lists, for people. */
+function originLists(route: RouteFacts): string {
+  return `allowed: ${route.allowedOrigins.length ? route.allowedOrigins.join(", ") : "any public origin"}; denied: ${route.deniedOrigins.length ? route.deniedOrigins.join(", ") : "none"}`;
 }
 
 /**
@@ -207,17 +216,21 @@ export const AUTH_REASONS: Record<string, AuthEntry> = {
     cause: ({ detail, route }) => {
       const asked = route ? `${route.provider} (${route.protocol}), model ${route.model || "unset"}, on ${route.origin || "an unreadable endpoint"}` : "";
       if (/does not grant the model connection's Secret/i.test(detail)) return `The run names model connection ${route?.connection || "of another owner"}, whose Secret this Agent was not given: ${detail}.`;
-      if (route?.declared === false) return `The run asks for ${asked}, and no route an operator declared for this namespace matches it exactly${route.mediationEnabled === false ? " (mediated model access is disabled on this cluster)" : ""}. ${route.offered.length ? `Declared: ${route.offered.join("; ")}.` : "No provider is declared for this namespace."}`;
+      if (route?.originStatus === "denied") return `The run asks for ${asked}, and the namespace's policy (${route.policies.join(", ") || "its execution policy"}) does not admit origin ${route.origin}${route.deniedBy ? `: it matches the denied pattern ${route.deniedBy}` : ""} (${originLists(route)})${route.mediationEnabled === false ? "; mediated model access is also disabled on this cluster" : ""}.`;
+      if (route?.originStatus === "needs-approval") return `The run asks for ${asked}; ${route.origin} is a private, LAN or loopback endpoint, and the model gateway carries an Agent's key there only once an operator approves exactly that origin (modelGateway.privateOrigins)${route.mediationEnabled === false ? "; mediated model access is also disabled on this cluster" : ""}.`;
       if (detail) return `The run's model route is not one the policy permits: ${detail}.`;
-      return route?.declared
-        ? `The run asks for ${asked}, which an operator declared, so the route itself is allowed. What is left: the connection ${route.connection} is disabled, invalid or no longer lists that model, it changed after the run was created, or the run names a connection whose Secret the Agent was not given (authRefs).`
-        : `The run's model connection and model${asked ? ` (${asked})` : ""} are not the exact route the policy permits: provider, protocol, model and endpoint origin must all match one declared route, the connection must be enabled and list the model, and the Agent must be given the connection's Secret.`;
+      return route?.originStatus === "allowed"
+        ? `The run asks for ${asked}, whose origin the policy admits, so the origin itself is allowed. What is left: the connection ${route.connection} is disabled, invalid or no longer lists that model, it changed after the run was created, or the run names a connection whose Secret the Agent was not given (authRefs).`
+        : `The run's model connection and model${asked ? ` (${asked})` : ""} are not a route the policy permits: the endpoint origin must be one the policy admits (and, for a private address, one an operator approved), the connection must be enabled and list the model, and the Agent must be given the connection's Secret.`;
     },
     steps: (run, { route, detail }) => [
-      ...(route?.declared === false ? [
-        { label: "Declare the route, or pick a declared one", detail: `An operator declares it with: sympozium install --celln-fleet … --celln-mediated-route provider=${route.provider},protocol=${route.protocol},origin=${route.origin || "https://…"},models=${route.model || "…"} (or celln.mediation.routes in the values, then sympozium celln-mediation apply-routes). Matching is exact on all four; sympozium doctor lists what is declared. Otherwise create the Agent on a provider and model that are declared (Create Agent → Celln offers only those).` },
+      ...(route?.originStatus === "denied" ? [
+        { label: "Use an admitted origin, or ask the operator to admit this one", detail: `The policy's origin guardrail (${originLists(route)}) refuses ${route.origin}. Create the Agent's connection on a provider whose origin it admits, or an operator changes the policy's allowedOrigins/deniedOrigins; sympozium doctor shows what applies.` },
       ] : []),
-      ...(route?.declared !== false || /does not grant/i.test(detail) ? [
+      ...(route?.originStatus === "needs-approval" ? [
+        { label: "Ask the operator to approve the private origin", detail: `Add exactly ${route.origin} to the chart value modelGateway.privateOrigins (helm upgrade), then start a new run. Only the listed origins are reached on private, LAN or loopback addresses.` },
+      ] : []),
+      ...(route?.originStatus === "allowed" || route?.originStatus === undefined || /does not grant/i.test(detail) ? [
         harnessStep(run, "Run on this Agent's own connection", "Agent → Harness → Model backend shows the connection and Secret this Agent owns. A run must name that connection (the Chat tab does); a run that names another Agent's Secret-backed connection is refused unless this Agent's authRefs list that Secret."),
       ] : []),
       replaceRunStep,
@@ -343,20 +356,23 @@ function refusedDiagnosis(run: AgentRun, refusal: { code: string; detail: string
   return { kind: "admission-refused", severity: "error", code: refusal.code, title: entry.title, cause: entry.cause(facts), evidence, nextSteps: entry.steps(run, facts) };
 }
 
-/** The route a run asked for (the controller freezes it into spec.model) against the namespace's declared routes. */
+/** The route a run asked for (the controller freezes it into spec.model) against the namespace's origin guardrail. */
 function routeFacts(run: AgentRun, mediation: CellnMediation | undefined): RouteFacts | undefined {
   const model = run.spec.model;
   if (!model?.connectionRef) return undefined;
   let origin = "";
   try { origin = model.baseURL ? new URL(model.baseURL).origin : ""; } catch { /* reported as unreadable */ }
-  const facts: RouteFacts = { provider: model.provider || "", protocol: model.protocol || "", model: model.model || "", origin, connection: model.connectionRef, offered: [] };
+  const facts: RouteFacts = { provider: model.provider || "", protocol: model.protocol || "", model: model.model || "", origin, connection: model.connectionRef, policies: [], allowedOrigins: [], deniedOrigins: [] };
   // Without the frozen route there is nothing to compare; say only what is known.
   if (!mediation || !facts.provider || !facts.protocol || !origin) return facts;
   return {
     ...facts,
     mediationEnabled: mediation.enabled,
-    declared: mediation.routes.some((route) => route.provider === facts.provider && route.protocol === facts.protocol && routeAllowsModel(route, facts.model) && route.endpointOrigins.includes(origin)),
-    offered: mediation.routes.map((route) => `${route.provider} (${route.protocol}) ${routeModelsLabel(route)} on ${route.endpointOrigins.join(", ")}`),
+    originStatus: originStatus(origin, mediation),
+    deniedBy: denyingPattern(origin, mediation),
+    policies: mediation.policies || [],
+    allowedOrigins: mediation.allowedOrigins || [],
+    deniedOrigins: mediation.deniedOrigins || [],
   };
 }
 
@@ -378,7 +394,7 @@ function diagnoseScoped(run: AgentRun, scoped: Condition, context: DiagnosisCont
       cause: "This Agent brings its own provider key, which only the model gateway may use. The controller has no scoped receiver configured (celln.mediation.enabled is off), so the run is held and nothing was started; it is never sent to a fleet backend instead.",
       evidence,
       nextSteps: [
-        { label: "Enable mediated model access", detail: "An operator bootstraps the trust (sympozium celln-mediation bootstrap), enables celln.mediation.enabled with the model gateway, and declares the providers Agents may bring a key for (--celln-mediated-route). See docs/guides/celln-mediated-model-access.md; sympozium doctor reports “Mediated model access”." },
+        { label: "Enable mediated model access", detail: "An operator reruns sympozium install without the mediation opt-out (a source build adds --model-gateway-image): it bootstraps the trust and enables celln.mediation.enabled with the model gateway. Nothing is declared per provider: an Agent's own connection is its route, guarded by the policy's origin globs. See docs/guides/celln-mediated-model-access.md; sympozium doctor reports “Mediated model access”." },
         waitStep,
       ],
     };

@@ -165,13 +165,11 @@ spec:
                     maximum: 300000
                     minimum: 1
                     type: integer
-                  credentialProfile:
-                    description: |-
-                      CredentialProfile names the owner-installed model credential; a tenant
-                      ModelConnection using this runtime must reference exactly this profile.
-                    pattern: ^[A-Za-z0-9_-]{1,64}$
-                    type: string
                   modelProfile:
+                    description: |-
+                      ModelProfile is the hash of the pinned model profile of a model the
+                      fleet calls itself. Absent for a model-free profile: its nodes hold no
+                      model and every run brings its own route through the gateway.
                     pattern: ^blake3:[0-9a-f]{64}$
                     type: string
                   parent:
@@ -204,8 +202,6 @@ spec:
                     x-kubernetes-preserve-unknown-fields: true
                 required:
                 - admissionWindowMs
-                - credentialProfile
-                - modelProfile
                 - parent
                 - reservedMemoryBytes
                 - systemPrompt

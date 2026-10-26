@@ -39,6 +39,7 @@ import (
 	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
@@ -158,23 +159,12 @@ const DefaultRunHistoryLimit = 50
 // AgentRunReconciler reconciles AgentRun objects.
 // It watches AgentRun CRDs and reconciles them into Kubernetes Jobs/Pods.
 type AgentRunReconciler struct {
-	// ParentOnly refuses unrelated workloads before any status/finalizer writes.
-	// Use with a namespace-scoped cache and restricted parent-controller RBAC.
-	ParentOnly bool
 	client.Client
-	// CatalogueDispatcher is explicit operator wiring; nil refuses catalogue
-	// issuance rather than falling through to legacy forge or OCI execution.
-	CatalogueDispatcher CatalogueDispatcher
-	// ScopedDispatcher is the explicit operator-configured shared-catalogue
-	// one-shot/enduring path. Nil is disabled and never falls back to legacy.
+	// ScopedDispatcher is the operator-configured Celln platform path
+	// (CELLN_SCOPED_CONFIG): every backend=celln run, one-shot or enduring, is
+	// executed through it. Nil holds Celln runs; nothing falls back to another
+	// execution plane.
 	ScopedDispatcher *cellnscoped.Dispatcher
-	// ScopedOnly ignores non-catalogue runs before finalizers or legacy side effects.
-	ScopedOnly bool
-	// ParentConfigPath explicitly enables experimental enduring-parent startup.
-	// Empty refuses new enduring runs; existing cleanup remains fail-closed.
-	ParentConfigPath string
-	// ParentAdmission optionally publishes prepared registrations before startup.
-	ParentAdmission ParentAdmission
 	// APIReader bypasses the controller cache for reads — needed when we
 	// must see status mutations committed by a concurrent reconcile that
 	// the watch-based cache may not yet have observed.
@@ -334,18 +324,6 @@ func (r *AgentRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 			return ctrl.Result{}, nil
 		}
 		return ctrl.Result{}, err
-	}
-	if r.ParentOnly && !parentOnlyRun(agentRun) {
-		return ctrl.Result{}, nil
-	}
-	if r.ScopedOnly {
-		selected, err := r.sharedCatalogueSelected(ctx, agentRun)
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-		if !selected {
-			return ctrl.Result{}, nil
-		}
 	}
 
 	// If the AgentRun carries a traceparent annotation (set by channel router),
@@ -589,7 +567,8 @@ func (r *AgentRunReconciler) resolveAgentRunInputs(ctx context.Context, agentRun
 // Agent grants. Both the pod and the scoped Celln paths call it before any
 // work. It returns a refusal to fail the run with, or a transient error.
 func (r *AgentRunReconciler) authorizeRunKeys(ctx context.Context, agentRun *sympoziumv1alpha1.AgentRun, agent *sympoziumv1alpha1.Agent) (string, error) {
-	for _, secret := range r.runModelSecrets(ctx, agentRun) {
+	model := agentRun.Spec.Model
+	for _, secret := range []string{model.AuthSecretRef, model.ProviderHeadersSecretRef} {
 		if err := modelkey.Authorize(ctx, r.Client, agent, "", secret); err != nil {
 			if modelkey.IsRefusal(err) {
 				return err.Error(), nil
@@ -597,22 +576,21 @@ func (r *AgentRunReconciler) authorizeRunKeys(ctx context.Context, agentRun *sym
 			return "", fmt.Errorf("checking model key ownership: %w", err)
 		}
 	}
-	return "", nil
-}
-
-// runModelSecrets lists the credential Secrets a run would use: its inline
-// key, its provider-headers Secret and its ModelConnection's Secret. A
-// connection that cannot be read is skipped; resolving it fails the run later.
-func (r *AgentRunReconciler) runModelSecrets(ctx context.Context, agentRun *sympoziumv1alpha1.AgentRun) []string {
-	model := agentRun.Spec.Model
-	secrets := []string{model.AuthSecretRef, model.ProviderHeadersSecretRef}
+	// The connection's key is claimed with the origin it goes to: the
+	// gateway sends it nowhere else. A connection that cannot be read is
+	// skipped; resolving it fails the run later.
 	if model.ConnectionRef != "" {
 		var connection sympoziumv1alpha1.ModelConnection
 		if err := r.Get(ctx, client.ObjectKey{Namespace: agentRun.Namespace, Name: model.ConnectionRef}, &connection); err == nil {
-			secrets = append(secrets, connection.Spec.SecretRef)
+			if err := modelkey.AuthorizeConnection(ctx, r.Client, agent, &connection); err != nil {
+				if modelkey.IsRefusal(err) {
+					return err.Error(), nil
+				}
+				return "", fmt.Errorf("checking model key ownership: %w", err)
+			}
 		}
 	}
-	return secrets
+	return "", nil
 }
 
 // resolveProviderHeaders merges the providerHeadersSecretRef contents into
@@ -848,36 +826,29 @@ func (r *AgentRunReconciler) prepareTaskPrerequisites(
 // reconcilePending handles an AgentRun that needs a Job created.
 func (r *AgentRunReconciler) reconcilePending(ctx context.Context, log logr.Logger, agentRun *sympoziumv1alpha1.AgentRun) (ctrl.Result, error) {
 	if agentRun.Status.CellnParent != nil {
-		return r.reconcileCellnParent(ctx, agentRun)
+		return ctrl.Result{}, r.failRun(ctx, agentRun, cellnNativeParentRemoved)
 	}
 	if reason := agentRun.Spec.ValidateLifecycle(); reason != "" {
 		return ctrl.Result{}, r.failRun(ctx, agentRun, reason)
 	}
+	// Every Celln run executes through the scoped platform path, which Reconcile
+	// selects before this point (sharedCatalogueSelected). A backend=celln run
+	// that was not selected has no execution plane left: never turn it into a
+	// Job, an OCI pod or enduring intent into a one-shot.
 	if agentRun.Spec.ExecutionLifecycle == "enduring" {
-		if r.ParentConfigPath != "" {
-			return r.reconcileCellnParent(ctx, agentRun)
-		}
-		// Fail closed until the authenticated persistent-owner serving path is
-		// integrated. Never turn explicit enduring intent into a one-shot Job.
-		return ctrl.Result{}, r.failRun(ctx, agentRun, "Celln enduring lifecycle is not yet available on this controller")
+		return ctrl.Result{}, r.failRun(ctx, agentRun, "Enduring runs execute through the Celln platform: backend celln with a cellnSelection (cluster tools or a platform runtime profile) and a string task")
 	}
 	if agentRun.Spec.CellnSelection != nil {
-		if agentRun.Spec.Backend != "celln" || agentRun.Spec.Celln != nil || !agentRun.Spec.Task.IsString() {
-			return ctrl.Result{}, r.failRun(ctx, agentRun, "Catalogue selection requires backend celln, a string task and no explicit artifacts")
+		if agentRun.Spec.Backend != "celln" || !agentRun.Spec.Task.IsString() {
+			return ctrl.Result{}, r.failRun(ctx, agentRun, "Catalogue selection requires backend celln and a string task")
 		}
-		// A one-shot on the shared catalogue is a single-turn native parent
-		// when the platform admits it; it never reaches namespace issuance.
-		if platform, err := r.platformOneShotSelected(ctx, agentRun); err != nil {
-			return ctrl.Result{}, err
-		} else if platform {
-			return r.reconcileCellnParent(ctx, agentRun)
-		}
-		if agentRun.Status.CellnIssuance == nil || agentRun.Status.CellnIssuance.Phase == "Prepared" {
-			return r.awaitCatalogueIssuance(ctx, log, agentRun)
-		}
+		return ctrl.Result{}, r.failRun(ctx, agentRun, cellnCatalogueRemoved)
 	}
-	if agentRun.Spec.Backend == "celln" && agentRun.Status.CellnIssuance != nil {
-		return r.reconcilePendingCatalogue(ctx, log, agentRun)
+	if agentRun.Spec.Backend == "celln" {
+		if agentRun.Status.CellnIssuance != nil {
+			return ctrl.Result{}, r.failRun(ctx, agentRun, cellnCatalogueRemoved)
+		}
+		return ctrl.Result{}, r.failRun(ctx, agentRun, cellnRouterPlaneRemoved)
 	}
 	ctx, span := controllerTracer.Start(ctx, "agentrun.create_job",
 		trace.WithAttributes(
@@ -904,7 +875,7 @@ func (r *AgentRunReconciler) reconcilePending(ctx context.Context, log logr.Logg
 	// inside the agent-runner. Fail fast with a clear status.error so the
 	// operator sees why the run never started instead of a runtime crash.
 	// PR #302 review (issuecomment 5033007953) — second smaller ask.
-	if agentRun.Spec.Task == nil && !(agentRun.Spec.Backend == "celln" && agentRun.Spec.Celln != nil) {
+	if agentRun.Spec.Task == nil {
 		return ctrl.Result{}, r.failRun(ctx, agentRun,
 			"spec.task is required and must not be empty; provide a string prompt (Path A) or a {mode, tool, parameters} object (Path B)")
 	}
@@ -971,30 +942,6 @@ func (r *AgentRunReconciler) reconcilePending(ctx context.Context, log logr.Logg
 		return ctrl.Result{}, r.failRun(ctx, agentRun, fmt.Sprintf("token budget exceeded: %v", err))
 	}
 
-	// Reject configurations that select two mutually exclusive execution
-	// backends at once. Without this check AgentSandbox is evaluated first
-	// below and celln would be silently dropped with no signal to whoever
-	// authored the run that their backend: celln choice was ignored.
-	if agentRun.Spec.Celln != nil && agentRun.Spec.Backend != "celln" {
-		return ctrl.Result{}, r.failRun(ctx, agentRun, "spec.celln requires backend: celln")
-	}
-	if agentRun.Spec.Backend == "celln" && agentRun.Spec.AgentSandbox != nil && agentRun.Spec.AgentSandbox.Enabled {
-		return ctrl.Result{}, r.failRun(ctx, agentRun,
-			"backend: celln and agentSandbox.enabled are mutually exclusive execution backends; set only one")
-	}
-
-	// Same failure, one level down: a task mode that replaces the agent
-	// container (mode: harness) has nothing to replace under backend: celln,
-	// which dispatches the task string to the router instead of building a
-	// pod. buildContainers never runs on that path, so without this the run
-	// is admitted, dispatched, and the operator's harness image is silently
-	// ignored. agentSandbox is fine — it reaches buildContainers through
-	// buildAgentPodTemplate, so task-mode dispatch still applies there.
-	if agentRun.Spec.Backend == "celln" && taskModeReplacesAgentContainer(agentRun.Spec.Task) {
-		return ctrl.Result{}, r.failRun(ctx, agentRun, fmt.Sprintf(
-			"task.mode %q replaces the agent container, which backend: celln never creates; use the default job backend (or agentSandbox) for this mode",
-			agentRun.Spec.Task.GetMode()))
-	}
 	if taskmodes.HarnessImage(agentRun.Spec.Task) != "" && !agentAllowsModelCredential(&runtimeInstance, agentRun.Spec.Model.Provider, agentRun.Spec.Model.AuthSecretRef) {
 		return ctrl.Result{}, r.failRun(ctx, agentRun, fmt.Sprintf("harness model credential %q is not declared in Agent %q spec.authRefs for provider %q", agentRun.Spec.Model.AuthSecretRef, runtimeInstance.Name, agentRun.Spec.Model.Provider))
 	}
@@ -1008,11 +955,6 @@ func (r *AgentRunReconciler) reconcilePending(ctx context.Context, log logr.Logg
 	// Agent Sandbox mode — create Sandbox CR instead of Job.
 	if agentRun.Spec.AgentSandbox != nil && agentRun.Spec.AgentSandbox.Enabled {
 		return r.reconcilePendingAgentSandbox(ctx, log, agentRun)
-	}
-
-	// Celln backend — dispatch to the Celln router instead of creating a Job.
-	if agentRun.Spec.Backend == "celln" {
-		return r.reconcilePendingCelln(ctx, log, agentRun)
 	}
 
 	// Setup shared with the agentSandbox backend — see prepareRunPrerequisites.
@@ -1231,18 +1173,21 @@ func (r *AgentRunReconciler) reconcileRunning(ctx context.Context, log logr.Logg
 	defer span.End()
 
 	log.Info("Checking running AgentRun")
-	if agentRun.Status.CellnParent != nil || agentRun.Spec.ExecutionLifecycle == "enduring" {
-		return r.reconcileCellnParent(ctx, agentRun)
+	// A Running Celln run is reconciled by the scoped path before this point.
+	// One that is not bound to it was started by an execution plane this
+	// controller no longer has (the native parent or the one-shot router):
+	// its outcome cannot be observed, so it ends here rather than being
+	// mistaken for a Job.
+	if agentRun.Status.CellnParent != nil {
+		return ctrl.Result{}, r.failRun(ctx, agentRun, cellnNativeParentRemoved)
+	}
+	if agentRun.Spec.Backend == "celln" || agentRun.Spec.ExecutionLifecycle == "enduring" {
+		return ctrl.Result{}, r.failRun(ctx, agentRun, cellnRouterPlaneRemoved)
 	}
 
 	// Agent Sandbox mode — check Sandbox CR status instead of Job.
 	if agentRun.Status.SandboxName != "" || agentRun.Status.SandboxClaimName != "" {
 		return r.reconcileRunningAgentSandbox(ctx, log, agentRun)
-	}
-
-	// Celln backend — poll the Celln router instead of checking a Job.
-	if agentRun.Spec.Backend == "celln" {
-		return r.reconcileRunningCelln(ctx, log, agentRun)
 	}
 
 	// Find the Job
@@ -1462,11 +1407,6 @@ func (r *AgentRunReconciler) checkAgentContainer(ctx context.Context, log logr.L
 // Instead of deleting immediately, it keeps up to RunHistoryLimit completed
 // runs per instance and prunes only the oldest ones beyond that threshold.
 func (r *AgentRunReconciler) reconcileCompleted(ctx context.Context, log logr.Logger, agentRun *sympoziumv1alpha1.AgentRun) (ctrl.Result, error) {
-	if controllerutil.ContainsFinalizer(agentRun, agentRunFinalizer) {
-		if err := r.stopCellnParent(ctx, agentRun); err != nil {
-			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
-		}
-	}
 	if agentRun.Status.CellnScoped != nil && controllerutil.ContainsFinalizer(agentRun, agentRunFinalizer) {
 		done, err := r.cleanupScoped(ctx, agentRun)
 		if err != nil {
@@ -1476,18 +1416,6 @@ func (r *AgentRunReconciler) reconcileCompleted(ctx context.Context, log logr.Lo
 		if !done {
 			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 		}
-	}
-	if agentRun.Status.CellnActionID != "" && controllerutil.ContainsFinalizer(agentRun, agentRunFinalizer) {
-		done, err := r.cancelCelln(ctx, agentRun)
-		if err != nil {
-			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
-		}
-		if !done {
-			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
-		}
-	}
-	if r.ScopedOnly {
-		return r.finishScopedOnly(ctx, agentRun)
 	}
 	// Clean up cluster-scoped RBAC created for skill sidecars.
 	r.cleanupSkillRBAC(ctx, log, agentRun)
@@ -2282,10 +2210,6 @@ func (r *AgentRunReconciler) pruneOldRuns(ctx context.Context, log logr.Logger, 
 // reconcileDelete handles AgentRun deletion.
 func (r *AgentRunReconciler) reconcileDelete(ctx context.Context, log logr.Logger, agentRun *sympoziumv1alpha1.AgentRun) (ctrl.Result, error) {
 	log.Info("Reconciling AgentRun deletion")
-	if err := r.stopCellnParent(ctx, agentRun); err != nil {
-		log.Error(err, "Celln parent deletion cleanup pending")
-		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
-	}
 	if agentRun.Status.CellnScoped != nil {
 		done, err := r.cleanupScoped(ctx, agentRun)
 		if err != nil {
@@ -2296,20 +2220,6 @@ func (r *AgentRunReconciler) reconcileDelete(ctx context.Context, log logr.Logge
 		if !done {
 			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 		}
-	}
-	if agentRun.Status.CellnActionID != "" {
-		done, err := r.cancelCelln(ctx, agentRun)
-		if err != nil {
-			log.Error(err, "Celln deletion cleanup pending")
-			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
-		}
-		if !done {
-			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
-		}
-	}
-
-	if r.ScopedOnly {
-		return r.finishScopedOnly(ctx, agentRun)
 	}
 	// Clean up cluster-scoped RBAC resources created for skill sidecars.
 	r.cleanupSkillRBAC(ctx, log, agentRun)
@@ -7053,20 +6963,14 @@ func (r *AgentRunReconciler) cleanupWorkspacePVC(ctx context.Context, log logr.L
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *AgentRunReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	if r.ParentOnly || r.ScopedOnly {
-		return ctrl.NewControllerManagedBy(mgr).For(&sympoziumv1alpha1.AgentRun{}).Complete(r)
-	}
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&sympoziumv1alpha1.AgentRun{}).
 		Owns(&batchv1.Job{}).
 		Owns(&appsv1.Deployment{}).
 		Owns(&corev1.Service{}).
+		// Several runs admit at once: a scoped admission is a chain of receiver
+		// and gateway calls that take seconds, and one worker would queue every
+		// other run (and every retrying old run) behind them.
+		WithOptions(controller.Options{MaxConcurrentReconciles: 4}).
 		Complete(r)
-}
-
-func parentOnlyRun(run *sympoziumv1alpha1.AgentRun) bool {
-	if run.Status.CellnParent != nil {
-		return true
-	}
-	return run.Spec.Backend == "celln" && run.Spec.ExecutionLifecycle == "enduring" && run.Status.JobName == "" && run.Status.DeploymentName == "" && run.Status.CellnRequest == "" && run.Status.CellnActionID == "" && run.Status.CellnIssuance == nil
 }

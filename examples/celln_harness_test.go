@@ -20,8 +20,8 @@ func TestBorrowedCellnExampleIsExplicitOneShotIntent(t *testing.T) {
 	if run.APIVersion != "sympozium.ai/v1alpha1" || run.Kind != "AgentRun" || run.GenerateName == "" || run.Namespace != "" {
 		t.Fatal("example must require explicit namespace and create a named run")
 	}
-	if run.Spec.Backend != "celln" || run.Spec.Celln != nil || !run.Spec.Task.IsString() {
-		t.Fatal("example must use catalogue Celln, not forge or OCI task override")
+	if run.Spec.Backend != "celln" || !run.Spec.Task.IsString() {
+		t.Fatal("example must use catalogue Celln, not an OCI task override")
 	}
 	if run.Spec.AgentID == "" || run.Spec.SessionKey == "" {
 		t.Fatal("required agentId and sessionKey must be explicit")

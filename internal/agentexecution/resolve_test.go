@@ -1,6 +1,8 @@
 package agentexecution
 
 import (
+	"slices"
+	"strings"
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -109,5 +111,22 @@ func TestAgentExecutionDefaultsValidate(t *testing.T) {
 	}
 	if good.Validate() != "" {
 		t.Fatal(good.Validate())
+	}
+}
+
+// The Agent's persona is inherited by a run that names none; a run's own wins.
+func TestResolveInheritsThePersona(t *testing.T) {
+	agent := &api.Agent{Spec: api.AgentSpec{Execution: &api.AgentExecutionDefaults{Backend: "celln", SystemPrompt: "Be terse."}}}
+	out, err := Resolve(agent, Input{})
+	if err != nil || out.SystemPrompt != "Be terse." || !slices.Contains(out.Inherited, "systemPrompt") {
+		t.Fatalf("persona not inherited: %+v %v", out, err)
+	}
+	out, err = Resolve(agent, Input{SystemPrompt: "Be verbose."})
+	if err != nil || out.SystemPrompt != "Be verbose." || slices.Contains(out.Inherited, "systemPrompt") {
+		t.Fatalf("run persona not kept: %+v %v", out, err)
+	}
+	long := &api.Agent{Spec: api.AgentSpec{Execution: &api.AgentExecutionDefaults{Backend: "celln", SystemPrompt: strings.Repeat("x", api.MaxCellnSystemPromptBytes+1)}}}
+	if _, err := Resolve(long, Input{}); err == nil {
+		t.Fatal("oversized Agent persona accepted")
 	}
 }

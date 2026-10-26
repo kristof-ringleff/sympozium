@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.12.0](https://github.com/sympozium-ai/sympozium/compare/v0.11.6...v0.12.0) (2026-10-25)
+
+
+### ⚠ BREAKING CHANGES
+
+* agent-bound model access — model-free Celln fleet, per-Agent keys, direct Agent API
+
+### Features
+
+* agent-bound model access — model-free Celln fleet, per-Agent keys, direct Agent API ([8732156](https://github.com/sympozium-ai/sympozium/commit/8732156242f006a28cb7969c7e68fb6053ff73c7))
+
+
+### Bug Fixes
+
+* **console:** keep the wizard footer in view on the Celln model step ([eef785d](https://github.com/sympozium-ai/sympozium/commit/eef785dff6bd68e7952a1ce1cbbb4e6c5e858f3a))
+* **console:** keep the wizard footer in view on the Celln model step ([8d91210](https://github.com/sympozium-ai/sympozium/commit/8d91210aaf05957cde1ca390e334675f3a5bbcd4))
+
+
+### Performance Improvements
+
+* faster Celln admission and turns; refuse stale turns at once ([29f8dd1](https://github.com/sympozium-ai/sympozium/commit/29f8dd18290d7b35f01e513be2d14b01a2815f55))
+
 ## [0.11.6](https://github.com/sympozium-ai/sympozium/compare/v0.11.5...v0.11.6) (2026-10-16)
 
 

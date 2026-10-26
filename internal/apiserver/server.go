@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"github.com/sympozium-ai/sympozium/internal/agentexecution"
-	"github.com/sympozium-ai/sympozium/internal/cellnauthority"
 	"github.com/sympozium-ai/sympozium/internal/modelconnection"
 	"github.com/sympozium-ai/sympozium/internal/modelkey"
 	"io"
@@ -66,7 +65,6 @@ var memoryProxyClient = &http.Client{
 
 // Server is the Sympozium API server.
 type Server struct {
-	cellnPreview map[types.NamespacedName]cellnauthority.Loader
 	client       client.Client
 	eventBus     eventbus.EventBus
 	kube         kubernetes.Interface
@@ -83,6 +81,9 @@ type Server struct {
 	// completeCellnBackend finishes an added fleet backend in the background;
 	// nil runs completeCellnFleetBackend (tests replace it).
 	completeCellnBackend func(name string, facts cellninstall.FleetFacts, cellnHint string)
+	// answerPoll is how often a waiting chat completion re-reads its run or
+	// turn; zero means agentChatPollInterval (tests shorten it).
+	answerPoll time.Duration
 }
 
 // NewServer creates a new API server.
@@ -194,6 +195,9 @@ func (s *Server) buildMux(frontendFS fs.FS, expected *tokenReader) http.Handler 
 	mux.HandleFunc("DELETE /api/v1/agents/{name}", s.deleteAgent)
 	mux.HandleFunc("PATCH /api/v1/agents/{name}", s.patchAgent)
 	mux.HandleFunc("GET /api/v1/agents/{name}/web-endpoint", s.getWebEndpointStatus)
+	mux.HandleFunc("POST /api/v1/agents/{name}/messages", s.postAgentMessage)
+	mux.HandleFunc("POST /api/v1/agents/{name}/v1/chat/completions", s.agentChatCompletions)
+	mux.HandleFunc("GET /api/v1/agents/{name}/v1/models", s.agentModels)
 
 	// Administrator-approved harness runtimes
 	mux.HandleFunc("GET /api/v1/runtimes", s.listRuntimes)
@@ -205,10 +209,7 @@ func (s *Server) buildMux(frontendFS fs.FS, expected *tokenReader) http.Handler 
 	mux.HandleFunc("POST /api/v1/celln-platform/wrappers", s.ensureCellnPlatformWrappers)
 	mux.HandleFunc("GET /api/v1/celln-platform/mediation", s.getCellnMediation)
 	mux.HandleFunc("GET /api/v1/celln-platform/key-secrets", s.listCellnKeySecrets)
-	mux.HandleFunc("GET /api/v1/celln-platform/backends", s.listCellnFleetBackends)
 	mux.HandleFunc("GET /api/v1/celln-platform/cells", s.listCellnFleetCells)
-	mux.HandleFunc("POST /api/v1/celln-platform/backends", s.addCellnFleetBackend)
-	mux.HandleFunc("POST /api/v1/celln-selection/preview", s.previewCellnSelection)
 	mux.HandleFunc("POST /api/v1/runtimes/install-defaults", s.installDefaultRuntimes)
 	// Persistent harness sessions. The API server owns the only browser-facing
 	// route to a session's private in-cluster Service.
@@ -355,7 +356,7 @@ func (s *Server) buildMux(frontendFS fs.FS, expected *tokenReader) http.Handler 
 	}
 
 	// Wrap the mux with otelhttp for automatic HTTP span instrumentation.
-	handler := otelhttp.NewHandler(mux, "sympozium-apiserver",
+	handler := otelhttp.NewHandler(namespaceHeaderMiddleware(mux), "sympozium-apiserver",
 		otelhttp.WithSpanNameFormatter(func(_ string, r *http.Request) string {
 			return "sympozium.api." + r.Method
 		}),
@@ -368,6 +369,26 @@ func (s *Server) buildMux(frontendFS fs.FS, expected *tokenReader) http.Handler 
 
 	s.log.Info("WARNING: API server auth token is empty — /api and /ws endpoints are unauthenticated; any caller can create runs in any namespace")
 	return handler
+}
+
+// namespaceHeaderMiddleware lets a client that cannot add a query parameter
+// (an OpenAI SDK pointed at an Agent's base URL) name the namespace with the
+// X-Sympozium-Namespace header instead: on an API route without ?namespace=,
+// the header becomes the query parameter every handler already reads. An
+// explicit query parameter always wins.
+func namespaceHeaderMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/api/") && r.URL.Query().Get("namespace") == "" {
+			if ns := strings.TrimSpace(r.Header.Get("X-Sympozium-Namespace")); ns != "" {
+				q := r.URL.Query()
+				q.Set("namespace", ns)
+				r2 := r.Clone(r.Context())
+				r2.URL.RawQuery = q.Encode()
+				r = r2
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // authMiddleware returns an http.Handler that checks for a valid Bearer token.
@@ -539,14 +560,13 @@ func (s *Server) listClusterCellnTools(w http.ResponseWriter, r *http.Request) {
 // CellnPlatformProfile is what a tenant sees of a runtime profile its
 // namespace may run: identity and route, never provisioning material.
 type CellnPlatformProfile struct {
-	Name              string `json:"name"`
-	Revision          string `json:"revision"`
-	Policy            string `json:"policy"`
-	Model             string `json:"model"`
-	Provider          string `json:"provider"`
-	Endpoint          string `json:"endpoint"`
-	CredentialProfile string `json:"credentialProfile"`
-	SystemPrompt      string `json:"systemPrompt"`
+	Name         string `json:"name"`
+	Revision     string `json:"revision"`
+	Policy       string `json:"policy"`
+	Model        string `json:"model"`
+	Provider     string `json:"provider"`
+	Endpoint     string `json:"endpoint"`
+	SystemPrompt string `json:"systemPrompt"`
 	// Backend names the fleet model backend this profile runs on ("native"
 	// for the default); Wrapper and Agent are the namespace's AgentRuntime
 	// and Agent for it, created on first use.
@@ -564,11 +584,6 @@ type CellnPlatformProfile struct {
 	// it runs only Agents with their own key (agent and credentialProfile
 	// stay empty; ask for the wrapper with runtimeOnly).
 	MediationOnly bool `json:"mediationOnly,omitempty"`
-	// StarterAgent and StarterNamespace name the Agent whose own key is a
-	// mediation-only backend's provider key (installer or added backend);
-	// absent when there is none. Names only: the key is never lent.
-	StarterAgent     string `json:"starterAgent,omitempty"`
-	StarterNamespace string `json:"starterNamespace,omitempty"`
 	// ToolboxProfile, ToolboxWrapper and ToolboxTools are what an Agent with
 	// its own key selects to lend the starter toolbox: the backend's toolbox
 	// profile, its namespace wrapper (ask for it with runtimeOnly) and
@@ -625,19 +640,9 @@ func (s *Server) listCellnPlatformProfiles(w http.ResponseWriter, r *http.Reques
 		}
 		names := cellnplatform.WrapperNames(cellnplatform.Backend(&a.Profile))
 		entry := CellnPlatformProfile{Name: a.Profile.Name, Revision: a.Profile.Spec.Revision, Policy: a.Policy.Name, SystemPrompt: a.Profile.Spec.Native.SystemPrompt, Backend: names.Backend, Wrapper: names.Runtime}
-		if objects, err := cellnplatform.TenantWrappers(ns, &a.Profile, &a.Policy); err == nil {
-			connection := objects[2].(*sympoziumv1alpha1.ModelConnection)
-			entry.Model, entry.Provider, entry.Endpoint, entry.CredentialProfile, entry.Agent = connection.Spec.Models[0], connection.Spec.Provider, connection.Spec.Endpoint, connection.Spec.CredentialProfile, names.Agent
-		} else if route, endpoint, model, err := cellnplatform.ProfileRoute(&a.Profile, &a.Policy, "secret"); err == nil && cellnplatform.MediationOnly(&a.Profile) {
-			// The backend's key never reached the fleet: the profile serves
-			// Agents with their own key only, so it has no shared Agent.
-			entry.Model, entry.Provider, entry.Endpoint, entry.MediationOnly = model, route.Provider, endpoint, true
-			if starters, err := cellninstall.StarterAgentsFor(r.Context(), s.client, names.Backend); err == nil && len(starters) != 0 {
-				entry.StarterAgent, entry.StarterNamespace = starters[0].Name, starters[0].Namespace
-			}
-		} else {
-			continue // a profile without a usable route is not offered
-		}
+		// Every profile of a model-free fleet serves Agents with their own
+		// connection; it names no provider, model or endpoint of its own.
+		entry.MediationOnly = true
 		c := a.Policy.Spec.Ceilings
 		ceilings := sympoziumv1alpha1.EnduringRunSpec{LeaseSeconds: int32(min(c.MaxParentLeaseSeconds, 86400)), MaxTurns: int32(min(c.MaxTurns, 1024)), MaxModelRequests: int32(min(c.MaxModelRequests, 6144)), MaxOutputTokens: c.MaxOutputTokens}
 		entry.Tools, entry.Ceilings, entry.SessionDefaults = cellnplatform.LentTools(&a.Policy), ceilings, *cellninstall.SessionDefaultsFor(ceilings, &a.Profile)
@@ -669,15 +674,11 @@ func (s *Server) ensureCellnPlatformWrappers(w http.ResponseWriter, r *http.Requ
 		http.Error(w, "profile is required", http.StatusBadRequest)
 		return
 	}
-	var wrappers cellnplatform.Wrappers
-	var err error
-	if req.RuntimeOnly {
-		// The same authorisation as the full set: only a profile one of the
-		// namespace's policies admits gets a wrapper.
-		wrappers, err = s.ensureCellnRuntimeWrapper(r.Context(), ns, req.Profile)
-	} else {
-		wrappers, err = cellnplatform.EnsureWrappers(r.Context(), s.client, ns, req.Profile)
-	}
+	// Only a profile one of the namespace's policies admits gets a wrapper,
+	// and the runtime wrapper is all there is: the Agent's own connection is
+	// its model route. runtimeOnly is accepted for 0.11 clients.
+	_ = req.RuntimeOnly
+	wrappers, err := s.ensureCellnRuntimeWrapper(r.Context(), ns, req.Profile)
 	if err != nil {
 		if k8serrors.IsNotFound(err) || strings.Contains(err.Error(), "no execution policy admits") {
 			http.Error(w, err.Error(), http.StatusForbidden)
@@ -1085,6 +1086,9 @@ type CreateInstanceRequest struct {
 	RunTimeout         string                                    `json:"runTimeout,omitempty"`
 	RequireApproval    bool                                      `json:"requireApproval,omitempty"`
 	Execution          *sympoziumv1alpha1.AgentExecutionDefaults `json:"execution,omitempty"`
+	// ModelConnection creates the Celln Agent's own connection (and key
+	// Secret) with the Agent, in one call; see server_agent_celln_defaults.go.
+	ModelConnection *InlineModelConnection `json:"modelConnection,omitempty"`
 }
 
 func (s *Server) createAgent(w http.ResponseWriter, r *http.Request) {
@@ -1098,6 +1102,10 @@ func (s *Server) createAgent(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
 		return
 	}
+	if code, err := s.prepareCellnAgent(r.Context(), ns, &req); err != nil {
+		http.Error(w, err.Error(), code)
+		return
+	}
 
 	if req.Execution != nil && req.Execution.ModelConnectionRef != "" {
 		if req.APIKey != "" || req.SecretName != "" || req.BaseURL != "" {
@@ -1107,7 +1115,7 @@ func (s *Server) createAgent(w http.ResponseWriter, r *http.Request) {
 		if req.Execution.Backend == "celln" {
 			// Only the provider is read here. An Agent may own a Secret-backed
 			// connection; which path may execute it is decided per run.
-			resolvedModel, err := modelconnection.ResolveMediated(r.Context(), s.client, ns, sympoziumv1alpha1.ModelSpec{ConnectionRef: req.Execution.ModelConnectionRef, Model: req.Model})
+			resolvedModel, err := modelconnection.Resolve(r.Context(), s.client, ns, sympoziumv1alpha1.ModelSpec{ConnectionRef: req.Execution.ModelConnectionRef, Model: req.Model})
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
@@ -1337,8 +1345,18 @@ func (s *Server) createAgent(w http.ResponseWriter, r *http.Request) {
 		inst.Spec.Channels = req.Channels
 	}
 
+	// A Celln Agent's key is its own from the moment the Agent exists: refused
+	// here if another live Agent holds it, recorded on the Secret right after.
+	if code, err := s.checkCellnKey(r.Context(), inst); err != nil {
+		http.Error(w, err.Error(), code)
+		return
+	}
 	if err := s.client.Create(r.Context(), inst); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if code, err := s.claimCellnKey(r.Context(), inst); err != nil {
+		http.Error(w, err.Error(), code)
 		return
 	}
 
@@ -1515,9 +1533,7 @@ type CreateRunRequest struct {
 	// host-issued model authority, never inherited Kubernetes auth credentials.
 	ModelConnectionRef string                                     `json:"modelConnectionRef,omitempty"`
 	CellnSelection     *sympoziumv1alpha1.CellnCatalogueSelection `json:"cellnSelection,omitempty"`
-	// Do not silently discard an advanced artifact block sent to this endpoint.
-	Celln    json.RawMessage `json:"celln,omitempty"`
-	Provider string          `json:"provider,omitempty"`
+	Provider           string                                     `json:"provider,omitempty"`
 }
 
 func (s *Server) createRun(w http.ResponseWriter, r *http.Request) {
@@ -1547,10 +1563,6 @@ func (s *Server) createRun(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "catalogue selection requires backend celln, a provider or model connection, model and toolRefs; use only cellnSelection.runtimeRef for an override", http.StatusBadRequest)
 		return
 	}
-	if len(req.Celln) != 0 && string(req.Celln) != "null" {
-		http.Error(w, "explicit celln artifacts require the AgentRun Kubernetes API and cannot be mixed with catalogue selection", http.StatusBadRequest)
-		return
-	}
 
 	// Look up the Agent to inherit auth, model, skills, and execution defaults.
 	var inst sympoziumv1alpha1.Agent
@@ -1572,11 +1584,13 @@ func (s *Server) createRun(w http.ResponseWriter, r *http.Request) {
 		Provider:           req.Provider,
 		Model:              req.Model,
 		RuntimeRef:         req.RuntimeRef,
+		SystemPrompt:       req.SystemPrompt,
 	})
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	req.SystemPrompt = resolved.SystemPrompt
 	req.Backend = resolved.Backend
 	req.ExecutionLifecycle = resolved.ExecutionLifecycle
 	req.Enduring = resolved.Enduring
@@ -1584,13 +1598,16 @@ func (s *Server) createRun(w http.ResponseWriter, r *http.Request) {
 	req.ModelConnectionRef = resolved.ModelConnectionRef
 	req.Provider = resolved.Provider
 	req.Model = resolved.Model
-	// A run on a fleet profile must carry the profile's bound persona
-	// verbatim; a client that sends none gets it here rather than a
-	// mismatch at admission.
+	// The persona is the run's, else the Agent's (execution.systemPrompt);
+	// a run on a fleet profile that names neither gets the fleet's default.
 	if req.SystemPrompt == "" && req.Backend == "celln" && req.CellnSelection != nil && len(req.CellnSelection.ToolRefs) == 0 {
 		if persona, ok := s.platformPersona(r.Context(), ns, &inst, req.CellnSelection.RuntimeRef); ok {
 			req.SystemPrompt = persona
 		}
+	}
+	if req.Backend == "celln" && !sympoziumv1alpha1.ValidCellnSystemPrompt(req.SystemPrompt) {
+		http.Error(w, fmt.Sprintf("a Celln run's system prompt must be at most %d UTF-8 bytes without NUL (the cell's bound)", sympoziumv1alpha1.MaxCellnSystemPromptBytes), http.StatusBadRequest)
+		return
 	}
 
 	if req.ExecutionLifecycle == "enduring" && (len(req.Task) > 2048 || strings.ContainsRune(req.Task, '\x00')) {
@@ -1698,16 +1715,10 @@ func (s *Server) createRun(w http.ResponseWriter, r *http.Request) {
 	if req.CellnSelection != nil {
 		run.Spec.CellnSelection = req.CellnSelection.DeepCopy()
 		run.Spec.Model = sympoziumv1alpha1.ModelSpec{Provider: req.Provider, Model: req.Model, ConnectionRef: req.ModelConnectionRef}
-		// A shared-catalogue selection (no namespaced toolRefs) is resolved by
-		// the platform resolver, whose route auth picks the path: a Secret-backed
-		// or credential-free connection runs gateway-mediated and is frozen
-		// without any credential reference. A legacy namespaced selection has no
-		// gateway and keeps requiring a host credential profile.
-		resolveConnection := modelconnection.Resolve
-		if len(req.CellnSelection.ToolRefs) == 0 {
-			resolveConnection = modelconnection.ResolveMediated
-		}
-		run.Spec.Model, err = resolveConnection(r.Context(), s.client, ns, run.Spec.Model)
+		// The route is frozen from the Agent's connection without any
+		// credential reference: every Celln run is gateway-mediated and the
+		// gateway adds the connection's key.
+		run.Spec.Model, err = modelconnection.Resolve(r.Context(), s.client, ns, run.Spec.Model)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
@@ -3243,6 +3254,9 @@ func createOrUpdateSecret(ctx context.Context, c client.Client, secret *corev1.S
 	for k, v := range secret.StringData {
 		existing.Data[k] = []byte(v)
 	}
+	for k, v := range secret.Data {
+		existing.Data[k] = v
+	}
 	return c.Update(ctx, existing)
 }
 
@@ -4484,9 +4498,8 @@ type CapabilitiesResponse struct {
 	Celln        CapabilityStatus `json:"celln"`
 }
 
-// defaultCellnRouterURL mirrors internal/controller/agentrun_celln.go's fallback:
-// the controller will still attempt this address even if CELLN_ROUTER_URL isn't
-// set on this pod, so capability reporting checks the same default.
+// defaultCellnRouterURL is the in-cluster router Service the chart deploys;
+// capability and cell reporting check it when CELLN_ROUTER_URL isn't set.
 const defaultCellnRouterURL = "http://celln-router.celln-system.svc.cluster.local:8787"
 
 // getCellnStatus validates authenticated, versioned node preflight. It does

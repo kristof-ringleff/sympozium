@@ -2916,6 +2916,15 @@ spec:
                       Provider is the default model provider for inherited Celln catalogue runs.
                       Omit when using modelConnectionRef; independent host model admission still applies.
                     type: string
+                  systemPrompt:
+                    description: |-
+                      SystemPrompt is this Agent's persona: the system prompt every inherited
+                      Celln run carries into its cell. It is agent configuration, not fleet
+                      material: the fleet's catalogue only supplies a default when neither
+                      the run nor the Agent names one. A cell accepts at most
+                      MaxCellnSystemPromptBytes.
+                    maxLength: 2048
+                    type: string
                 type: object
               imagePullSecrets:
                 description: ImagePullSecrets are secrets to use when pulling container

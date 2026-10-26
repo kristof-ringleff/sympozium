@@ -69,9 +69,12 @@ func (sr *ScheduleRouter) handleScheduleEvent(ctx context.Context, event *eventb
 		return
 	}
 
-	// Resolve namespace from the instance.
+	// Resolve namespace from the bridge metadata. Older bridges sent none, so
+	// fall back to finding the instance by name.
 	namespace := "default"
-	if instanceName != "" {
+	if ns := event.Metadata["namespace"]; ns != "" {
+		namespace = ns
+	} else if instanceName != "" {
 		var instances sympoziumv1alpha1.AgentList
 		if err := sr.Client.List(ctx, &instances); err == nil {
 			for i := range instances.Items {

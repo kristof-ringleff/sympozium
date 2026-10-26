@@ -1,66 +1,52 @@
 #!/usr/bin/env bash
-# Multi-node fleet proof on Kind: label N KVM nodes, every node prepares the
-# reviewed starter package and sizes its own capacity, one router discovers
-# them, enduring parents are issued through the gateway (several on one node),
-# a follow-up turn keeps live context, any ordinary namespace runs with
-# wrappers created on first use while an excluded one is refused, a second
-# model backend (FLEET_SECOND_BACKEND, optional) serves the same namespace side
-# by side, one-shot runs answer once on any backend as single-turn parents and
-# give their cells back, a backend added to the running scope
-# (FLEET_ADD_BACKEND, optional) serves runs without an owner restart, and
-# removing a node's label drains its owner honestly.
+# The model-free Celln fleet on multi-node Kind. A bare `sympozium install`
+# (a build that pins a starter package) must, with no model input at all:
+#   - say what privilege the fleet takes and never ask for or mention a
+#     provider key; deploy two owners, the router, the model gateway and its
+#     trust;
+#   - leave no model anywhere: no fleet credential Secret, no managed Agent or
+#     ModelConnection, one mediation-only profile (plus its toolbox) per
+#     scope and a policy with no routes that admits every public origin;
+#   - let every namespace bring its own ModelConnection and Agent: a keyless
+#     llama-server tenant and a tenant whose two Agents hold keys to an
+#     in-cluster HTTPS canary provider that records which key every call
+#     carried, so each Agent's key is seen to arrive and no other;
+#   - hold one key to one Agent (a second Agent naming the first's Secret is
+#     refused), pin a key Secret to its first origin (re-posting the
+#     connection at another origin is 409), and refuse a re-owned key at the
+#     gateway without disturbing the other Agent;
+#   - refuse to move the fleet to another package without
+#     --celln-fleet-replace-package, and keep live conversations on a rerun;
+#   - end only the conversation whose node is lost (AUTH_CONTEXT_LOST) while
+#     the one on the other node carries on;
+#   - keep skills away from Secrets (admission policy present).
 #
-# Requires: kind, docker, kubectl, helm, /dev/kvm, a readable host kernel in
-# /boot, a model backend (FLEET_MODEL_PROVIDER=deepseek|openai|anthropic|llama-server
-# with DEEPSEEK_API_KEY, OPENAI_API_KEY or ANTHROPIC_API_KEY, or
-# FLEET_MODEL_ENDPOINT for llama-server; FLEET_MODEL names the model; an optional
-# second backend as FLEET_SECOND_BACKEND="name=NAME,provider=..,model=..[,endpoint=..][,protocol=..][,allow-insecure=true]"
-# with its key in FLEET_SECOND_MODEL_KEY), a celln bundle (bin/celln + share/celln with pilot
-# binaries, scripts, guest) matching config/celln/release.json plus #109/#110,
-# and the sympozium controller/apiserver/webhook/celln-installer images tagged
-# $SYMPOZIUM_IMAGE_TAG together with the celln image $CELLN_IMAGE. See
-# docs/guides/celln-fleet-installation.md.
+# Inputs: CELLN_BUNDLE (a Celln release bundle: bin/celln + share/celln),
+# LLAMA_ORIGIN + LLAMA_MODEL (a keyless OpenAI-compatible server, e.g.
+# llama-server, on a private address the gateway is told to approve). No
+# provider key is read; any DEEPSEEK/OPENAI/ANTHROPIC key in the environment is
+# dropped before the install so the journey proves it is not needed. Optional
+# FLEET_CERT_MANAGER_MANIFEST, FLEET_CLUSTER, FLEET_WORK, FLEET_REGISTRY_NAME,
+# KEEP_CLUSTER=1. Images: controller, apiserver, webhook, node-probe,
+# model-gateway and celln-installer built with TAG (make docker-build-<name>
+# TAG=...), and the Celln image tagged CELLN_IMAGE.
 set -euo pipefail
-
-: "${CELLN_BUNDLE:?bundle directory with bin/celln and share/celln}"
-MODEL_PROVIDER="${FLEET_MODEL_PROVIDER:-deepseek}"
-MODEL_ARGS=(--celln-fleet-model-provider "$MODEL_PROVIDER")
-[ -n "${FLEET_MODEL:-}" ] && MODEL_ARGS+=(--celln-fleet-model "$FLEET_MODEL")
-[ -n "${FLEET_MODEL_ENDPOINT:-}" ] && MODEL_ARGS+=(--celln-fleet-model-endpoint "$FLEET_MODEL_ENDPOINT")
-[ -n "${FLEET_MODEL_PROTOCOL:-}" ] && MODEL_ARGS+=(--celln-fleet-model-protocol "$FLEET_MODEL_PROTOCOL")
-[ "${FLEET_MODEL_ALLOW_INSECURE:-}" = 1 ] && MODEL_ARGS+=(--celln-fleet-model-allow-insecure)
-# The HTTPS tools reach exactly these hosts. The journey posts JSON to a
-# receiver it runs inside the cluster (plain HTTP on a private address, so it
-# is only exercised when the native backend was approved with allow-insecure).
-HOOK_HOST="hook-echo.${FLEET_NAMESPACE:-celln-agents}-b.svc.cluster.local"
-HOST_ARGS=(--celln-fleet-https-host example.com --celln-fleet-https-host "$HOOK_HOST")
-for host in ${FLEET_HTTPS_HOSTS:-}; do HOST_ARGS+=(--celln-fleet-https-host "$host"); done
-case "$MODEL_PROVIDER" in
-deepseek) MODEL_KEY="${DEEPSEEK_API_KEY:?DEEPSEEK_API_KEY for the deepseek backend}" ;;
-openai) MODEL_KEY="${OPENAI_API_KEY:?OPENAI_API_KEY for the openai backend}" ;;
-anthropic) MODEL_KEY="${ANTHROPIC_API_KEY:?ANTHROPIC_API_KEY for the anthropic backend}" ;;
-*) MODEL_KEY="${FLEET_MODEL_KEY:-}" ;;
-esac
+REPO="$(cd "$(dirname "$0")/../.." && pwd)"
 CLUSTER="${FLEET_CLUSTER:-fleet}"
-SCOPE="${FLEET_SCOPE:-trial}"
 TAG="${SYMPOZIUM_IMAGE_TAG:-fleet-trial}"
 CELLN_IMAGE="${CELLN_IMAGE:-celln:$TAG}"
 REGISTRY_NAME="${FLEET_REGISTRY_NAME:-kind-registry}"
 WORK="${FLEET_WORK:-$(mktemp -d /tmp/celln-fleet.XXXXXX)}"
-SYMPOZIUM="${SYMPOZIUM_BIN:-$WORK/sympozium}"
-NAMESPACE="${FLEET_NAMESPACE:-celln-agents}"
-REPO="$(cd "$(dirname "$0")/../.." && pwd)"
+SCOPE=starter
+PROFILE="celln-native-$SCOPE"
+POLICY="celln-fleet-$SCOPE"
+: "${CELLN_BUNDLE:?a Celln bundle directory (bin/celln, share/celln) is required}"
+: "${LLAMA_ORIGIN:?LLAMA_ORIGIN (scheme://host[:port] of a keyless OpenAI-compatible server) is required}"
+: "${LLAMA_MODEL:?LLAMA_MODEL names the model the server serves}"
 log() { printf '\033[1;33m---- %s\033[0m\n' "$*"; }
 pass() { printf '\033[0;32mPASS %s\033[0m\n' "$*"; }
 fail() { printf '\033[0;31mFAIL %s\033[0m\n' "$*" >&2; exit 1; }
 kc() { kubectl --context "kind-$CLUSTER" "$@"; }
-turn_recorded() { # run namespace -> the initial turn has a committed result (either way)
-	[ -n "$(kubectl --context "kind-$CLUSTER" -n "$2" get agentrun "$1" -o jsonpath='{.status.cellnParent.initialTurn.result.succeeded}' 2>/dev/null)" ]
-}
-require_turn_succeeded() { # run namespace: a committed failed turn is reported with its reason
-	[ "$(kubectl --context "kind-$CLUSTER" -n "$2" get agentrun "$1" -o jsonpath='{.status.cellnParent.initialTurn.result.succeeded}')" = true ] ||
-		fail "initial turn of $1 failed: $(kubectl --context "kind-$CLUSTER" -n "$2" get agentrun "$1" -o jsonpath='{.status.cellnParent.initialTurn.result.answer}' | cut -c1-300)"
-}
 wait_for() { # description seconds command...
 	local what="$1" limit="$2" i=0
 	shift 2
@@ -70,212 +56,248 @@ wait_for() { # description seconds command...
 		i=$((i + 5))
 	done
 }
+mkdir -p "$WORK"
+api_pf=""
+cleanup() {
+	[ -z "$api_pf" ] || kill "$api_pf" 2>/dev/null || true
+	[ "${KEEP_CLUSTER:-}" = 1 ] || kind delete cluster --name "$CLUSTER" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
 
-log "Cluster and registry"
+log "Cluster (one control plane, two KVM workers) and a local registry the nodes pull from"
 if ! docker inspect "$REGISTRY_NAME" >/dev/null 2>&1; then
 	docker run -d --restart=always -p 127.0.0.1:5001:5000 --name "$REGISTRY_NAME" registry:2 >/dev/null
 fi
 if ! kind get clusters | grep -qx "$CLUSTER"; then
-	printf 'kind: Cluster\napiVersion: kind.x-k8s.io/v1alpha4\nnodes:\n  - role: control-plane\n  - role: worker\n  - role: worker\n' >"$WORK/kind.yaml"
+	cat >"$WORK/kind.yaml" <<'EOF'
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+containerdConfigPatches:
+  - |-
+    [plugins."io.containerd.grpc.v1.cri".registry]
+      config_path = "/etc/containerd/certs.d"
+nodes:
+  - role: control-plane
+  - role: worker
+  - role: worker
+EOF
 	kind create cluster --name "$CLUSTER" --config "$WORK/kind.yaml" --wait 120s
 fi
 docker network connect kind "$REGISTRY_NAME" 2>/dev/null || true
 registry="$(docker inspect -f '{{(index .NetworkSettings.Networks "kind").IPAddress}}' "$REGISTRY_NAME"):5000"
-# Kind nodes carry no kernel; the dispatcher's readiness needs one in /boot.
+for node in $(kind get nodes --name "$CLUSTER"); do
+	docker exec "$node" mkdir -p /etc/containerd/certs.d/localhost:5001
+	printf '[host."http://%s:5000"]\n' "$REGISTRY_NAME" | docker exec -i "$node" tee /etc/containerd/certs.d/localhost:5001/hosts.toml >/dev/null
+done
+# Kind nodes carry no kernel; the probe and the dispatcher both need one.
 kernel="/boot/vmlinuz-$(uname -r)"
 [ -r "$kernel" ] || fail "readable host kernel required at $kernel"
 for node in $(kind get nodes --name "$CLUSTER" | grep worker); do
 	docker exec "$node" test -f "/boot/$(basename "$kernel")" || docker cp "$kernel" "$node:/boot/"
 done
-pass "cluster $CLUSTER with registry $registry"
+# Deliberately no celln.dev/kvm label: the node probe must add it.
+pass "cluster $CLUSTER with registry $registry; no node labelled by hand"
 
-log "Starter package (built once per bundle)"
-package="$WORK/package"
-if [ ! -f "$package/package.json" ]; then
-	[ -f "$WORK/publisher.seed" ] || { head -c 32 /dev/urandom >"$WORK/publisher.seed"; chmod 600 "$WORK/publisher.seed"; }
-	# FLEET_TOOL_IMAGES names catalogue images whose commands join the
-	# worker as borrowed tools (e.g. "busybox jq"); their static executables
-	# are taken from the digest-pinned images in this work directory's root.
-	TOOL_IMAGE_ARGS=()
-	for image in ${FLEET_TOOL_IMAGES:-}; do TOOL_IMAGE_ARGS+=(--tool-image "$image"); done
-	"$CELLN_BUNDLE/bin/celln" --root "$WORK/celln-root" starter-package --runtime-dir "$CELLN_BUNDLE/share/celln" --guest-dir "$CELLN_BUNDLE/share/celln/pilot" \
-		--kernel "$kernel" --signing-key "$WORK/publisher.seed" --output "$package" "${TOOL_IMAGE_ARGS[@]}" >"$WORK/starter-package.log" 2>&1 || { tail -5 "$WORK/starter-package.log"; fail "starter package"; }
-fi
-"$CELLN_BUNDLE/bin/celln" starter-inspect "$package" >"$WORK/inspect.json"
-package_hash="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["packageHash"])' "$WORK/inspect.json")"
-publisher="$(python3 -c '
-import json, sys
-def find(o):
-    if isinstance(o, dict):
-        for k, v in o.items():
-            if k == "publisher" and isinstance(v, str): yield v
-            yield from find(v)
-    elif isinstance(o, list):
-        for i in o: yield from find(i)
-print(sorted(set(find(json.load(open(sys.argv[1])))))[0])' "$WORK/inspect.json")"
-rm -rf "$WORK/package-image" && mkdir -p "$WORK/package-image" && cp -r "$package" "$WORK/package-image/package"
-printf 'FROM scratch\nCOPY package /package\n' >"$WORK/package-image/Dockerfile"
-docker build -q -t "localhost:5001/celln/starter:$SCOPE" "$WORK/package-image" >/dev/null
-docker push -q "localhost:5001/celln/starter:$SCOPE"
-digest="$(docker inspect --format '{{index .RepoDigests 0}}' "localhost:5001/celln/starter:$SCOPE" | sed 's/.*@//')"
-pass "package $package_hash by $publisher at $registry/celln/starter@$digest"
+log "Starter package and a CLI that pins it and the model gateway, as a release build would"
+"$REPO/hack/build-celln-starter.sh" --bundle "$CELLN_BUNDLE" --kernel "$kernel" \
+	--image "localhost:5001/celln/starter:$CLUSTER" --out "$WORK/starter" --push >"$WORK/starter-build.log" 2>&1 || { tail -5 "$WORK/starter-build.log"; fail "starter package"; }
+digest="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["image"].split("@")[1])' "$WORK/starter/starter.json")"
+package_hash="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["packageHash"])' "$WORK/starter/starter.json")"
+publisher="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["publisher"])' "$WORK/starter/starter.json")"
+image="$registry/celln/starter@$digest"
+docker tag "ghcr.io/sympozium-ai/sympozium/model-gateway:$TAG" "localhost:5001/sympozium/model-gateway:$TAG"
+docker push -q "localhost:5001/sympozium/model-gateway:$TAG" >/dev/null
+gateway="localhost:5001/sympozium/model-gateway@$(docker buildx imagetools inspect "localhost:5001/sympozium/model-gateway:$TAG" --format '{{json .Manifest}}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["digest"])')"
+(cd "$REPO" && go build -ldflags "-X main.cellnStarterImage=$image -X main.cellnStarterHash=$package_hash -X main.cellnStarterPublisher=$publisher -X main.cellnStarterCellnVersion=journey -X main.modelGatewayImage=$gateway" -o "$WORK/sympozium" ./cmd/sympozium)
+pass "sympozium built with package $package_hash by $publisher and gateway $gateway"
 
-log "Images and CLI"
-for image in "$CELLN_IMAGE" "ghcr.io/sympozium-ai/sympozium/controller:$TAG" "ghcr.io/sympozium-ai/sympozium/apiserver:$TAG" "ghcr.io/sympozium-ai/sympozium/webhook:$TAG" "ghcr.io/sympozium-ai/sympozium/celln-installer:$TAG"; do
-	kind load docker-image --name "$CLUSTER" "$image" >/dev/null
+log "Images"
+for img in "$CELLN_IMAGE" "ghcr.io/sympozium-ai/sympozium/controller:$TAG" "ghcr.io/sympozium-ai/sympozium/apiserver:$TAG" "ghcr.io/sympozium-ai/sympozium/webhook:$TAG" "ghcr.io/sympozium-ai/sympozium/celln-installer:$TAG" "ghcr.io/sympozium-ai/sympozium/node-probe:$TAG"; do
+	kind load docker-image --name "$CLUSTER" "$img" >/dev/null
 done
-[ -x "$SYMPOZIUM" ] || (cd "$REPO" && go build -o "$SYMPOZIUM" ./cmd/sympozium)
-umask 077
-rm -f "$WORK/model-token"
-CREDENTIAL_ARGS=()
-if [ -n "$MODEL_KEY" ]; then
-	printf '%s\n' "$MODEL_KEY" >"$WORK/model-token"
-	CREDENTIAL_ARGS=(--celln-fleet-model-credential-file "$WORK/model-token")
-fi
-# With a second backend (or one added later) every backend is declared
-# explicitly: the native backend from the FLEET_MODEL_* inputs, the second
-# from FLEET_SECOND_BACKEND, and FLEET_ADD_BACKEND joins a running scope.
-native_spec="name=native,provider=$MODEL_PROVIDER"
-[ -n "${FLEET_MODEL:-}" ] && native_spec="$native_spec,model=$FLEET_MODEL"
-[ -n "${FLEET_MODEL_ENDPOINT:-}" ] && native_spec="$native_spec,endpoint=$FLEET_MODEL_ENDPOINT"
-[ -n "${FLEET_MODEL_PROTOCOL:-}" ] && native_spec="$native_spec,protocol=$FLEET_MODEL_PROTOCOL"
-[ "${FLEET_MODEL_ALLOW_INSECURE:-}" = 1 ] && native_spec="$native_spec,allow-insecure=true"
-[ -n "$MODEL_KEY" ] && native_spec="$native_spec,credential-file=$WORK/model-token"
-BACKEND_ARGS=(--celln-fleet-backend "$native_spec")
-SECOND_BACKEND=""
-if [ -n "${FLEET_SECOND_BACKEND:-}" ]; then
-	second_spec="$FLEET_SECOND_BACKEND"
-	if [ -n "${FLEET_SECOND_MODEL_KEY:-}" ]; then
-		printf '%s\n' "$FLEET_SECOND_MODEL_KEY" >"$WORK/second-token"
-		second_spec="$second_spec,credential-file=$WORK/second-token"
-	fi
-	SECOND_BACKEND="$(printf '%s' "$FLEET_SECOND_BACKEND" | tr ',' '\n' | sed -n 's/^name=//p')"
-	[ -n "$SECOND_BACKEND" ] || fail "FLEET_SECOND_BACKEND needs name=NAME"
-	BACKEND_ARGS+=(--celln-fleet-backend "$second_spec")
-fi
-ADD_BACKEND=""
-if [ -n "${FLEET_ADD_BACKEND:-}" ]; then
-	ADD_BACKEND="$(printf '%s' "$FLEET_ADD_BACKEND" | tr ',' '\n' | sed -n 's/^name=//p')"
-	[ -n "$ADD_BACKEND" ] || fail "FLEET_ADD_BACKEND needs name=NAME"
-	add_spec="$FLEET_ADD_BACKEND"
-	if [ -n "${FLEET_ADD_MODEL_KEY:-}" ]; then
-		printf '%s\n' "$FLEET_ADD_MODEL_KEY" >"$WORK/add-token"
-		add_spec="$add_spec,credential-file=$WORK/add-token"
-	fi
-fi
-if [ -n "$SECOND_BACKEND" ] || [ -n "$ADD_BACKEND" ]; then
-	CREDENTIAL_ARGS=()
-	MODEL_ARGS=("${BACKEND_ARGS[@]}")
-fi
-kc create namespace "$NAMESPACE" 2>/dev/null || true
-kc label node --overwrite -l '!node-role.kubernetes.io/control-plane' celln.dev/kvm=true >/dev/null
-pass "images loaded; workers labeled celln.dev/kvm=true"
+pass "images loaded"
 
-# A cached cert-manager manifest avoids depending on GitHub release downloads;
-# the installer skips cert-manager when its namespace already exists.
+log "Key canary: an in-cluster HTTPS provider that records which key each call carries"
+# The gateway sends a key only over HTTPS to an approved origin, so the canary
+# has its own CA, which the gateway is told to trust (modelGateway.providerCA).
+CANARY_NS=canary-provider CANARY_ORIGIN="https://canary.canary-provider.svc"
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 2 -subj "/CN=journey canary CA" \
+	-keyout "$WORK/canary-ca.key" -out "$WORK/canary-ca.crt" >/dev/null 2>&1 || fail "canary CA"
+openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -subj "/CN=canary.$CANARY_NS.svc" \
+	-keyout "$WORK/canary.key" -out "$WORK/canary.csr" >/dev/null 2>&1 || fail "canary key"
+printf 'subjectAltName=DNS:canary.%s.svc,DNS:canary.%s.svc.cluster.local\nextendedKeyUsage=serverAuth\n' "$CANARY_NS" "$CANARY_NS" >"$WORK/canary.ext"
+openssl x509 -req -in "$WORK/canary.csr" -CA "$WORK/canary-ca.crt" -CAkey "$WORK/canary-ca.key" -CAcreateserial -days 2 \
+	-extfile "$WORK/canary.ext" -out "$WORK/canary.crt" >/dev/null 2>&1 || fail "canary certificate"
+kc create namespace "$CANARY_NS" >/dev/null 2>&1 || true
+kc -n "$CANARY_NS" create secret tls canary-tls --cert "$WORK/canary.crt" --key "$WORK/canary.key" --dry-run=client -o yaml | kc apply -f - >/dev/null
+kc create namespace sympozium-system >/dev/null 2>&1 || true
+kc -n sympozium-system create configmap canary-provider-ca --from-file=ca.crt="$WORK/canary-ca.crt" --dry-run=client -o yaml | kc apply -f - >/dev/null
+kind get kubeconfig --name "$CLUSTER" >"$WORK/kubeconfig"
+KUBECONFIG="$WORK/kubeconfig" TEST_NAMESPACE="$CANARY_NS" KIND_CLUSTER_NAME="$CLUSTER" FAKE_MODEL_NAME=canary FAKE_MODEL_TLS_SECRET=canary-tls \
+	"$REPO/test/integration/deploy-fake-model.sh" >"$WORK/canary-deploy.log" 2>&1 || { tail -20 "$WORK/canary-deploy.log"; fail "canary provider"; }
+pass "canary provider serving $CANARY_ORIGIN"
+
+log "sympozium install: no model input at all"
 if [ -n "${FLEET_CERT_MANAGER_MANIFEST:-}" ]; then
 	kc apply -f "$FLEET_CERT_MANAGER_MANIFEST" >/dev/null
+	kc -n cert-manager wait --for=condition=Available deploy --all --timeout=180s >/dev/null
 fi
-
-log "sympozium install --celln-fleet"
-rm -rf "$WORK/fleet-out" # a fresh scope starts from an empty private output directory
-KUBECONFIG="$WORK/kubeconfig" kind export kubeconfig --name "$CLUSTER" --kubeconfig "$WORK/kubeconfig" >/dev/null
-fleet_install() { # extra args... ; the same command is rerun to add nodes or backends
-	KUBECONFIG="$WORK/kubeconfig" "$SYMPOZIUM" install -n "$NAMESPACE" --celln-fleet \
-		--celln-fleet-scope "$SCOPE" \
-		--celln-fleet-package-image "$registry/celln/starter@$digest" \
-		--celln-fleet-package-hash "$package_hash" \
-		--celln-fleet-publisher "$publisher" \
-		"${CREDENTIAL_ARGS[@]}" \
-		"${MODEL_ARGS[@]}" "${HOST_ARGS[@]}" "$@" \
-		--celln-fleet-output-dir "$WORK/fleet-out" \
-		--celln-fleet-wait 20m \
-		--celln-native-approve-starter-tools \
+# Only image tags for the sideloaded builds, the private test registry and the
+# two private provider origins the gateway may reach; nothing about a model,
+# a backend, a route or a key. Any provider key in the environment is dropped.
+sympozium_install() { # extra args... -> the same command, rerun to prove the package gate
+	KUBECONFIG="$WORK/kubeconfig" env -u DEEPSEEK_API_KEY -u OPENAI_API_KEY -u ANTHROPIC_API_KEY -u SYMPOZIUM_CELLN_BACKEND \
+		"$WORK/sympozium" install "$@" \
+		--set "modelGateway.privateOrigins[0]=$LLAMA_ORIGIN" --set "modelGateway.privateOrigins[1]=$CANARY_ORIGIN" \
+		--set modelGateway.providerCA.configMap=canary-provider-ca \
+		--celln-fleet-output-dir "$WORK/fleet-out" --celln-fleet-wait 20m \
 		--celln-router-image "$CELLN_IMAGE" \
 		--celln-installer-image "ghcr.io/sympozium-ai/sympozium/celln-installer:$TAG" \
 		--set celln.fleet.package.insecureRegistry=true \
-		--set "controller.image.tag=$TAG" --set "apiserver.image.tag=$TAG" --set "webhook.image.tag=$TAG"
+		--set "controller.image.tag=$TAG" --set "apiserver.image.tag=$TAG" --set "webhook.image.tag=$TAG" --set "nodeProbe.image.tag=$TAG" \
+		</dev/null
 }
-fleet_install >"$WORK/install.log" 2>&1 || { tail -20 "$WORK/install.log"; fail "fleet install"; }
+sympozium_install >"$WORK/install.log" 2>&1 || { tail -40 "$WORK/install.log"; fail "sympozium install"; }
+grep -q 'Using the default Celln starter package' "$WORK/install.log" || fail "the install did not pick the pinned package: $(head -20 "$WORK/install.log")"
+# The privilege disclosure (fleetPrivilegeNotice) is printed before anything is deployed.
+grep -q 'two privileged DaemonSets' "$WORK/install.log" && grep -q 'Nodes hold no model key' "$WORK/install.log" || fail "the install did not disclose the fleet's privilege: $(head -20 "$WORK/install.log")"
+grep -q 'Model gateway:' "$WORK/install.log" || fail "the install did not report the model gateway"
+# No provider key was asked for, read or mentioned.
+if grep -Eiq '_API_KEY|provider key|credential-file|celln-fleet-model|SYMPOZIUM_CELLN_BACKEND|starter Agent|model-credentials' "$WORK/install.log"; then
+	fail "the install mentioned a provider key or a model input: $(grep -Ei '_API_KEY|provider key|credential-file|celln-fleet-model|SYMPOZIUM_CELLN_BACKEND|starter Agent|model-credentials' "$WORK/install.log" | head -3)"
+fi
+pass "installed with the pinned package, the privilege disclosed and no model asked (log: $WORK/install.log)"
+
+log "The gateway, its database and the trust came up without any flags; the nodes joined by themselves"
+kc -n sympozium-system rollout status deploy/sympozium-model-gateway --timeout=300s >/dev/null || fail "model gateway not ready"
+kc -n sympozium-system rollout status statefulset/sympozium-model-gateway-db --timeout=300s >/dev/null || fail "bundled database not ready"
+for obj in secret/celln-mediation-controller secret/celln-mediation-gateway configmap/celln-mediation-trust; do
+	kc -n sympozium-system get "$obj" >/dev/null || fail "$obj missing in sympozium-system"
+done
+for obj in secret/celln-mediation-node configmap/celln-mediation-trust configmap/celln-mediation; do
+	kc -n celln-system get "$obj" >/dev/null || fail "$obj missing in celln-system"
+done
+[ "$(kc get nodes -l celln.dev/kvm=true -o name | wc -l)" -eq 2 ] || fail "expected both workers labelled by the probe"
 owners="$(kc -n celln-system get pods -l app.kubernetes.io/name=celln-node --field-selector status.phase=Running -o name | wc -l)"
 [ "$owners" -eq 2 ] || fail "expected 2 running owners, got $owners"
 kc -n sympozium-system get deploy sympozium-controller-manager -o jsonpath='{.spec.template.spec.nodeSelector}' | grep -q hostname && fail "controller pinned to a node"
-pass "two owners prepared from one package; controller unpinned; catalogue installed in $NAMESPACE"
+pass "gateway, bundled PostgreSQL and mediation trust in place; two owners prepared from one package; controller unpinned"
 
-log "Enduring runs are issued through the gateway to fleet owners"
-run_ready() { [ "$(kc -n "${2:-$NAMESPACE}" get agentrun "$1" -o jsonpath='{.status.conditions[?(@.type=="CellnParentReady")].status}')" = True ]; }
-node_of() { # launch profile -> node whose owner issued it
-	for pod in $(kc -n celln-system get pods -l app.kubernetes.io/name=celln-node -o name); do
-		if kc -n celln-system exec "$pod" -c dispatcher -- test -e "/var/lib/sympozium-celln/$SCOPE/authority/trusted-parent-launches/${1#blake3:}.json" 2>/dev/null; then
-			kc -n celln-system get "$pod" -o jsonpath='{.spec.nodeName}'
-		fi
-	done
+log "The fleet holds no model: no credential Secret, no managed Agent or connection, one mediation-only profile, a policy without routes"
+[ -z "$(kc get secrets -A --field-selector metadata.name=celln-fleet-model-credentials -o name)" ] || fail "a fleet model credential Secret exists"
+managed="$(kc get agents,modelconnections -A -o json | python3 -c '
+import json, sys
+for i in json.load(sys.stdin)["items"]:
+    m = i["metadata"]; labels = m.get("labels") or {}
+    if labels.get("sympozium.ai/managed-by") == "celln-platform" or m["name"].startswith("celln-") or m["name"] == "starter":
+        print(i["kind"] + " " + m["namespace"] + "/" + m["name"])')"
+[ -z "$managed" ] || fail "the install created a model object: $(echo "$managed" | tr '\n' ' ')"
+[ "$(kc get cellnruntimeprofile "$PROFILE" -o jsonpath='{.metadata.labels.celln\.sympozium\.ai/mediation-only}')" = true ] || fail "profile $PROFILE is not labelled celln.sympozium.ai/mediation-only=true"
+kc get cellnruntimeprofile "$PROFILE.toolbox" >/dev/null || fail "toolbox profile $PROFILE.toolbox missing"
+[ "$(kc get cellnruntimeprofile -o name | wc -l)" -eq 2 ] || fail "expected exactly the profile and its toolbox, got: $(kc get cellnruntimeprofile -o name | tr '\n' ' ')"
+[ -z "$(kc get cellnexecutionpolicy "$POLICY" -o jsonpath='{.spec.allowedOrigins}{.spec.deniedOrigins}')" ] || fail "policy $POLICY narrows origins out of the box: $(kc get cellnexecutionpolicy "$POLICY" -o jsonpath='{.spec.allowedOrigins} {.spec.deniedOrigins}')"
+tools="$(kc get clustercellntool -o name | wc -l)"
+[ "$tools" -ge 8 ] || fail "expected at least the eight brokered tools, got $tools"
+pass "no fleet credential; no Agent or ModelConnection anywhere; $PROFILE (+ .toolbox) mediation-only; $POLICY has no origin guardrail; $tools tools"
+
+log "API access"
+api_token="$(kc -n sympozium-system get secret sympozium-ui-token -o jsonpath='{.data.token}' | base64 -d)"
+api_auth=(-H "Authorization: Bearer $api_token")
+kc -n sympozium-system rollout status deploy/sympozium-apiserver --timeout=300s >/dev/null || fail "apiserver rollout"
+api_port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')"
+kubectl --context "kind-$CLUSTER" -n sympozium-system port-forward svc/sympozium-apiserver "$api_port:8080" >/dev/null 2>&1 &
+api_pf=$!
+API="http://127.0.0.1:$api_port"
+tenant_local=fleet-local tenant_canary=fleet-canary denied=fleet-denied
+for ns in "$tenant_local" "$tenant_canary" "$denied"; do kc create namespace "$ns" >/dev/null 2>&1 || true; done
+kc label namespace "$denied" --overwrite celln.sympozium.ai/excluded=true >/dev/null
+wait_for "apiserver port-forward" 120 curl -sf "${api_auth[@]}" "$API/api/v1/celln-platform/profiles?namespace=$tenant_local" -o /dev/null
+api() { curl -sf "${api_auth[@]}" "$@"; }
+api_json() { api -H 'Content-Type: application/json' "$@"; }
+api_code() { curl -s -o "$WORK/api-last-body" -w '%{http_code}' "${api_auth[@]}" -H 'Content-Type: application/json' "$@"; }
+
+log "A fresh namespace is offered the mediation-only profile; the excluded one is refused; the policy routes nothing"
+profiles="$(api "$API/api/v1/celln-platform/profiles?namespace=$tenant_local")"
+echo "$profiles" | python3 -c '
+import json, sys
+ps = json.load(sys.stdin)
+p = next((p for p in ps if p["name"] == sys.argv[1]), None)
+assert p, f"profile {sys.argv[1]} not offered: {ps}"
+assert p.get("mediationOnly") is True, "profile is not mediation-only"
+assert not p.get("provider") and not p.get("model") and not p.get("endpoint"), "profile still carries a fleet model"
+assert not p.get("agent"), "profile still names a shared Agent"
+assert p["wrapper"] == "celln-native", p["wrapper"]
+assert p.get("toolboxProfile") == sys.argv[1] + ".toolbox", p.get("toolboxProfile")
+assert p.get("toolboxWrapper") == "celln-native.toolbox", p.get("toolboxWrapper")
+assert p["policy"] == sys.argv[2], p["policy"]' "$PROFILE" "$POLICY" || fail "profile listing for $tenant_local"
+api "$API/api/v1/celln-platform/mediation?namespace=$tenant_local" | python3 -c '
+import json, sys
+m = json.load(sys.stdin)
+assert m["enabled"] is True, m
+assert m["allowedOrigins"] == [] and m["deniedOrigins"] == [], f"origin guardrail out of the box: {m}"
+assert m["routes"] == [] and m["pending"] == [], f"routes or pending left: {m}"
+assert sys.argv[1] in m["policies"], m["policies"]
+assert sys.argv[2] in m["privateOrigins"] and sys.argv[3] in m["privateOrigins"], m["privateOrigins"]
+print("mediation: enabled, no origin guardrail, no routes, private origins", m["privateOrigins"])' "$POLICY" "$LLAMA_ORIGIN" "$CANARY_ORIGIN" || fail "mediation report for $tenant_local"
+[ "$(api "$API/api/v1/celln-platform/profiles?namespace=$denied")" = "[]" ] || fail "excluded namespace $denied was offered a profile"
+[ "$(api_code -X POST -d "{\"profile\":\"$PROFILE\",\"runtimeOnly\":true}" "$API/api/v1/celln-platform/wrappers?namespace=$denied")" = 403 ] || fail "excluded namespace $denied was given a wrapper"
+pass "$tenant_local is offered $PROFILE (mediation-only, no provider, no shared Agent); $denied gets nothing; mediation lists no routes"
+
+# toolbox_selection namespace -> "wrapper<TAB>tool-refs JSON": the toolbox
+# wrapper (an AgentRuntime, created runtime-only) and exactly the tools it
+# lends. Nothing else is created in the namespace: the Agent's own connection
+# is its model route.
+toolbox_selection() {
+	local ns=$1 profiles toolbox_profile
+	profiles="$(api "$API/api/v1/celln-platform/profiles?namespace=$ns")"
+	toolbox_profile="$(echo "$profiles" | python3 -c 'import json,sys; print(next(p["toolboxProfile"] for p in json.load(sys.stdin) if p.get("toolboxProfile")))')" || fail "no toolbox profile is offered in $ns: $profiles"
+	api_json -X POST -d "{\"profile\":\"$toolbox_profile\",\"runtimeOnly\":true}" "$API/api/v1/celln-platform/wrappers?namespace=$ns" | python3 -c '
+import json, sys
+w = json.load(sys.stdin)
+assert w["runtime"] == sys.argv[1], w
+assert not w.get("agent") and not w.get("connection"), f"wrapper creation made a shared Agent or connection: {w}"' "celln-native.toolbox" || fail "toolbox wrapper in $ns"
+	[ -z "$(kc -n "$ns" get agents,modelconnections -o name)" ] || fail "wrapper creation left model objects in $ns: $(kc -n "$ns" get agents,modelconnections -o name | tr '\n' ' ')"
+	echo "$profiles" | python3 -c 'import json,sys; p=next(p for p in json.load(sys.stdin) if p.get("toolboxProfile")); print(p["toolboxWrapper"]+"\t"+json.dumps(p["toolboxTools"]))'
 }
-launch_of() { kc -n "$NAMESPACE" get agentrun "$1" -o jsonpath='{.status.cellnParent.binding.launchProfile}'; }
-first="$(kc -n "$NAMESPACE" create -f "$WORK/fleet-out/installation/run.json" -o jsonpath='{.metadata.name}')"
-wait_for "parent $first ready" 240 run_ready "$first"
-[ "$(kc -n "$NAMESPACE" get agentrun "$first" -o jsonpath='{.status.cellnParent.binding.target}')" = "http://celln-router.celln-system.svc.cluster.local:8787" ] || fail "$first not issued through the gateway"
-wait_for "initial turn of $first" 240 turn_recorded "$first" "$NAMESPACE"
-require_turn_succeeded "$first" "$NAMESPACE"
-first_node="$(node_of "$(launch_of "$first")")"
-[ -n "$first_node" ] || fail "owner of $first not found"
-pass "$first issued through the gateway to $first_node and completed a real model turn"
-
-# The gateway places by incarnation hash, not by load. With per-parent broker
-# charging (celln#112) and node-sized capacity a node holds many parents, so
-# keep creating runs until one lands on the first owner and prove both live
-# there. FLEET_EXPECT_COLOCATION=0 restores the one-parent-per-node assertion
-# for Celln bundles without it.
-extra=()
-colocated=""
-for attempt in 1 2 3 4 5 6; do
-	run="$(kc -n "$NAMESPACE" create -f "$WORK/fleet-out/installation/run.json" -o jsonpath='{.metadata.name}')"
-	extra+=("$run")
-	wait_for "issuance of $run" 120 bash -c "[ -n \"\$(kubectl --context kind-$CLUSTER -n $NAMESPACE get agentrun $run -o jsonpath='{.status.cellnParent.binding.launchProfile}')\" ]"
-	node="$(node_of "$(launch_of "$run")")"
-	[ -n "$node" ] || fail "owner of $run not found"
-	if [ "$node" != "$first_node" ]; then
-		wait_for "parent $run ready" 240 run_ready "$run"
-		pass "$run issued to the other owner $node"
-		continue
-	fi
-	colocated="$run"
-	break
-done
-[ -n "$colocated" ] || fail "no run hashed to $first_node in ${#extra[@]} attempts"
-if [ "${FLEET_EXPECT_COLOCATION:-1}" = 1 ]; then
-	wait_for "parent $colocated ready beside $first on $first_node" 240 run_ready "$colocated"
-	wait_for "initial turn of $colocated" 240 turn_recorded "$colocated" "$NAMESPACE"
-	require_turn_succeeded "$colocated" "$NAMESPACE"
-	run_ready "$first" || fail "$first lost readiness when $colocated joined $first_node"
-	pass "$colocated and $first are both live on $first_node and $colocated completed a real model turn"
-else
-	wait_for "capacity refusal of $colocated" 120 bash -c "kubectl --context kind-$CLUSTER -n $NAMESPACE get agentrun $colocated -o jsonpath='{.status.conditions[?(@.type==\"CellnParentReady\")].reason}' | grep -qE 'CreateRefused|ReconciliationRequired'"
-	pass "$colocated hashed to $first_node and was refused there (one parent per node); not re-placed"
-fi
-
-log "Follow-up turn keeps live context on the same owner"
-uid="$(kc -n "$NAMESPACE" get agentrun "$first" -o jsonpath='{.metadata.uid}')"
-kc -n "$NAMESPACE" create -f - >/dev/null <<EOF
-apiVersion: sympozium.ai/v1alpha1
-kind: AgentRunTurn
-metadata:
-  name: $first-turn-2
-  ownerReferences:
-    - {apiVersion: sympozium.ai/v1alpha1, kind: AgentRun, name: $first, uid: "$uid", controller: true, blockOwnerDeletion: true}
-spec:
-  runName: $first
-  runUID: "$uid"
-  message: Read notes.txt with workspace-read and reply with exactly its content and revision.
-EOF
-wait_for "follow-up turn" 240 bash -c "kubectl --context kind-$CLUSTER -n $NAMESPACE get agentrunturn $first-turn-2 -o jsonpath='{.status.conditions[?(@.type==\"CellnTurnComplete\")].status}' | grep -q True"
-answer="$(kc -n "$NAMESPACE" get agentrunturn "$first-turn-2" -o jsonpath='{.status.execution.result.answer}')"
-echo "$answer" | grep -qi violet || fail "follow-up turn lost context: $answer"
-[ "$(kc -n "$NAMESPACE" get agentrunturn "$first-turn-2" -o jsonpath='{.status.execution.child}')" != "$(kc -n "$NAMESPACE" get agentrun "$first" -o jsonpath='{.status.cellnParent.initialTurn.child}')" ] || fail "turn reused the initial child"
-pass "distinct child read back: $(echo "$answer" | tr '\n' ' ')"
-
-turn_answer() { # run turn-name message [namespace] -> the turn's answer
-	local run=$1 name=$2 message=$3 ns=${4:-$NAMESPACE} uid
+# create_agent namespace name connection model -> an Agent on the toolbox
+# wrapper whose model route is its own connection (POST /api/v1/agents).
+create_agent() {
+	local ns=$1 name=$2 connection=$3 model=$4 provider=$5 wrapper tool_refs
+	IFS=$'\t' read -r wrapper tool_refs < <(toolbox_selection "$ns")
+	python3 -c '
+import json, sys
+ns, name, connection, model, provider, wrapper, tools = sys.argv[1:8]
+print(json.dumps({"name": name, "provider": provider, "model": model, "runtimeRef": wrapper,
+  "execution": {"backend": "celln", "executionLifecycle": "enduring", "modelConnectionRef": connection, "model": model,
+    # The persona belongs to the Agent; every run below must carry it into its cell.
+    "systemPrompt": "You are the fleet journey agent " + name + ". Answer with only what is asked.",
+    "cellnSelection": {"runtimeRef": wrapper, "toolRefs": [], "clusterToolRefs": json.loads(tools)},
+    "enduring": {"leaseSeconds": 1800, "maxTurns": 12, "maxModelRequests": 64, "maxOutputTokens": 98304}}}))' \
+		"$ns" "$name" "$connection" "$model" "$provider" "$wrapper" "$tool_refs" |
+		api_json -X POST --data-binary @- "$API/api/v1/agents?namespace=$ns" >/dev/null || fail "API refused Agent $name in $ns"
+}
+# The gateway reserves each model request's full output bound against the
+# run's maxOutputTokens, and a turn with tools may make several requests, so a
+# conversation needs room for every turn's requests or its parent ends with
+# its budget exhausted.
+start_conversation() { # namespace agent task [maxOutputTokens] [leaseSeconds] -> run name
+	kc -n "$1" get agent "$2" -o json | python3 -c '
+import json, sys
+e = json.load(sys.stdin)["spec"]["execution"]
+print(json.dumps({"agentRef": sys.argv[2], "task": sys.argv[1], "backend": "celln", "executionLifecycle": "enduring",
+  "enduring": {"leaseSeconds": int(sys.argv[4]), "maxTurns": 12, "maxModelRequests": 64, "maxOutputTokens": int(sys.argv[3])},
+  "model": e["model"], "modelConnectionRef": e["modelConnectionRef"],
+  "cellnSelection": {"runtimeRef": e["cellnSelection"]["runtimeRef"], "clusterToolRefs": e["cellnSelection"].get("clusterToolRefs", []), "toolRefs": []}}))' "$3" "$2" "${4:-98304}" "${5:-1800}" |
+		api_json -X POST --data-binary @- "$API/api/v1/runs?namespace=$1" |
+		python3 -c 'import json,sys; print(json.load(sys.stdin)["metadata"]["name"])'
+}
+first_answer() { kc -n "$1" get agentrun "$2" -o jsonpath='{.status.result}'; }
+wait_first_answer() { # namespace run
+	wait_for "first answer of $2" 420 bash -c "[ -n \"\$(kubectl --context kind-$CLUSTER -n $1 get agentrun $2 -o jsonpath='{.status.result}')\" ] || kubectl --context kind-$CLUSTER -n $1 get agentrun $2 -o jsonpath='{.status.phase}' | grep -q Failed"
+	[ "$(kc -n "$1" get agentrun "$2" -o jsonpath='{.status.phase}')" != Failed ] || fail "$2 failed: $(kc -n "$1" get agentrun "$2" -o jsonpath='{.status.error}')"
+}
+send_turn() { # namespace run turn-name message
+	local ns=$1 run=$2 name=$3 message=$4 uid
 	uid="$(kc -n "$ns" get agentrun "$run" -o jsonpath='{.metadata.uid}')"
 	kc -n "$ns" create -f - >/dev/null <<EOF
 apiVersion: sympozium.ai/v1alpha1
@@ -289,354 +311,289 @@ spec:
   runUID: "$uid"
   message: "$message"
 EOF
-	wait_for "turn $name" 240 bash -c "kubectl --context kind-$CLUSTER -n $ns get agentrunturn $name -o jsonpath='{.status.conditions[?(@.type==\"CellnTurnComplete\")].status}' | grep -q True"
-	kc -n "$ns" get agentrunturn "$name" -o jsonpath='{.status.execution.result.answer}'
 }
-if kc get clustercellntool "celln-$SCOPE-workspace-list" >/dev/null 2>&1; then
-	log "Run files over the conversation: append, search, list and delete through the workspace broker"
-	# The workspace revision moves with every change; the model carries it
-	# between turns like any other fact it read.
-	answer="$(turn_answer "$first" "$first-turn-3" "Append the text ' orange' to notes.txt with workspace-append using revision 1. Reply with only the new revision number.")"
-	echo "$answer" | grep -q '2' || fail "append did not report revision 2: $answer"
-	answer="$(turn_answer "$first" "$first-turn-4" "Call workspace-search exactly once with pattern orange. Reply with the file name and line number it reports.")"
-	echo "$answer" | grep -q 'notes.txt' || fail "search did not find the appended text: $answer"
-	answer="$(turn_answer "$first" "$first-turn-5" "Call workspace-list exactly once. Reply with each file name and its size in bytes.")"
-	echo "$answer" | grep -q 'notes.txt' || fail "list did not name the file: $answer"
-	answer="$(turn_answer "$first" "$first-turn-6" "Delete notes.txt with workspace-delete using revision 2. Reply with the exact JSON result the tool returned, nothing else.")"
-	echo "$answer" | grep -q '3' || fail "delete did not report revision 3: $answer"
-	answer="$(turn_answer "$first" "$first-turn-7" "Call workspace-list exactly once. Reply with the exact JSON result the tool returned, nothing else.")"
-	if ! echo "$answer" | grep -q '"files":\[\]'; then
-		# A small local model now and then answers a revision number without
-		# calling the tool; the workspace is the truth, so ask once more.
-		echo "list still reports files after the delete ($answer); repeating the delete once" >&2
-		turn_answer "$first" "$first-turn-6b" "Delete notes.txt with workspace-delete using revision 2. Reply with the exact JSON result the tool returned, nothing else." >/dev/null
-		answer="$(turn_answer "$first" "$first-turn-7b" "Call workspace-list exactly once. Reply with the exact JSON result the tool returned, nothing else.")"
-	fi
-	echo "$answer" | grep -q '"files":\[\]' || fail "list still reports files after the delete: $answer"
-	pass "notes.txt was appended to (revision 2), found by search, listed, deleted (revision 3) and gone from the listing"
-fi
+turn_json() { kc -n "$1" get agentrunturn "$2" -o json; }
+wait_turn() { # namespace turn-name -> the turn committed (or its parent ended)
+	wait_for "turn $2" 300 bash -c "kubectl --context kind-$CLUSTER -n $1 get agentrunturn $2 -o json | grep -qiE '\"reason\": \"(Committed|ParentEnded)\"'"
+}
+turn_recalls() { # namespace turn-name word -> the committed answer names the word
+	turn_json "$1" "$2" | python3 -c 'import json,sys; t=json.load(sys.stdin); sys.exit(0 if sys.argv[1].lower() in json.dumps(t.get("status",{})).lower() else 1)' "$3"
+}
 
-# Every run deletes cleanly through the gateway, live or refused.
-for run in "$first" "${extra[@]}"; do
-	kc -n "$NAMESPACE" delete agentrun "$run" --timeout=180s >/dev/null || fail "$run could not be deleted"
-done
-pass "$first and ${#extra[@]} other runs deleted through the gateway"
-
-log "Any ordinary namespace runs on the fleet; wrappers are created on first use; an excluded one is refused"
-tenant="$NAMESPACE-b"
-denied="$NAMESPACE-denied"
-profile="celln-native-$SCOPE"
-kc create namespace "$tenant" >/dev/null 2>&1 || true
-kc create namespace "$denied" >/dev/null 2>&1 || true
-kc label namespace "$denied" --overwrite celln.sympozium.ai/excluded=true >/dev/null
-# The tenant path is the API: list the profiles the namespace may run, then
-# have the wrappers created. No label, no YAML.
-api_token="$(kc -n sympozium-system get secret sympozium-ui-token -o jsonpath='{.data.token}' 2>/dev/null | base64 -d || true)"
-[ -n "$api_token" ] || api_token="$(kc -n sympozium-system get deploy sympozium-apiserver -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="SYMPOZIUM_UI_TOKEN")].value}')"
-api_auth=()
-[ -n "$api_token" ] && api_auth=(-H "Authorization: Bearer $api_token")
-# Run kubectl itself in the background (not the kc function, whose subshell
-# would survive the kill) on a port no other journey holds.
-api_port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')"
-kubectl --context "kind-$CLUSTER" -n sympozium-system port-forward svc/sympozium-apiserver "$api_port:8080" >/dev/null 2>&1 &
-api_pf=$!
-trap 'kill "$api_pf" 2>/dev/null || true' EXIT
-wait_for "apiserver port-forward" 60 curl -sf "${api_auth[@]}" "http://127.0.0.1:$api_port/api/v1/celln-platform/profiles?namespace=$tenant" -o /dev/null
-curl -sf "${api_auth[@]}" "http://127.0.0.1:$api_port/api/v1/celln-platform/profiles?namespace=$tenant" | grep -q "\"name\":\"$profile\"" || fail "platform profile $profile not offered to $tenant"
-curl -sf "${api_auth[@]}" -X POST -H 'Content-Type: application/json' -d "{\"profile\":\"$profile\"}" "http://127.0.0.1:$api_port/api/v1/celln-platform/wrappers?namespace=$tenant" | grep -q '"connection":"celln-native"' || fail "wrappers were not created in $tenant"
-if [ -n "$SECOND_BACKEND" ]; then
-	# The second backend is a second profile of the same scope with its own
-	# wrapper names; the same namespace gets both.
-	second_profile="$profile-$SECOND_BACKEND"
-	curl -sf "${api_auth[@]}" "http://127.0.0.1:$api_port/api/v1/celln-platform/profiles?namespace=$tenant" | grep -q "\"name\":\"$second_profile\"" || fail "second backend profile $second_profile not offered to $tenant"
-	curl -sf "${api_auth[@]}" -X POST -H 'Content-Type: application/json' -d "{\"profile\":\"$second_profile\"}" "http://127.0.0.1:$api_port/api/v1/celln-platform/wrappers?namespace=$tenant" | grep -q "\"connection\":\"celln-$SECOND_BACKEND\"" || fail "second backend wrappers were not created in $tenant"
-	pass "$tenant offers both backends: $profile (celln-native) and $second_profile (celln-$SECOND_BACKEND)"
-fi
-[ "$(curl -s "${api_auth[@]}" "http://127.0.0.1:$api_port/api/v1/celln-platform/profiles?namespace=$denied")" = "[]" ] || fail "excluded namespace $denied was offered a profile"
-[ "$(curl -s -o /dev/null -w '%{http_code}' "${api_auth[@]}" -X POST -H 'Content-Type: application/json' -d "{\"profile\":\"$profile\"}" "http://127.0.0.1:$api_port/api/v1/celln-platform/wrappers?namespace=$denied")" = 403 ] || fail "excluded namespace $denied was prepared"
-# The excluded namespace applies the same objects by hand so its refusal is the policy's, not a missing Agent.
-for kind in modelconnection agentruntime agent; do
-	kc -n "$NAMESPACE" get "$kind" -o json | python3 -c "
+log "Tenant $tenant_local: its own keyless connection to $LLAMA_ORIGIN, its own Agent, a conversation through the router"
+python3 -c '
 import json, sys
-for item in json.load(sys.stdin)['items']:
-    print(json.dumps({'apiVersion': item['apiVersion'], 'kind': item['kind'], 'metadata': {'name': item['metadata']['name'], 'namespace': sys.argv[1]}, 'spec': item['spec']}))" "$denied" | kc apply -f - >/dev/null
-done
-# Tenants start runs through the API, as the UI does, and one Agent may hold
-# several enduring conversations at once.
-api_run() { # task [backend] -> run name, via POST /api/v1/runs; a backend selects that backend's wrappers and model
-	python3 -c '
-import json, os, sys
-r = json.load(open(sys.argv[1]))["spec"]
-backend = sys.argv[3] if len(sys.argv) > 3 else ""
-agent, runtime, connection, model = r["agentRef"], r["cellnSelection"]["runtimeRef"], r["model"]["connectionRef"], r["model"]["model"]
-if backend:
-    agent, runtime, connection = f"celln-agent-{backend}", f"celln-{backend}", f"celln-{backend}"
-    # The installer writes configured.json per backend; one added through
-    # the API has none, and the journey adds it on the same model.
-    model = json.load(open(sys.argv[4]))["model"]["model"] if os.path.exists(sys.argv[4]) else os.environ["FLEET_MODEL"]
-print(json.dumps({"agentRef": agent, "task": sys.argv[2], "systemPrompt": r["systemPrompt"], "backend": "celln",
-  "executionLifecycle": "enduring", "enduring": r["enduring"], "model": model, "modelConnectionRef": connection,
-  "cellnSelection": {"runtimeRef": runtime, "clusterToolRefs": r["cellnSelection"]["clusterToolRefs"], "toolRefs": []}}))' "$WORK/fleet-out/installation/run.json" "$1" ${2:+"$2" "$WORK/fleet-out/configuration/$2/configured.json"} |
-		curl -sf "${api_auth[@]}" -X POST -H 'Content-Type: application/json' --data-binary @- "http://127.0.0.1:$api_port/api/v1/runs?namespace=$tenant" |
-		python3 -c 'import json,sys; print(json.load(sys.stdin)["metadata"]["name"])'
-}
-tenant_task="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["spec"]["task"])' "$WORK/fleet-out/installation/run.json")"
-tenant_run="$(api_run "$tenant_task")" || fail "API refused an enduring run in $tenant"
-tenant_run2="$(api_run "Remember the word saffron. Reply with one short sentence; do not use tools.")" || fail "API refused a second conversation for the same Agent in $tenant"
-tenant_runs=("$tenant_run" "$tenant_run2")
-second_run=""
-if [ -n "$SECOND_BACKEND" ]; then
-	second_run="$(api_run "Where is Botswana? Reply with one short sentence; do not use tools." "$SECOND_BACKEND")" || fail "API refused a conversation on backend $SECOND_BACKEND in $tenant"
-	tenant_runs+=("$second_run")
-fi
-kill "$api_pf" >/dev/null 2>&1 || true
-for run in "${tenant_runs[@]}"; do
-	wait_for "parent $run ready in $tenant" 240 run_ready "$run" "$tenant"
-	wait_for "initial turn of $run" 300 turn_recorded "$run" "$tenant"
-	require_turn_succeeded "$run" "$tenant"
-done
-[ "$(kc -n "$tenant" get agentrun "$tenant_run2" -o jsonpath='{.status.cellnParent.binding.incarnation}')" != "$(kc -n "$tenant" get agentrun "$tenant_run" -o jsonpath='{.status.cellnParent.binding.incarnation}')" ] || fail "two conversations shared a parent"
-pass "two enduring conversations of one Agent started through the API in $tenant, each with its own parent"
-if [ -n "$second_run" ]; then
-	[ "$(kc -n "$tenant" get agentrun "$second_run" -o jsonpath='{.spec.cellnSelection.runtimeRef}{" "}{.spec.model.connectionRef}')" = "celln-$SECOND_BACKEND celln-$SECOND_BACKEND" ] || fail "$second_run did not run on backend $SECOND_BACKEND"
-	second_answer="$(kc -n "$tenant" get agentrun "$second_run" -o jsonpath='{.status.cellnParent.initialTurn.result.answer}' 2>/dev/null || true)"
-	pass "$second_run answered on backend $SECOND_BACKEND in the same namespace as the native runs: ${second_answer:0:160}"
-fi
+origin, model = sys.argv[1:3]
+print(json.dumps({"name": "local", "spec": {"provider": "llama-server", "protocol": "openai-chat", "endpoint": origin + "/v1/chat/completions",
+  "models": [model], "allowInsecure": True,
+  # A local reasoning model at ~10 tokens/s must answer within a turn: no thinking, and a short output bound per request.
+  "parameters": {"chat_template_kwargs": {"enable_thinking": False}}, "maxOutputTokens": 512}}))' "$LLAMA_ORIGIN" "$LLAMA_MODEL" |
+	api_json -X POST --data-binary @- "$API/api/v1/model-connections?namespace=$tenant_local" >/dev/null || fail "API refused the keyless connection in $tenant_local"
+[ -z "$(kc -n "$tenant_local" get modelconnection local -o jsonpath='{.spec.secretRef}')" ] || fail "the keyless connection got a Secret"
+create_agent "$tenant_local" local-agent local "$LLAMA_MODEL" llama-server
+run_local="$(start_conversation "$tenant_local" local-agent "Remember the word indigo. Reply with only READY.")" || fail "API refused a conversation in $tenant_local"
+wait_first_answer "$tenant_local" "$run_local"
+[ "$(kc -n "$tenant_local" get agentrun "$run_local" -o jsonpath='{.spec.systemPrompt}')" = "You are the fleet journey agent local-agent. Answer with only what is asked." ] || fail "$run_local does not carry its Agent persona"
+[ "$(kc -n "$tenant_local" get agentrun "$run_local" -o jsonpath='{.status.cellnParent.binding.target}')" = "http://celln-router.celln-system.svc.cluster.local:8787" ] || fail "$run_local not issued through the router"
+send_turn "$tenant_local" "$run_local" "$run_local-recall" "Which word did I ask you to remember? Reply with only the word."
+wait_turn "$tenant_local" "$run_local-recall"
+turn_recalls "$tenant_local" "$run_local-recall" indigo || fail "$tenant_local conversation did not recall indigo: $(turn_json "$tenant_local" "$run_local-recall" | python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin).get("status",{}))[:300])')"
+pass "$run_local answered through the router on a keyless connection ('$(first_answer "$tenant_local" "$run_local" | head -c 60)') and recalled indigo"
 
-if [ -n "${FLEET_TOOL_IMAGES:-}" ]; then
-	log "Borrowed commands from pinned images: the catalogue carries their source, the model calls them through the argv binding"
-	tool_count="$(kc get clustercellntool -o json | python3 -c '
-import json,sys
-tools=[t for t in json.load(sys.stdin)["items"] if t["spec"].get("invocationABI")=="celln.argv/v1"]
-for t in tools: assert t["spec"].get("sourceImage",""), t["metadata"]["name"]+" lacks a source image"
-print(len(tools))')"
-	[ "$tool_count" -ge 2 ] || fail "borrowed commands not installed as cluster tools with provenance ($tool_count)"
-	pass "$tool_count borrowed commands installed as cluster tools, each naming its pinned source image"
-fi
-log "One-shot runs on the fleet: a single-turn parent per run, any backend, finished with its answer"
-# The same API call as an enduring conversation minus the lifecycle and lease:
-# the platform admits it, one parent answers once, the run succeeds with the
-# answer and its parent is stopped so the node's cells come back.
-live_cells() { # sum of live cells across every owner
-	local total=0 n
-	for pod in $(kubectl --context "kind-$CLUSTER" -n celln-system get pods -l app.kubernetes.io/name=celln-node --field-selector status.phase=Running -o name); do
-		n="$(kubectl --context "kind-$CLUSTER" -n celln-system exec "$pod" -c dispatcher -- curl -s http://127.0.0.1:8787/v1/health | python3 -c 'import json,sys; print(json.load(sys.stdin)["node"]["live_cells"])')" || n=0
-		total=$((total + n))
-	done
-	echo "$total"
-}
-cells_before="$(live_cells)"
-kubectl --context "kind-$CLUSTER" -n sympozium-system port-forward svc/sympozium-apiserver "$api_port:8080" >/dev/null 2>&1 &
-api_pf=$!
-wait_for "apiserver port-forward" 60 curl -sf "${api_auth[@]}" "http://127.0.0.1:$api_port/api/v1/celln-platform/profiles?namespace=$tenant" -o /dev/null
-api_one_shot() { # task [backend] -> run name, via POST /api/v1/runs with the one-shot lifecycle
+log "Tenant $tenant_local: the same Agent as an OpenAI-compatible endpoint continues that conversation"
+completion="$(api -H 'Content-Type: application/json' -H "X-Sympozium-Namespace: $tenant_local" -X POST "$API/api/v1/agents/local-agent/v1/chat/completions?timeout=5m" \
+	-d '{"model":"local-agent","messages":[{"role":"system","content":"ignored: the Agent holds its own conversation"},{"role":"user","content":"Once more: which word did I ask you to remember? Reply with only the word."}]}')" || fail "chat completion against local-agent failed: $(cat "$WORK/api-last-body" 2>/dev/null | head -c 300)"
+echo "$completion" | python3 -c '
+import json, sys
+c = json.load(sys.stdin)
+assert c["object"] == "chat.completion" and c["model"] == "local-agent", c
+assert c["choices"][0]["finish_reason"] == "stop", c
+assert "indigo" in c["choices"][0]["message"]["content"].lower(), c["choices"][0]["message"]["content"]
+assert c["sympozium"]["run"] == sys.argv[1] and c["sympozium"]["turn"] and not c["sympozium"]["started"], c["sympozium"]
+' "$run_local" || fail "chat completion did not continue $run_local with indigo: $(echo "$completion" | head -c 400)"
+[ "$(api "$API/api/v1/agents/local-agent/v1/models?namespace=$tenant_local" | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"][0]["id"])')" = local-agent ] || fail "the Agent is not listed as its endpoint's model"
+pass "an OpenAI chat completion continued $run_local as a turn and recalled indigo"
+
+log "Tenant $tenant_canary: two Agents, each with its own key to the canary, entered through the API and pinned to the canary's origin"
+declare -A canary_fp=() canary_secret=()
+for agent in canary-a canary-b; do
+	key="sk-canary-$(openssl rand -hex 16)"
+	canary_fp[$agent]="$(printf '%s' "$key" | sha256sum | cut -c1-16)"
+	canary_secret[$agent]="$agent-canary-key" # <connection>-<provider>-key, written by the API
 	python3 -c '
-import json, os, sys
-r = json.load(open(sys.argv[1]))["spec"]
-backend = sys.argv[3] if len(sys.argv) > 3 else ""
-agent, runtime, connection, model = r["agentRef"], r["cellnSelection"]["runtimeRef"], r["model"]["connectionRef"], r["model"]["model"]
-if backend:
-    agent, runtime, connection = f"celln-agent-{backend}", f"celln-{backend}", f"celln-{backend}"
-    # A backend added through the API has no installer output; the journey adds it on the same model.
-    model = json.load(open(sys.argv[4]))["model"]["model"] if os.path.exists(sys.argv[4]) else os.environ["FLEET_MODEL"]
-print(json.dumps({"agentRef": agent, "task": sys.argv[2], "systemPrompt": r["systemPrompt"], "backend": "celln",
-  "executionLifecycle": "one-shot", "model": model, "modelConnectionRef": connection,
-  "cellnSelection": {"runtimeRef": runtime, "clusterToolRefs": r["cellnSelection"]["clusterToolRefs"], "toolRefs": []}}))' "$WORK/fleet-out/installation/run.json" "$1" ${2:+"$2" "$WORK/fleet-out/configuration/$2/configured.json"} |
-		curl -sf "${api_auth[@]}" -X POST -H 'Content-Type: application/json' --data-binary @- "http://127.0.0.1:$api_port/api/v1/runs?namespace=$tenant" |
-		python3 -c 'import json,sys; print(json.load(sys.stdin)["metadata"]["name"])'
-}
-one_shot_runs=()
-one_shot_native="$(api_one_shot "Where is Botswana? Reply with one short sentence; do not use tools.")" || fail "API refused a one-shot run on the native backend in $tenant"
-one_shot_runs+=("$one_shot_native")
-one_shot_post=""
-if [ "${FLEET_MODEL_ALLOW_INSECURE:-}" = 1 ] && kc get clustercellntool "celln-$SCOPE-https-post-json" >/dev/null 2>&1; then
-	# A JSON receiver inside the cluster: the broker resolves its Service name,
-	# posts the object with no credential, and the receiver's log is the proof.
-	cat >"$WORK/hook-echo.py" <<'PYEOF'
-from http.server import BaseHTTPRequestHandler, HTTPServer
-class Hook(BaseHTTPRequestHandler):
-    def do_POST(self):
-        body = self.rfile.read(int(self.headers.get("content-length", "0")))
-        print("HOOK", self.path, body.decode(errors="replace"), flush=True)
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.end_headers()
-        self.wfile.write(b'{"received":true}')
-HTTPServer(("", 8080), Hook).serve_forever()
-PYEOF
-	kc -n "$tenant" create configmap hook-echo --from-file=server.py="$WORK/hook-echo.py" >/dev/null 2>&1 || true
-	kc -n "$tenant" apply -f - >/dev/null <<EOF
-apiVersion: apps/v1
-kind: Deployment
-metadata: {name: hook-echo}
+import json, sys
+name, origin, key = sys.argv[1:4]
+print(json.dumps({"name": name, "apiKey": key, "spec": {"provider": "canary", "protocol": "openai-chat", "endpoint": origin + "/v1/chat/completions", "models": ["canary-model"]}}))' "$agent" "$CANARY_ORIGIN" "$key" |
+		api_json -X POST --data-binary @- "$API/api/v1/model-connections?namespace=$tenant_canary" >/dev/null || fail "API refused connection $agent"
+	[ "$(kc -n "$tenant_canary" get modelconnection "$agent" -o jsonpath='{.spec.secretRef}')" = "${canary_secret[$agent]}" ] || fail "connection $agent does not name its Secret ${canary_secret[$agent]}"
+	pinned="$(kc -n "$tenant_canary" get secret "${canary_secret[$agent]}" -o jsonpath='{.metadata.annotations.sympozium\.ai/model-key-origin}')"
+	[ "$pinned" = "$CANARY_ORIGIN" ] || fail "${canary_secret[$agent]} is pinned to '$pinned', not $CANARY_ORIGIN"
+	create_agent "$tenant_canary" "$agent" "$agent" canary-model canary
+	[ "$(kc -n "$tenant_canary" get agent "$agent" -o jsonpath='{.spec.authRefs[0].secret}')" = "${canary_secret[$agent]}" ] || fail "Agent $agent does not grant its own Secret"
+done
+[ "${canary_fp[canary-a]}" != "${canary_fp[canary-b]}" ] || fail "canary keys collide"
+pass "canary-a and canary-b each hold their own key Secret, pinned to $CANARY_ORIGIN on entry, and grant it in authRefs"
+
+log "Key canary: the two Agents' concurrent conversations each reach the provider with their own key and no other"
+canary_run_a="$(start_conversation "$tenant_canary" canary-a "CANARY:canary-a Remember this exact token for the next turn: cobalt-a1")" || fail "API refused canary-a"
+canary_run_b="$(start_conversation "$tenant_canary" canary-b "CANARY:canary-b Remember this exact token for the next turn: saffron-b2")" || fail "API refused canary-b"
+wait_first_answer "$tenant_canary" "$canary_run_a"
+wait_first_answer "$tenant_canary" "$canary_run_b"
+for agent in canary-a canary-b; do
+	owner="$(kc -n "$tenant_canary" get secret "${canary_secret[$agent]}" -o jsonpath='{.metadata.annotations.sympozium\.ai/model-key-owner}')"
+	[ "$owner" = "Agent/$agent" ] || fail "${canary_secret[$agent]} is owned by '$owner', not Agent/$agent"
+done
+send_turn "$tenant_canary" "$canary_run_a" "$canary_run_a-recall" "What exact token did I ask you to remember?"
+send_turn "$tenant_canary" "$canary_run_b" "$canary_run_b-recall" "What exact token did I ask you to remember?"
+for pair in "$canary_run_a-recall:cobalt-a1" "$canary_run_b-recall:saffron-b2"; do
+	turn="${pair%%:*}" token="${pair##*:}"
+	wait_turn "$tenant_canary" "$turn"
+	turn_recalls "$tenant_canary" "$turn" "$token" || fail "$turn did not recall $token"
+done
+canary_records() { kubectl --context "kind-$CLUSTER" get --raw "/api/v1/namespaces/$CANARY_NS/services/https:canary:443/proxy/fixture/keys"; }
+records="$(canary_records)" || fail "could not read the canary's key records"
+echo "$records" | python3 -c '
+import json, sys
+records = json.load(sys.stdin)
+want = {"canary-a": sys.argv[1], "canary-b": sys.argv[2]}
+for agent, fp in want.items():
+    mine = [r for r in records if r["tag"] == agent]
+    wrong = [r for r in mine if r["key"] != fp]
+    if len(mine) < 2:
+        sys.exit(f"{agent}: only {len(mine)} provider call(s) recorded, want its first turn and its recall")
+    if wrong:
+        sys.exit(f"{agent}: {len(wrong)} of {len(mine)} calls carried a key other than its own: {wrong}")
+    print(f"{agent}: {len(mine)} calls, every one with its own key {fp}")
+keyless = [r for r in records if r["tag"] in want and not r["key"]]
+if keyless:
+    sys.exit(f"a call reached the provider without its Agent key: {keyless}")
+untagged = [r for r in records if r["tag"] not in want and r["key"] in want.values()]
+if untagged:
+    sys.exit(f"an Agent key served an untagged conversation: {untagged}")' "${canary_fp[canary-a]}" "${canary_fp[canary-b]}" >"$WORK/canary-verdict" || fail "key canary: $(cat "$WORK/canary-verdict")"
+pass "the provider saw only each Agent's own key: $(tr '\n' ';' <"$WORK/canary-verdict")"
+
+log "Key canary: neither key exists outside its own Secret, and no pod spec carries one"
+kc get secrets -A -o json | python3 -c '
+import base64, hashlib, json, sys
+fps = set(sys.argv[1:])
+for i in json.load(sys.stdin)["items"]:
+    for k, v in (i.get("data") or {}).items():
+        raw = base64.b64decode(v).strip()
+        if hashlib.sha256(raw).hexdigest()[:16] in fps:
+            print(i["metadata"]["namespace"] + "/" + i["metadata"]["name"])' "${canary_fp[canary-a]}" "${canary_fp[canary-b]}" | sort >"$WORK/canary-holders"
+[ "$(tr '\n' ' ' <"$WORK/canary-holders")" = "$tenant_canary/${canary_secret[canary-a]} $tenant_canary/${canary_secret[canary-b]} " ] || fail "a canary key is held elsewhere: $(cat "$WORK/canary-holders")"
+for agent in canary-a canary-b; do
+	key="$(kc -n "$tenant_canary" get secret "${canary_secret[$agent]}" -o jsonpath='{.data.OPENAI_API_KEY}' | base64 -d)"
+	[ -n "$key" ] || fail "${canary_secret[$agent]} holds no OPENAI_API_KEY"
+	if kc get pods -A -o json | grep -qF "$key"; then fail "$agent's key appears in a pod spec"; fi
+done
+pass "each key is only in its own Secret; no pod spec carries either"
+
+log "Key canary: the cells view attributes each conversation's cells to its Agent"
+cells_by_agent="$(api "$API/api/v1/celln-platform/cells" | python3 -c '
+import json, sys
+runs = {sys.argv[1]: "canary-a", sys.argv[2]: "canary-b"}
+seen = {}
+for n in json.load(sys.stdin):
+    for c in n.get("cells") or []:
+        r = c.get("run") or {}
+        if r.get("name") in runs and r.get("agent") == runs[r["name"]]:
+            seen[runs[r["name"]]] = seen.get(runs[r["name"]], 0) + 1
+print(" ".join(f"{a}={seen.get(a, 0)}" for a in ("canary-a", "canary-b")))' "$canary_run_a" "$canary_run_b")"
+case "$cells_by_agent" in *"=0"*) fail "cells not attributed to both conversations: $cells_by_agent" ;; esac
+pass "cells attributed: $cells_by_agent"
+
+log "One key, one Agent: a second Agent naming canary-a's Secret is refused"
+code="$(api_code -X POST -d "{\"name\":\"intruder\",\"provider\":\"canary\",\"model\":\"canary-model\",\"secretName\":\"${canary_secret[canary-a]}\"}" "$API/api/v1/agents?namespace=$tenant_canary")"
+[ "$code" = 409 ] && grep -q "belongs to Agent/canary-a" "$WORK/api-last-body" || fail "an Agent naming canary-a's Secret was not refused ($code): $(cat "$WORK/api-last-body")"
+intruder_by_secret="$(cat "$WORK/api-last-body")"
+code="$(api_code -X POST -d '{"name":"intruder","provider":"canary","model":"canary-model","execution":{"backend":"celln","modelConnectionRef":"canary-a","model":"canary-model"}}' "$API/api/v1/agents?namespace=$tenant_canary")"
+[ "$code" = 409 ] && grep -q "belongs to Agent/canary-a" "$WORK/api-last-body" || fail "an Agent selecting canary-a's connection was not refused ($code): $(cat "$WORK/api-last-body")"
+kc -n "$tenant_canary" get agent intruder >/dev/null 2>&1 && fail "the intruder Agent was created"
+# The Kubernetes path says the same: an Agent may list the Secret, but no run of
+# it gets the key (admission or the controller refuses before any pod or parent).
+kc -n "$tenant_canary" apply -f - >/dev/null <<EOF
+apiVersion: sympozium.ai/v1alpha1
+kind: Agent
+metadata:
+  name: intruder
 spec:
-  replicas: 1
-  selector: {matchLabels: {app: hook-echo}}
-  template:
-    metadata: {labels: {app: hook-echo}}
-    spec:
-      containers:
-        - name: hook
-          image: python:3.12-alpine
-          command: [python3, -u, /app/server.py]
-          ports: [{containerPort: 8080}]
-          volumeMounts: [{name: app, mountPath: /app}]
-      volumes: [{name: app, configMap: {name: hook-echo}}]
----
-apiVersion: v1
-kind: Service
-metadata: {name: hook-echo}
-spec:
-  selector: {app: hook-echo}
-  ports: [{port: 8080, targetPort: 8080}]
+  authRefs: [{provider: canary, secret: ${canary_secret[canary-a]}}]
+  agents:
+    default:
+      model: canary-model
 EOF
-	wait_for "hook receiver ready" 180 bash -c "kubectl --context kind-$CLUSTER -n $tenant get deploy hook-echo -o jsonpath='{.status.readyReplicas}' | grep -qx 1"
-	one_shot_post="$(api_one_shot "Call https-post-json exactly once with url http://$HOOK_HOST:8080/hook and body {\"event\":\"done\"}. Reply with only the HTTP status number it returns.")" || fail "API refused an https-post-json one-shot"
-	one_shot_runs+=("$one_shot_post")
+intruder_err="$(kc -n "$tenant_canary" create -f - 2>&1 <<EOF || true
+apiVersion: sympozium.ai/v1alpha1
+kind: AgentRun
+metadata:
+  name: intruder-run
+spec:
+  agentRef: intruder
+  agentId: intruder
+  sessionKey: intruder
+  task: "say hi"
+  cleanup: delete
+  model:
+    provider: canary
+    model: canary-model
+    authSecretRef: ${canary_secret[canary-a]}
+EOF
+)"
+if echo "$intruder_err" | grep -q "belongs to Agent/canary-a"; then
+	pass "the API refused the intruder twice (409: ${intruder_by_secret:0:120}) and admission refused its run"
+else
+	wait_for "intruder run to fail" 120 bash -c "kubectl --context kind-$CLUSTER -n $tenant_canary get agentrun intruder-run -o jsonpath='{.status.phase}' | grep -q Failed"
+	kc -n "$tenant_canary" get agentrun intruder-run -o jsonpath='{.status.error}' | grep -q "belongs to Agent/canary-a" || fail "intruder run was not refused for the key: $(kc -n "$tenant_canary" get agentrun intruder-run -o jsonpath='{.status.error}')"
+	kc -n "$tenant_canary" get jobs -l sympozium.ai/agent-run=intruder-run -o name | grep -q . && fail "a pod was started with another Agent's key"
+	pass "the API refused the intruder twice (409: ${intruder_by_secret:0:120}) and the controller refused its run before starting anything"
 fi
-if [ -n "${FLEET_TOOL_IMAGES:-}" ]; then
-	# Real commands borrowed from images: jq over a JSON document and grep over text.
-	one_shot_jq="$(api_one_shot "Call the jq tool exactly once with filter .capital, raw output, and this input: {\"capital\":\"Gaborone\",\"country\":\"Botswana\"}. Reply with only the tool's output.")" || fail "API refused a jq one-shot"
-	one_shot_grep="$(api_one_shot "Call the grep tool exactly once with pattern ^vio and this text (three lines): red, violet, blue. Reply with only the matching line.")" || fail "API refused a grep one-shot"
-	one_shot_runs+=("$one_shot_jq" "$one_shot_grep")
+kc -n "$tenant_canary" delete agent intruder --ignore-not-found >/dev/null
+
+log "A key is pinned to its first origin: re-posting canary-a's connection at another origin is refused"
+code="$(api_code -X POST -d "{\"name\":\"canary-a\",\"spec\":{\"provider\":\"canary\",\"protocol\":\"openai-chat\",\"endpoint\":\"https://attacker.example/v1/chat/completions\",\"models\":[\"canary-model\"],\"secretRef\":\"${canary_secret[canary-a]}\"}}" "$API/api/v1/model-connections?namespace=$tenant_canary")"
+[ "$code" = 409 ] && grep -q "is pinned to $CANARY_ORIGIN" "$WORK/api-last-body" || fail "moving canary-a's key to another origin was not refused ($code): $(cat "$WORK/api-last-body")"
+[ "$(kc -n "$tenant_canary" get modelconnection canary-a -o jsonpath='{.spec.endpoint}')" = "$CANARY_ORIGIN/v1/chat/completions" ] || fail "the refused move changed the connection"
+[ "$(kc -n "$tenant_canary" get secret "${canary_secret[canary-a]}" -o jsonpath='{.metadata.annotations.sympozium\.ai/model-key-origin}')" = "$CANARY_ORIGIN" ] || fail "the refused move re-pinned the key"
+pass "409: $(head -c 160 "$WORK/api-last-body" | tr '\n' ' '); connection and pin unchanged"
+
+log "Key canary: re-owning canary-a's key stops canary-a, names it in the refusal, and leaves canary-b alone"
+before="$(canary_records | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))')"
+kc -n "$tenant_canary" annotate secret "${canary_secret[canary-a]}" sympozium.ai/model-key-owner=Agent/someone-else --overwrite >/dev/null
+send_turn "$tenant_canary" "$canary_run_a" "$canary_run_a-reowned" "CANARY:canary-a Reply with LEAKED only"
+send_turn "$tenant_canary" "$canary_run_b" "$canary_run_b-after" "What exact token did I ask you to remember?"
+wait_turn "$tenant_canary" "$canary_run_b-after"
+turn_recalls "$tenant_canary" "$canary_run_b-after" saffron-b2 || fail "canary-b was affected by canary-a's key change"
+wait_for "a refusal naming $canary_run_a" 300 bash -c "kubectl --context kind-$CLUSTER -n sympozium-system logs deploy/sympozium-model-gateway --since=10m | grep 'refused' | grep -q 'claimed_run=$tenant_canary/$canary_run_a '"
+# Only the turn's status: its spec carries the message, which names the word.
+if turn_json "$tenant_canary" "$canary_run_a-reowned" | python3 -c 'import json,sys; sys.exit(0 if "LEAKED" in json.dumps(json.load(sys.stdin).get("status", {})) else 1)'; then
+	fail "canary-a was answered with a key it no longer owns"
 fi
-if [ -n "$SECOND_BACKEND" ]; then
-	one_shot_second="$(api_one_shot "What is the capital of Botswana? Reply with one short sentence; do not use tools." "$SECOND_BACKEND")" || fail "API refused a one-shot run on backend $SECOND_BACKEND in $tenant"
-	one_shot_runs+=("$one_shot_second")
-fi
-kill "$api_pf" >/dev/null 2>&1 || true
-for run in "${one_shot_runs[@]}"; do
-	wait_for "one-shot $run to finish" 300 bash -c "kubectl --context kind-$CLUSTER -n $tenant get agentrun $run -o jsonpath='{.status.phase}' | grep -qE 'Succeeded|Failed'"
-	[ "$(kc -n "$tenant" get agentrun "$run" -o jsonpath='{.status.phase}')" = Succeeded ] || fail "one-shot $run failed: $(kc -n "$tenant" get agentrun "$run" -o jsonpath='{.status.error}')"
-	[ -n "$(kc -n "$tenant" get agentrun "$run" -o jsonpath='{.status.cellnParent.binding.incarnation}')" ] || fail "one-shot $run did not run as a native parent"
-	answer="$(kc -n "$tenant" get agentrun "$run" -o jsonpath='{.status.result}')"
-	[ -n "$answer" ] || fail "one-shot $run finished without a result"
-	pass "one-shot $run (runtime $(kc -n "$tenant" get agentrun "$run" -o jsonpath='{.spec.cellnSelection.runtimeRef}')) succeeded: ${answer:0:160}"
-done
-if [ -n "${FLEET_TOOL_IMAGES:-}" ]; then
-	jq_answer="$(kc -n "$tenant" get agentrun "$one_shot_jq" -o jsonpath='{.status.result}')"
-	grep_answer="$(kc -n "$tenant" get agentrun "$one_shot_grep" -o jsonpath='{.status.result}')"
-	echo "$jq_answer" | grep -q 'Gaborone' || fail "jq one-shot did not return the extracted value: $jq_answer"
-	echo "$grep_answer" | grep -q 'violet' || fail "grep one-shot did not return the matching line: $grep_answer"
-	pass "borrowed jq and grep answered through the argv binding: '$jq_answer' / '$grep_answer'"
-fi
-if [ -n "$one_shot_post" ]; then
-	post_answer="$(kc -n "$tenant" get agentrun "$one_shot_post" -o jsonpath='{.status.result}')"
-	echo "$post_answer" | grep -q '200' || fail "https-post-json did not report a 200 status: $post_answer"
-	kc -n "$tenant" logs deploy/hook-echo | grep -F '"event":"done"' >/dev/null || fail "the receiver did not log the posted object: $(kc -n "$tenant" logs deploy/hook-echo | tail -3)"
-	pass "https-post-json delivered {\"event\":\"done\"} to $HOOK_HOST with no credential; the receiver logged it and the model reported 200"
-fi
-wait_for "one-shot parents released (live cells back to $cells_before)" 120 bash -c "[ \"\$(
-	total=0; for pod in \$(kubectl --context kind-$CLUSTER -n celln-system get pods -l app.kubernetes.io/name=celln-node --field-selector status.phase=Running -o name); do
-		n=\$(kubectl --context kind-$CLUSTER -n celln-system exec \$pod -c dispatcher -- curl -s http://127.0.0.1:8787/v1/health | python3 -c 'import json,sys; print(json.load(sys.stdin)[\"node\"][\"live_cells\"])'); total=\$((total + n)); done; echo \$total)\" = $cells_before ]"
-pass "one-shot parents stopped after answering; ${#one_shot_runs[@]} run(s) left the node's cells as they were ($cells_before live)"
-if [ -n "$ADD_BACKEND" ]; then
-	log "Adding backend $ADD_BACKEND to the running scope: owners untouched, conversations keep going"
-	owners_before="$(kc -n celln-system get pods -l app.kubernetes.io/name=celln-node -o jsonpath='{.items[*].metadata.uid}' | tr ' ' '\n' | sort)"
-	fleet_install --celln-fleet-backend "$add_spec" >"$WORK/install-add.log" 2>&1 || { tail -20 "$WORK/install-add.log"; fail "adding backend $ADD_BACKEND"; }
-	owners_after="$(kc -n celln-system get pods -l app.kubernetes.io/name=celln-node -o jsonpath='{.items[*].metadata.uid}' | tr ' ' '\n' | sort)"
-	[ "$owners_before" = "$owners_after" ] || fail "adding a backend restarted the owners"
-	kc get cellnruntimeprofile "$profile-$ADD_BACKEND" >/dev/null || fail "profile $profile-$ADD_BACKEND not installed"
-	[ "$(kc get cellnexecutionpolicy "celln-fleet-$SCOPE" -o jsonpath='{.spec.runtimeProfiles[*].ref.name}' | tr ' ' '\n' | grep -c .)" -ge 2 ] || fail "policy did not grow"
-	kc -n celln-system get configmap celln-fleet-configuration -o jsonpath='{.data}' | grep -q "$ADD_BACKEND.configured.json" || fail "nodes did not publish $ADD_BACKEND"
-	[ "$(kc -n "$tenant" get agentrun "$tenant_run" -o jsonpath='{.status.phase}')" = Running ] || fail "$tenant_run did not survive the backend addition"
-	[ -f "$WORK/fleet-out/configuration/$ADD_BACKEND/configured.json" ] || fail "installer did not materialize $ADD_BACKEND"
-	pass "backend $ADD_BACKEND joined scope $SCOPE without an owner restart; $tenant_run still running"
-	kubectl --context "kind-$CLUSTER" -n sympozium-system port-forward svc/sympozium-apiserver "$api_port:8080" >/dev/null 2>&1 &
-	api_pf=$!
-	wait_for "apiserver port-forward" 60 curl -sf "${api_auth[@]}" "http://127.0.0.1:$api_port/api/v1/celln-platform/profiles?namespace=$tenant" -o /dev/null
-	curl -sf "${api_auth[@]}" "http://127.0.0.1:$api_port/api/v1/celln-platform/profiles?namespace=$tenant" | grep -q "\"name\":\"$profile-$ADD_BACKEND\"" || fail "added backend not offered to $tenant"
-	curl -sf "${api_auth[@]}" -X POST -H 'Content-Type: application/json' -d "{\"profile\":\"$profile-$ADD_BACKEND\"}" "http://127.0.0.1:$api_port/api/v1/celln-platform/wrappers?namespace=$tenant" | grep -q "\"connection\":\"celln-$ADD_BACKEND\"" || fail "added backend wrappers were not created in $tenant"
-	added_run="$(api_one_shot "Name one river in Botswana. Reply with one short sentence; do not use tools." "$ADD_BACKEND")" || fail "API refused a one-shot on added backend $ADD_BACKEND"
-	kill "$api_pf" >/dev/null 2>&1 || true
-	wait_for "one-shot $added_run on added backend" 300 bash -c "kubectl --context kind-$CLUSTER -n $tenant get agentrun $added_run -o jsonpath='{.status.phase}' | grep -qE 'Succeeded|Failed'"
-	[ "$(kc -n "$tenant" get agentrun "$added_run" -o jsonpath='{.status.phase}')" = Succeeded ] || fail "one-shot on added backend failed: $(kc -n "$tenant" get agentrun "$added_run" -o jsonpath='{.status.error}')"
-	pass "one-shot $added_run on added backend $ADD_BACKEND succeeded: $(kc -n "$tenant" get agentrun "$added_run" -o jsonpath='{.status.result}' | cut -c1-160)"
-fi
-if [ -n "$second_run" ]; then
-	kc -n "$tenant" delete agentrun "$second_run" --timeout=180s >/dev/null || fail "$second_run could not be deleted"
-fi
-# tenant_run2 (the one that remembers "saffron") stays alive: the drain
-# below takes its owner away and its conversation must carry on elsewhere.
-[ "$(kc -n "$tenant" get configmap -o name | grep -c grant-)" = 0 ] || fail "grant ConfigMaps appeared in $tenant"
-[ "$(kc -n "$tenant" get cellntool -o name | wc -l)" = 0 ] || fail "namespaced tools appeared in $tenant"
-tenant_node="$(node_of "$(kc -n "$tenant" get agentrun "$tenant_run" -o jsonpath='{.status.cellnParent.binding.launchProfile}')")"
-[ -n "$tenant_node" ] || fail "owner of $tenant_run not found"
-pass "$tenant_run ran in $tenant on $tenant_node with wrappers created on first use (no label, no YAML, no grants, no copied tools)"
-denied_run="$(python3 -c "
+canary_records | python3 -c '
 import json, sys
-r = json.load(open(sys.argv[1])); r['metadata']['namespace'] = sys.argv[2]; print(json.dumps(r))" "$WORK/fleet-out/installation/run.json" "$denied" | kc create -f - -o jsonpath='{.metadata.name}')"
-wait_for "policy refusal for $denied_run" 90 bash -c "kubectl --context kind-$CLUSTER -n $denied get agentrun $denied_run -o jsonpath='{.status.conditions[?(@.type==\"CellnParentReady\")].message}' | grep -q AUTH_POLICY_WITHDRAWN"
-[ -z "$(kc -n "$denied" get agentrun "$denied_run" -o jsonpath='{.status.cellnParent}')" ] || fail "$denied_run was issued a parent without policy"
-pass "$denied_run in excluded $denied refused with AUTH_POLICY_WITHDRAWN and no parent"
+records = json.load(sys.stdin)[int(sys.argv[1]):]
+bad = [r for r in records if r["tag"] == "canary-a"]
+if bad:
+    sys.exit(f"canary-a reached the provider after its key was re-owned: {bad}")' "$before" || fail "re-owned key still reached the provider"
+kc -n "$tenant_canary" annotate secret "${canary_secret[canary-a]}" sympozium.ai/model-key-owner=Agent/canary-a --overwrite >/dev/null
+pass "canary-a was refused at the gateway ($(kc -n sympozium-system logs deploy/sympozium-model-gateway --since=10m | grep "claimed_run=$tenant_canary/$canary_run_a " | tail -1 | cut -c1-160)), never reached the provider, and canary-b still recalled saffron-b2"
 
-log "Adding a backend through the API: no installer, no restart, offered to every namespace"
-kubectl --context "kind-$CLUSTER" -n sympozium-system port-forward svc/sympozium-apiserver "$api_port:8080" >/dev/null 2>&1 &
-api_pf=$!
-wait_for "apiserver port-forward" 60 curl -sf "${api_auth[@]}" "http://127.0.0.1:$api_port/api/v1/celln-platform/backends" -o /dev/null
-before="$(curl -sf "${api_auth[@]}" "http://127.0.0.1:$api_port/api/v1/celln-platform/backends" | python3 -c 'import json,sys; print(",".join(sorted(b["name"] for b in json.load(sys.stdin))))')"
-echo "$before" | grep -q 'native' || fail "the API does not list the install-time backends: $before"
-api_spec="$(python3 -c '
-import json, os
-print(json.dumps({"name": "apiadd", "provider": "llama-server", "model": os.environ["FLEET_MODEL"], "endpoint": os.environ["FLEET_MODEL_ENDPOINT"], "allowInsecure": True}))')"
-code="$(curl -s -o "$WORK/api-add.json" -w '%{http_code}' "${api_auth[@]}" -X POST -H 'Content-Type: application/json' -d "$api_spec" "http://127.0.0.1:$api_port/api/v1/celln-platform/backends")"
-[ "$code" = 202 ] || fail "API refused the backend addition ($code): $(cat "$WORK/api-add.json")"
-owners_before_api="$(kc -n celln-system get pods -l app.kubernetes.io/name=celln-node -o jsonpath='{.items[*].metadata.uid}' | tr ' ' '\n' | sort)"
-backend_ready() { # name -> the API lists it as ready
-	curl -sf "${api_auth[@]}" "http://127.0.0.1:$api_port/api/v1/celln-platform/backends" |
-		python3 -c 'import json,sys; sys.exit(0 if any(b["name"] == sys.argv[1] and b["state"] == "ready" for b in json.load(sys.stdin)) else 1)' "$1"
+log "The conversations landed on different nodes"
+node_of_run() { # namespace run -> node holding its parent: the cells view, else dispatcher logs
+	local ns=$1 run=$2 incarnation pod node
+	incarnation="$(kc -n "$ns" get agentrun "$run" -o jsonpath='{.status.cellnParent.binding.incarnation}')"
+	node="$(api "$API/api/v1/celln-platform/cells" | python3 -c '
+import json, sys
+run, incarnation = sys.argv[1], sys.argv[2]
+for n in json.load(sys.stdin):
+    text = json.dumps({"cells": n.get("cells"), "parents": n.get("parents")})
+    if f"\"{run}\"" in text or (incarnation and incarnation in text):
+        print(n["node"]); break' "$run" "$incarnation" 2>/dev/null || true)"
+	if [ -n "$node" ]; then
+		echo "$node"
+		return 0
+	fi
+	[ -n "$incarnation" ] || return 1
+	for pod in $(kc -n celln-system get pods -l app.kubernetes.io/name=celln-node -o name); do
+		if kc -n celln-system logs "$pod" -c dispatcher --tail=-1 2>/dev/null | grep -q "${incarnation#blake3:}"; then
+			kc -n celln-system get "$pod" -o jsonpath='{.spec.nodeName}'
+			return 0
+		fi
+	done
+	return 1
 }
-wait_for "backend apiadd to become ready" 900 backend_ready apiadd
-[ "$owners_before_api" = "$(kc -n celln-system get pods -l app.kubernetes.io/name=celln-node -o jsonpath='{.items[*].metadata.uid}' | tr ' ' '\n' | sort)" ] || fail "adding a backend through the API restarted the owners"
-curl -sf "${api_auth[@]}" "http://127.0.0.1:$api_port/api/v1/celln-platform/profiles?namespace=$tenant" | grep -q "\"name\":\"$profile-apiadd\"" || fail "API-added backend not offered to $tenant"
-curl -sf "${api_auth[@]}" -X POST -H 'Content-Type: application/json' -d "{\"profile\":\"$profile-apiadd\"}" "http://127.0.0.1:$api_port/api/v1/celln-platform/wrappers?namespace=$tenant" | grep -q '"connection":"celln-apiadd"' || fail "API-added backend wrappers were not created in $tenant"
-apiadd_run="$(api_one_shot "Name one desert in Botswana. Reply with one short sentence; do not use tools." apiadd)" || fail "API refused a one-shot on the API-added backend"
-kill "$api_pf" >/dev/null 2>&1 || true
-wait_for "one-shot $apiadd_run on API-added backend" 300 bash -c "kubectl --context kind-$CLUSTER -n $tenant get agentrun $apiadd_run -o jsonpath='{.status.phase}' | grep -qE 'Succeeded|Failed'"
-[ "$(kc -n "$tenant" get agentrun "$apiadd_run" -o jsonpath='{.status.phase}')" = Succeeded ] || fail "one-shot on API-added backend failed: $(kc -n "$tenant" get agentrun "$apiadd_run" -o jsonpath='{.status.error}')"
-pass "backend apiadd added through the API, configured by the nodes without an owner restart, offered to $tenant and answered: $(kc -n "$tenant" get agentrun "$apiadd_run" -o jsonpath='{.status.result}' | cut -c1-120)"
+node_a="$(node_of_run "$tenant_canary" "$canary_run_a" || true)"
+node_b="$(node_of_run "$tenant_canary" "$canary_run_b" || true)"
+[ -n "$node_a" ] && [ -n "$node_b" ] || fail "could not locate the conversations' nodes (A='$node_a' B='$node_b'); dispatcher logs do not name the parents"
+[ "$node_a" != "$node_b" ] || fail "both conversations landed on $node_a; capacity placement should spread them"
+pass "conversation A on $node_a, B on $node_b"
 
-log "Restarting a conversation by hand moves it to a new parent with its memory"
-# The API restart: a new run seeded with the transcript, the old run deleted.
+log "Moving the fleet to another package needs --celln-fleet-replace-package; a rerun with the same package keeps live conversations"
+owners_before="$(kc -n celln-system get pods -l app.kubernetes.io/name=celln-node -o jsonpath='{.items[*].metadata.uid}' | tr ' ' '\n' | sort)"
+other_hash="blake3:$(printf '%064d' 0)"
+if sympozium_install --celln-fleet --celln-fleet-package-image "$image" --celln-fleet-publisher "$publisher" --celln-fleet-package-hash "$other_hash" >"$WORK/install-move.log" 2>&1; then
+	fail "an install naming another package was not refused: $(tail -5 "$WORK/install-move.log")"
+fi
+grep -q 'rerun with --celln-fleet-replace-package' "$WORK/install-move.log" || fail "the refusal did not name the approval flag: $(tail -5 "$WORK/install-move.log")"
+[ "$owners_before" = "$(kc -n celln-system get pods -l app.kubernetes.io/name=celln-node -o jsonpath='{.items[*].metadata.uid}' | tr ' ' '\n' | sort)" ] || fail "the refused move restarted the owners"
+sympozium_install >"$WORK/install-rerun.log" 2>&1 || { tail -20 "$WORK/install-rerun.log"; fail "rerunning the install with the same package"; }
+grep -q 'Celln fleet package unchanged' "$WORK/install-rerun.log" || fail "the rerun did not report the package unchanged: $(grep -i 'package' "$WORK/install-rerun.log" | head -3)"
+[ "$owners_before" = "$(kc -n celln-system get pods -l app.kubernetes.io/name=celln-node -o jsonpath='{.items[*].metadata.uid}' | tr ' ' '\n' | sort)" ] || fail "the rerun restarted the owners"
+for run in "$canary_run_a" "$canary_run_b" "$run_local"; do
+	phase="$(kc -n "$tenant_canary" get agentrun "$run" -o jsonpath='{.status.phase}' 2>/dev/null || kc -n "$tenant_local" get agentrun "$run" -o jsonpath='{.status.phase}')"
+	[ "$phase" = Running ] || fail "$run did not survive the rerun (phase $phase)"
+done
+# The rerun rolls the API server; reopen the port-forward before using the API again.
+kill "$api_pf" 2>/dev/null || true
+kc -n sympozium-system rollout status deploy/sympozium-apiserver --timeout=300s >/dev/null || fail "apiserver rollout after the rerun"
 kubectl --context "kind-$CLUSTER" -n sympozium-system port-forward svc/sympozium-apiserver "$api_port:8080" >/dev/null 2>&1 &
 api_pf=$!
-wait_for "apiserver port-forward" 60 curl -sf "${api_auth[@]}" "http://127.0.0.1:$api_port/api/v1/celln-platform/profiles?namespace=$tenant" -o /dev/null
-run_uid="$(kc -n "$tenant" get agentrun "$tenant_run" -o jsonpath='{.metadata.uid}')"
-restarted="$(curl -sf "${api_auth[@]}" -X POST "http://127.0.0.1:$api_port/api/v1/runs/$tenant_run/continue?namespace=$tenant&uid=$run_uid" | python3 -c 'import json,sys; r=json.load(sys.stdin); print(r["metadata"]["name"])')" || fail "API refused to restart $tenant_run"
-kill "$api_pf" >/dev/null 2>&1 || true
-[ "$(kc -n "$tenant" get agentrun "$restarted" -o jsonpath='{.spec.conversation.continuesFrom}')" = "$tenant_run" ] || fail "$restarted does not continue $tenant_run"
-[ "$(kc -n "$tenant" get agentrun "$restarted" -o jsonpath='{.spec.conversation.seed[0].user}' | cut -c1-20)" = "$(echo "$tenant_task" | cut -c1-20)" ] || fail "$restarted was not seeded with the transcript: $(kc -n "$tenant" get agentrun "$restarted" -o jsonpath='{.spec.conversation.seed}' | cut -c1-200)"
-wait_for "old run $tenant_run gone" 120 bash -c "! kubectl --context kind-$CLUSTER -n $tenant get agentrun $tenant_run >/dev/null 2>&1"
-wait_for "parent $restarted ready" 240 run_ready "$restarted" "$tenant"
-wait_for "resume turn of $restarted" 300 turn_recorded "$restarted" "$tenant"
-require_turn_succeeded "$restarted" "$tenant"
-pass "$tenant_run restarted as $restarted: seeded, old run deleted, new parent ready and it resumed: $(kc -n "$tenant" get agentrun "$restarted" -o jsonpath='{.status.cellnParent.initialTurn.result.answer}' | cut -c1-120)"
-kc -n "$tenant" delete agentrun "$restarted" --timeout=180s >/dev/null || fail "$restarted could not be deleted"
+wait_for "apiserver port-forward" 120 curl -sf "${api_auth[@]}" "$API/api/v1/celln-platform/profiles?namespace=$tenant_local" -o /dev/null
+send_turn "$tenant_canary" "$canary_run_b" "$canary_run_b-after-rerun" "What exact token did I ask you to remember?"
+wait_turn "$tenant_canary" "$canary_run_b-after-rerun"
+turn_recalls "$tenant_canary" "$canary_run_b-after-rerun" saffron-b2 || fail "canary-b lost its context across the rerun"
+pass "the move was refused with the approval flag named; the same-package rerun kept the owners and canary-b still recalled saffron-b2"
 
-log "Removing a node's label drains its owner; the conversation there continues on another node with its memory"
-memory_node="$(node_of "$(kc -n "$tenant" get agentrun "$tenant_run2" -o jsonpath='{.status.cellnParent.binding.launchProfile}')")"
-[ -n "$memory_node" ] || fail "owner of $tenant_run2 not found"
-# An explicit false keeps the node out; the node probe re-adds a missing
-# label on any node with KVM and a kernel, so removal alone would not drain.
-kc label node --overwrite "$memory_node" celln.dev/kvm=false >/dev/null
-wait_for "owner drain on $memory_node" 120 bash -c "[ \$(kubectl --context kind-$CLUSTER -n celln-system get pods -l app.kubernetes.io/name=celln-node --field-selector spec.nodeName=$memory_node -o name | wc -l) = 0 ]"
-wait_for "context loss report for $tenant_run2" 180 bash -c "kubectl --context kind-$CLUSTER -n $tenant get agentrun $tenant_run2 -o jsonpath='{.status.error}' | grep -q 'context lost or stopped'"
-continued="$(kc -n "$tenant" get agentrun "$tenant_run2" -o jsonpath='{.status.cellnParent.continuedBy}')"
-[ -n "$continued" ] || fail "$tenant_run2 lost its context but was not continued: $(kc -n "$tenant" get agentrun "$tenant_run2" -o jsonpath='{.status.error}')"
-pass "$tenant_run2 reports ContextLost and was continued as $continued"
-[ "$(kc -n "$tenant" get agentrun "$continued" -o jsonpath='{.spec.conversation.continuesFrom}')" = "$tenant_run2" ] || fail "$continued does not continue $tenant_run2"
-wait_for "parent $continued ready on another node" 300 run_ready "$continued" "$tenant"
-continued_node="$(node_of "$(kc -n "$tenant" get agentrun "$continued" -o jsonpath='{.status.cellnParent.binding.launchProfile}')")"
-[ -n "$continued_node" ] && [ "$continued_node" != "$memory_node" ] || fail "continuation landed on $continued_node, expected another node than $memory_node"
-wait_for "resume turn of $continued" 300 turn_recorded "$continued" "$tenant"
-require_turn_succeeded "$continued" "$tenant"
-answer="$(turn_answer "$continued" "$continued-recall" "Which word did I ask you to remember? Reply with only that word." "$tenant")"
-echo "$answer" | grep -qi 'saffron' || fail "the continued conversation lost its memory: $answer"
-pass "$continued on $continued_node remembers: $(echo "$answer" | tr '\n' ' ' | cut -c1-80)"
-for run in "$tenant_run2" "$continued"; do
-	kc -n "$tenant" delete agentrun "$run" --timeout=120s >/dev/null || fail "$run could not be deleted"
+log "Skills cannot reach Secrets"
+kc get validatingadmissionpolicy sympozium-skill-secret-references >/dev/null || fail "skill Secret admission policy missing"
+pass "skill Secret admission policy installed"
+
+log "Losing conversation A's node ends A with AUTH_CONTEXT_LOST; B carries on"
+pod_a="$(kc -n celln-system get pods -l app.kubernetes.io/name=celln-node --field-selector "spec.nodeName=$node_a" -o name)"
+kc -n celln-system delete "$pod_a" --wait=true >/dev/null
+send_turn "$tenant_canary" "$canary_run_a" "$canary_run_a-after-loss" "Are you still there? Reply with only YES."
+wait_for "conversation A to end after its node was lost" 300 bash -c "kubectl --context kind-$CLUSTER -n $tenant_canary get agentrun $canary_run_a -o jsonpath='{.status.phase}' | grep -q Failed"
+kc -n "$tenant_canary" get agentrun "$canary_run_a" -o jsonpath='{.status.error}' | grep -q 'AUTH_CONTEXT_LOST' || fail "A did not end with AUTH_CONTEXT_LOST: $(kc -n "$tenant_canary" get agentrun "$canary_run_a" -o jsonpath='{.status.error}')"
+send_turn "$tenant_canary" "$canary_run_b" "$canary_run_b-after-loss" "What exact token did I ask you to remember?"
+wait_turn "$tenant_canary" "$canary_run_b-after-loss"
+turn_recalls "$tenant_canary" "$canary_run_b-after-loss" saffron-b2 || fail "B did not carry on after A's node was lost"
+pass "A ended with AUTH_CONTEXT_LOST; B on $node_b still recalled saffron-b2"
+
+log "Deleting the lost conversation does not hang on its finalizer"
+kc -n "$tenant_canary" delete agentrun "$canary_run_a" --wait=false >/dev/null
+wait_for "lost conversation A to be deleted" 180 bash -c "! kubectl --context kind-$CLUSTER -n $tenant_canary get agentrun $canary_run_a"
+pass "A deleted; cleanup treated the lost node's state as gone"
+for pair in "$tenant_canary:$canary_run_b" "$tenant_local:$run_local"; do
+	kc -n "${pair%%:*}" delete agentrun "${pair##*:}" --timeout=180s >/dev/null || fail "${pair##*:} could not be deleted"
 done
-pass "lost and continued runs deleted; cleanup released"
-
-kc label node --overwrite "$memory_node" celln.dev/kvm=true >/dev/null
-pass "celln fleet integration complete (work dir: $WORK)"
+pass "model-free fleet integration complete (work dir: $WORK)"

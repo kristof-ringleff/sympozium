@@ -11,7 +11,6 @@ import (
 	"testing"
 
 	api "github.com/sympozium-ai/sympozium/api/v1alpha1"
-	"github.com/sympozium-ai/sympozium/internal/cellnparent"
 	"github.com/sympozium-ai/sympozium/internal/cellnplatform"
 	"github.com/zeebo/blake3"
 	appsv1 "k8s.io/api/apps/v1"
@@ -23,74 +22,21 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
-// starterConfiguration materializes the reviewed testdata with a consistent
-// receipt, as the fleet nodes publish it.
-type testBackend struct{ name, provider, protocol, model, url, credentialProfile string }
-
+// starterConfiguration materializes the reviewed testdata as the fleet nodes
+// publish it since 0.12: one model-free backend, native, with a consistent
+// receipt naming no model.
 func starterConfiguration(t *testing.T) (dir, packageHash, principal string) {
 	t.Helper()
 	dir = filepath.Join(t.TempDir(), "configuration")
 	if err := os.Mkdir(dir, 0700); err != nil {
 		t.Fatal(err)
 	}
-	// Two backends of one package: the reviewed default (DeepSeek) and an
-	// Anthropic route named "claude" sharing every other byte.
-	for _, backend := range []testBackend{
-		{"native", "", "", "", "", ""},
-		{"claude", "anthropic", "anthropic-messages", "claude-test", "https://api.anthropic.com/v1/messages", "trial-claude"},
-	} {
-		packageHash, principal = writeBackendConfiguration(t, dir, backend)
-	}
-	return dir, packageHash, principal
-}
-
-// writeBackendConfiguration materializes one backend's node configuration
-// from the testdata package, as a node would publish it.
-func writeBackendConfiguration(t *testing.T, dir string, backend testBackend) (packageHash, principal string) {
-	t.Helper()
-	sub := filepath.Join(dir, backend.name)
-	if err := os.Mkdir(sub, 0700); err != nil {
-		t.Fatal(err)
-	}
+	writeModelFreeConfiguration(t, dir, cellnplatform.DefaultBackend)
 	var metadata receipt
-	for _, name := range []string{"catalogue.json", "native-template.json", "configured.json"} {
-		raw, err := os.ReadFile(filepath.Join("testdata", name))
-		if err != nil {
-			t.Fatal(err)
-		}
-		raw = []byte(strings.TrimSuffix(string(raw), "\n"))
-		if name == "native-template.json" && backend.provider != "" {
-			var native map[string]any
-			if err := json.Unmarshal(raw, &native); err != nil {
-				t.Fatal(err)
-			}
-			template := native["template"].(map[string]any)
-			template["model"], template["url"] = backend.model, backend.url
-			native["modelProfile"] = "blake3:" + strings.Repeat("e", 64)
-			raw, _ = json.Marshal(native)
-		}
-		if name == "configured.json" {
-			if err := json.Unmarshal(raw, &metadata); err != nil {
-				t.Fatal(err)
-			}
-		}
-		if err := os.WriteFile(filepath.Join(sub, name), raw, 0600); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if backend.provider != "" {
-		metadata.Model = api.ModelSpec{Provider: backend.provider, Protocol: backend.protocol, Model: backend.model, BaseURL: backend.url, CredentialProfile: backend.credentialProfile}
-		metadata.ModelProfile = "blake3:" + strings.Repeat("e", 64)
-	}
-	for file, field := range map[string]*string{"catalogue.json": &metadata.CatalogueHash, "native-template.json": &metadata.NativeTemplateHash} {
-		raw, _ := os.ReadFile(filepath.Join(sub, file))
-		*field = fmt.Sprintf("blake3:%x", blake3.Sum256(raw))
-	}
-	raw, _ := json.Marshal(metadata)
-	if err := os.WriteFile(filepath.Join(sub, "configured.json"), raw, 0600); err != nil {
+	if _, err := read(filepath.Join(dir, cellnplatform.DefaultBackend, "configured.json"), &metadata); err != nil {
 		t.Fatal(err)
 	}
-	return metadata.PackageHash, metadata.Principal
+	return dir, metadata.PackageHash, metadata.Principal
 }
 
 func platformInstallStore(t *testing.T) client.Client {
@@ -104,6 +50,10 @@ func platformInstallStore(t *testing.T) client.Client {
 	return fake.NewClientBuilder().WithScheme(scheme).WithObjects(deployment, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "kube-system", UID: "cluster-uid"}}, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "tenant-a"}}, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "tenant-b"}}).Build()
 }
 
+// One scope publishes one model-free profile, its tools and one policy
+// without routes, sized from the nodes' host limits; a namespace gets its
+// runtime wrapper only, never a shared Agent or ModelConnection, and nothing
+// is written for a run.
 func TestInstallPlatformPublishesCatalogueOncePerScopeAndWrapsNamespaces(t *testing.T) {
 	ctx := context.Background()
 	dir, packageHash, principal := starterConfiguration(t)
@@ -124,34 +74,35 @@ func TestInstallPlatformPublishesCatalogueOncePerScopeAndWrapsNamespaces(t *test
 	if err := store.Get(ctx, types.NamespacedName{Name: profileName}, &profile); err != nil {
 		t.Fatal(err)
 	}
-	// The second backend has its own profile, credential profile and wrappers.
-	var claude api.CellnRuntimeProfile
-	if err := store.Get(ctx, types.NamespacedName{Name: PlatformProfileName("trial", "claude")}, &claude); err != nil || claude.Labels[cellnplatform.BackendLabel] != "claude" || claude.Annotations[cellnplatform.ProtocolAnnotation] != "anthropic-messages" || claude.Spec.Native.CredentialProfile != "trial-claude" || claude.Spec.Native.ModelProfile != "blake3:"+strings.Repeat("e", 64) {
-		t.Fatalf("claude profile: %v %+v", err, claude)
+	var profiles api.CellnRuntimeProfileList
+	if err := store.List(ctx, &profiles); err != nil || len(profiles.Items) != 1 {
+		t.Fatalf("a model-free scope publishes exactly one profile: %v %d", err, len(profiles.Items))
 	}
-	var claudeConnection api.ModelConnection
-	if err := store.Get(ctx, types.NamespacedName{Namespace: "tenant-a", Name: "celln-claude"}, &claudeConnection); err != nil || claudeConnection.Spec.Provider != "anthropic" || claudeConnection.Spec.Protocol != "anthropic-messages" || claudeConnection.Spec.CredentialProfile != "trial-claude" || claudeConnection.Spec.Validate() != nil {
-		t.Fatalf("claude wrapper connection: %v %+v", err, claudeConnection.Spec)
+	if !cellnplatform.MediationOnly(&profile) || cellnplatform.Backend(&profile) != "native" || profile.Annotations[packageAnnotation] != packageHash {
+		t.Fatalf("profile is not the scope's mediation-only native profile: %+v", profile.ObjectMeta)
 	}
 	native := profile.Spec.Native
-	if native == nil || native.CredentialProfile != "trial" || native.ModelProfile == "" || native.SystemPrompt == "" || len(native.Parent.Raw) == 0 || len(native.Template.Raw) == 0 || profile.Spec.Lifecycles[1] != "enduring" || profile.Annotations[packageAnnotation] != packageHash {
-		t.Fatalf("profile lacks native provisioning material: %+v", profile.Spec)
+	if native == nil || native.ModelProfile != "" || native.SystemPrompt == "" || len(native.Parent.Raw) == 0 || len(native.Worker.Raw) == 0 || len(native.Template.Raw) == 0 || profile.Spec.Lifecycles[1] != "enduring" || profile.Spec.Limits.TimeoutMillis != 60000 {
+		t.Fatalf("profile lacks model-free native provisioning material: %+v", profile.Spec)
 	}
 	var policy api.CellnExecutionPolicy
 	if err := store.Get(ctx, types.NamespacedName{Name: policyName}, &policy); err != nil {
 		t.Fatal(err)
 	}
-	route := policy.Spec.Routes[0]
 	exclusions := policy.Spec.NamespaceSelector.MatchExpressions
 	if len(exclusions) != 2 || exclusions[0].Key != cellnplatform.NamespaceNameLabel || exclusions[0].Operator != metav1.LabelSelectorOpNotIn || !slices.Contains(exclusions[0].Values, "kube-system") || !slices.Contains(exclusions[0].Values, "sympozium-system") || !slices.Contains(exclusions[0].Values, "celln-system") || exclusions[1].Key != cellnplatform.ExcludedLabel || exclusions[1].Operator != metav1.LabelSelectorOpDoesNotExist {
 		t.Fatalf("default policy is not open with system exclusions: %+v", policy.Spec.NamespaceSelector)
 	}
-	if len(policy.Spec.RuntimeProfiles) != 2 || len(policy.Spec.Routes) != 2 || policy.Spec.Routes[0].Provider != "anthropic" || policy.Spec.Routes[1].Provider != "deepseek" {
-		t.Fatalf("policy must carry every backend's profile and route: %+v", policy.Spec)
+	if len(policy.Spec.RuntimeProfiles) != 1 || policy.Spec.RuntimeProfiles[0].Ref != (api.CellnRuntimeProfileRef{Name: profileName, Revision: profile.Spec.Revision}) {
+		t.Fatalf("policy must carry exactly the scope's profile: %+v", policy.Spec.RuntimeProfiles)
 	}
-	route = policy.Spec.Routes[1]
-	if len(policy.Spec.Tools) != 3 || route.Auth != "host-profile" || route.Provider != "deepseek" || route.EndpointOrigins[0] != "https://api.deepseek.com" || policy.Spec.Ceilings.MaxTurns != 12 || policy.Spec.Ceilings.MaxParentLeaseSeconds != 3600 || policy.Spec.Ceilings.MaxTurnSeconds != 60 {
-		t.Fatalf("policy does not bind the reviewed route and ceilings: %+v", policy.Spec)
+	// The ceilings are the nodes' host limits; the turn ceiling is the worker's lifetime.
+	c := policy.Spec.Ceilings
+	if len(policy.Spec.Tools) != 3 || c.MaxTurns != 12 || c.MaxModelRequests != 36 || c.MaxOutputTokens != 18432 || c.MaxParentLeaseSeconds != 3600 || c.MaxTurnSeconds != 60 || policy.Annotations[packageAnnotation] != packageHash {
+		t.Fatalf("policy does not bind the reviewed tools and ceilings: %+v", policy.Spec)
+	}
+	if !slices.Equal(policy.Spec.Lifecycles, []string{"direct-one-shot", "harness-one-shot", "enduring"}) {
+		t.Fatalf("policy lifecycles: %v", policy.Spec.Lifecycles)
 	}
 	var tool api.ClusterCellnTool
 	if err := store.Get(ctx, types.NamespacedName{Name: toolName("https-fetch")}, &tool); err != nil || tool.Spec.Revision != "v1" {
@@ -161,13 +112,16 @@ func TestInstallPlatformPublishesCatalogueOncePerScopeAndWrapsNamespaces(t *test
 	if err := store.Get(ctx, types.NamespacedName{Name: "tenant-a"}, &namespace); err != nil || namespace.Labels[ScopeLabel] != "" {
 		t.Fatalf("default mode labeled the namespace: %v %v", err, namespace.Labels)
 	}
+	names := cellnplatform.WrapperNames("native")
 	var wrapper api.AgentRuntime
-	var connection api.ModelConnection
-	if err := store.Get(ctx, types.NamespacedName{Namespace: "tenant-a", Name: "celln-native"}, &wrapper); err != nil || wrapper.Spec.CellnProfileRef == nil || wrapper.Spec.CellnProfileRef.Name != profileName || wrapper.Spec.Celln != nil {
-		t.Fatalf("tenant wrapper: %v %+v", err, wrapper.Spec)
+	if err := store.Get(ctx, types.NamespacedName{Namespace: "tenant-a", Name: names.Runtime}, &wrapper); err != nil || wrapper.Spec.CellnProfileRef == nil || *wrapper.Spec.CellnProfileRef != (api.CellnRuntimeProfileRef{Name: profileName, Revision: profile.Spec.Revision}) || wrapper.Spec.Celln != nil || wrapper.Labels[cellnplatform.ManagedByLabel] != cellnplatform.ManagedByValue || wrapper.Annotations[packageAnnotation] != packageHash {
+		t.Fatalf("tenant wrapper: %v %+v", err, wrapper)
 	}
-	if err := store.Get(ctx, types.NamespacedName{Namespace: "tenant-a", Name: "celln-native"}, &connection); err != nil || connection.Spec.CredentialProfile != "trial" || connection.Spec.SecretRef != "" || connection.Spec.Validate() != nil {
-		t.Fatalf("tenant model connection: %v %+v", err, connection.Spec)
+	if err := store.Get(ctx, types.NamespacedName{Namespace: "tenant-a", Name: names.Connection}, &api.ModelConnection{}); err == nil {
+		t.Fatal("a model-free scope published a shared ModelConnection")
+	}
+	if err := store.Get(ctx, types.NamespacedName{Namespace: "tenant-a", Name: names.Agent}, &api.Agent{}); err == nil {
+		t.Fatal("a model-free scope published a shared Agent")
 	}
 	var grants corev1.ConfigMapList
 	if err := store.List(ctx, &grants, client.InNamespace("tenant-a")); err != nil || len(grants.Items) != 0 {
@@ -177,29 +131,28 @@ func TestInstallPlatformPublishesCatalogueOncePerScopeAndWrapsNamespaces(t *test
 	if err := store.List(ctx, &tools, client.InNamespace("tenant-a")); err != nil || len(tools.Items) != 0 {
 		t.Fatal("platform installation copied namespaced tools")
 	}
-	out := first.OutputDir
-	raw, err := os.ReadFile(filepath.Join(out, "registrations.json"))
-	if err != nil {
-		t.Fatal(err)
+	// Only the installation record is written: no registration, no sample run.
+	entries, err := os.ReadDir(first.OutputDir)
+	if err != nil || len(entries) != 1 || entries[0].Name() != "installed.json" {
+		t.Fatalf("output directory holds %v, want installed.json alone (%v)", entries, err)
 	}
-	var registration cellnparent.RegistrationConfig
-	if err := json.Unmarshal(raw, &registration); err != nil || registration.Platform == nil || registration.Platform.ClusterID != clusterID || registration.Platform.Target != ManagedRouterURL || registration.LocalProvisioner != nil || registration.Journal != FleetJournalRoot+"/journal" {
-		t.Fatalf("registrations are not platform-mode: %v %+v", err, registration)
+	var installed struct {
+		Scope, PackageHash, Policy, Readiness string
+		Backends, Profiles                    []string
+		RunSubmitted                          bool
 	}
-	raw, _ = os.ReadFile(filepath.Join(out, "run.json"))
-	var run api.AgentRun
-	if err := json.Unmarshal(raw, &run); err != nil || run.Spec.Model.ConnectionRef != "celln-native" || len(run.Spec.CellnSelection.ClusterToolRefs) != 3 || len(run.Spec.CellnSelection.ToolRefs) != 0 || run.Spec.SystemPrompt != native.SystemPrompt || run.Spec.Enduring.MaxTurns != 12 || run.Spec.Enduring.LeaseSeconds != 3600 || run.Spec.Enduring.MaxOutputTokens != 18432 || run.Spec.ExecutionLifecycle != "enduring" {
-		t.Fatalf("sample run is not a platform run: %v %+v", err, run.Spec)
+	raw, _ := os.ReadFile(filepath.Join(first.OutputDir, "installed.json"))
+	if err := json.Unmarshal(raw, &installed); err != nil || installed.Scope != "trial" || installed.PackageHash != packageHash || installed.Policy != policyName || installed.Readiness != "not_established" || installed.RunSubmitted || !slices.Equal(installed.Backends, []string{"native"}) || !slices.Equal(installed.Profiles, []string{profileName}) {
+		t.Fatalf("installation record: %v %s", err, raw)
 	}
-	values, err := ConfigureFleet(ctx, store, Options{OutputDir: out, ControllerNamespace: "sympozium-system", OwnerTarget: ManagedRouterURL})
-	if err != nil || values[0] != "celln.fleet.parentConfigSecret="+FleetParentConfigSecret {
-		t.Fatalf("fleet wiring from platform registration: %v %v", err, values)
-	}
-	// A second namespace reuses the scope's catalogue and gets only wrappers.
+	// A second namespace reuses the scope's catalogue and gets only its wrapper.
 	if err := InstallPlatform(ctx, store, options("tenant-b")); err != nil {
 		t.Fatalf("second namespace on the same scope: %v", err)
 	}
-	if err := store.Get(ctx, types.NamespacedName{Namespace: "tenant-b", Name: "celln-native"}, &wrapper); err != nil {
+	if err := store.List(ctx, &profiles); err != nil || len(profiles.Items) != 1 {
+		t.Fatalf("second namespace changed the catalogue: %v %d", err, len(profiles.Items))
+	}
+	if err := store.Get(ctx, types.NamespacedName{Namespace: "tenant-b", Name: names.Runtime}, &wrapper); err != nil {
 		t.Fatal(err)
 	}
 	// Strict mode publishes a scope-label selector and labels the namespace.
@@ -237,60 +190,6 @@ func TestSessionDefaultsStayInsideCeilings(t *testing.T) {
 	narrow := SessionDefaults(api.EnduringRunSpec{LeaseSeconds: 600, MaxTurns: 4, MaxModelRequests: 12, MaxOutputTokens: 6144})
 	if narrow.LeaseSeconds != 600 || narrow.MaxTurns != 2 || narrow.MaxModelRequests != 12 || narrow.MaxOutputTokens != 6144 {
 		t.Fatalf("session defaults exceed narrow ceilings: %+v", narrow)
-	}
-}
-
-// A rerun with one more backend configured by the nodes adds that backend's
-// profile, route and wrappers to the scope and rewrites the installation
-// record; the first installation's registration and sample run are kept.
-func TestInstallPlatformAddsBackendToRunningScope(t *testing.T) {
-	ctx := context.Background()
-	dir, packageHash, principal := starterConfiguration(t)
-	store := platformInstallStore(t)
-	o := PlatformOptions{Namespace: "tenant-a", ConfigurationDir: dir, OutputDir: filepath.Join(t.TempDir(), "out"), Scope: "trial", ClusterID: "cluster-uid", PackageHash: packageHash, Principal: principal, ControllerNamespace: "sympozium-system"}
-	if err := InstallPlatform(ctx, store, o); err != nil {
-		t.Fatal(err)
-	}
-	runBefore, err := os.ReadFile(filepath.Join(o.OutputDir, "run.json"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	writeBackendConfiguration(t, dir, testBackend{"spare", "spare-provider", "openai-chat", "spare.gguf", "https://spare.example/v1/chat/completions", "trial-spare"})
-	if err := InstallPlatform(ctx, store, o); err != nil {
-		t.Fatalf("rerun with an added backend refused: %v", err)
-	}
-	_, policyName, _ := PlatformCatalogueNames("trial")
-	var policy api.CellnExecutionPolicy
-	if err := store.Get(ctx, types.NamespacedName{Name: policyName}, &policy); err != nil {
-		t.Fatal(err)
-	}
-	if len(policy.Spec.RuntimeProfiles) != 3 || len(policy.Spec.Routes) != 3 || !slices.ContainsFunc(policy.Spec.Routes, func(r api.CellnExecutionPolicyRoute) bool {
-		return r.Provider == "spare-provider" && r.EndpointOrigins[0] == "https://spare.example"
-	}) {
-		t.Fatalf("policy did not grow by the added backend only: %+v", policy.Spec)
-	}
-	var spare api.CellnRuntimeProfile
-	if err := store.Get(ctx, types.NamespacedName{Name: PlatformProfileName("trial", "spare")}, &spare); err != nil || spare.Spec.Native.CredentialProfile != "trial-spare" {
-		t.Fatalf("added backend profile: %v", err)
-	}
-	var connection api.ModelConnection
-	if err := store.Get(ctx, types.NamespacedName{Namespace: "tenant-a", Name: "celln-spare"}, &connection); err != nil || connection.Spec.Provider != "spare-provider" {
-		t.Fatalf("added backend wrappers: %v", err)
-	}
-	var installed struct {
-		Backends []string `json:"backends"`
-	}
-	raw, err := os.ReadFile(filepath.Join(o.OutputDir, "installed.json"))
-	if err != nil || json.Unmarshal(raw, &installed) != nil || len(installed.Backends) != 3 {
-		t.Fatalf("installation record not rewritten with every backend: %s %v", raw, err)
-	}
-	runAfter, _ := os.ReadFile(filepath.Join(o.OutputDir, "run.json"))
-	if string(runAfter) != string(runBefore) {
-		t.Fatal("sample run of the first installation was rewritten")
-	}
-	// The same rerun again changes nothing.
-	if err := InstallPlatform(ctx, store, o); err != nil {
-		t.Fatalf("idempotent rerun refused: %v", err)
 	}
 }
 
@@ -333,9 +232,92 @@ func repackage(t *testing.T, dir, packageHash string) {
 	}
 }
 
+// rederive rewrites the configuration as a newer Celln binary would derive it
+// from the same package: another persona and a wider fetch limit, with the
+// template and receipt hashes following.
+func rederive(t *testing.T, dir, persona string, fetchBytes int) {
+	t.Helper()
+	sub := filepath.Join(dir, cellnplatform.DefaultBackend)
+	var cat map[string]any
+	raw, _ := os.ReadFile(filepath.Join(sub, "catalogue.json"))
+	if err := json.Unmarshal(raw, &cat); err != nil {
+		t.Fatal(err)
+	}
+	cat["systemPrompt"] = persona
+	for _, tool := range cat["tools"].([]any) {
+		entry := tool.(map[string]any)
+		if entry["name"] == "https-fetch" {
+			entry["spec"].(map[string]any)["limits"].(map[string]any)["https"].(map[string]any)["maxResponseBytes"] = fetchBytes
+		}
+	}
+	raw, _ = json.Marshal(cat)
+	if err := os.WriteFile(filepath.Join(sub, "catalogue.json"), raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+	var native map[string]any
+	nativeRaw, _ := os.ReadFile(filepath.Join(sub, "native-template.json"))
+	if err := json.Unmarshal(nativeRaw, &native); err != nil {
+		t.Fatal(err)
+	}
+	native["template"].(map[string]any)["system"] = persona
+	nativeRaw, _ = json.Marshal(native)
+	if err := os.WriteFile(filepath.Join(sub, "native-template.json"), nativeRaw, 0600); err != nil {
+		t.Fatal(err)
+	}
+	var configured map[string]any
+	receiptRaw, _ := os.ReadFile(filepath.Join(sub, "configured.json"))
+	if err := json.Unmarshal(receiptRaw, &configured); err != nil {
+		t.Fatal(err)
+	}
+	configured["catalogueHash"] = fmt.Sprintf("blake3:%x", blake3.Sum256(raw))
+	configured["nativeTemplateHash"] = fmt.Sprintf("blake3:%x", blake3.Sum256(nativeRaw))
+	receiptRaw, _ = json.Marshal(configured)
+	if err := os.WriteFile(filepath.Join(sub, "configured.json"), receiptRaw, 0600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The same package re-derived by another Celln binary (another persona, a
+// wider fetch limit) updates the scope's profile and tools in place without
+// a package replacement; namespace wrappers keep working unchanged.
+func TestInstallPlatformFollowsARederivedCatalogue(t *testing.T) {
+	ctx := context.Background()
+	dir, packageHash, principal := starterConfiguration(t)
+	store := platformInstallStore(t)
+	o := PlatformOptions{Namespace: "tenant-a", ConfigurationDir: dir, OutputDir: filepath.Join(t.TempDir(), "out"), Scope: "trial", ClusterID: "cluster-uid", PackageHash: packageHash, Principal: principal, ControllerNamespace: "sympozium-system"}
+	if err := InstallPlatform(ctx, store, o); err != nil {
+		t.Fatal(err)
+	}
+	profileName, _, toolName := PlatformCatalogueNames("trial")
+	var before api.CellnRuntimeProfile
+	if err := store.Get(ctx, types.NamespacedName{Name: profileName}, &before); err != nil {
+		t.Fatal(err)
+	}
+	rederive(t, dir, "You have tools; fetch a live source first.", 16384)
+	if err := InstallPlatform(ctx, store, o); err != nil {
+		t.Fatalf("re-derived catalogue refused: %v", err)
+	}
+	var profile api.CellnRuntimeProfile
+	if err := store.Get(ctx, types.NamespacedName{Name: profileName}, &profile); err != nil || profile.Spec.Native.SystemPrompt != "You have tools; fetch a live source first." || profile.Annotations[packageAnnotation] != packageHash || profile.Annotations[catalogueAnnotation] == before.Annotations[catalogueAnnotation] {
+		t.Fatalf("profile did not follow the re-derived catalogue: %v %+v", err, profile.ObjectMeta)
+	}
+	var tool api.ClusterCellnTool
+	if err := store.Get(ctx, types.NamespacedName{Name: toolName("https-fetch")}, &tool); err != nil || tool.Spec.Limits.HTTPS == nil || tool.Spec.Limits.HTTPS.MaxResponseBytes != 16384 {
+		t.Fatalf("tool limits did not follow: %v %+v", err, tool.Spec.Limits)
+	}
+	var runtime api.AgentRuntime
+	if err := store.Get(ctx, types.NamespacedName{Namespace: "tenant-a", Name: "celln-native"}, &runtime); err != nil || runtime.Spec.CellnProfileRef.Name != profileName {
+		t.Fatalf("namespace wrapper lost: %v %+v", err, runtime.Spec.CellnProfileRef)
+	}
+	// A rerun is idempotent.
+	if err := InstallPlatform(ctx, store, o); err != nil {
+		t.Fatalf("rerun refused: %v", err)
+	}
+}
+
 // Moving a scope to a new package is refused unless approved; approved, the
 // catalogue is replaced, dropped tools are retired and every namespace's
-// platform wrappers follow the new profiles.
+// platform wrappers follow the new profile.
 func TestInstallPlatformReplacesPackageOnlyWhenApproved(t *testing.T) {
 	ctx := context.Background()
 	dir, oldPackage, principal := starterConfiguration(t)
@@ -344,14 +326,14 @@ func TestInstallPlatformReplacesPackageOnlyWhenApproved(t *testing.T) {
 	if err := InstallPlatform(ctx, store, o); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := cellnplatform.EnsureWrappers(ctx, store, "tenant-b", PlatformProfileName("trial", "claude")); err != nil {
-		t.Fatalf("on-demand wrappers: %v", err)
+	profileName, policyName, toolName := PlatformCatalogueNames("trial")
+	if name, err := cellnplatform.EnsureRuntimeWrapper(ctx, store, "tenant-b", profileName); err != nil || name != "celln-native" {
+		t.Fatalf("on-demand wrapper: %v %q", err, name)
 	}
 	var oldCat catalogue
 	if _, err := read(filepath.Join(dir, "native", "catalogue.json"), &oldCat); err != nil {
 		t.Fatal(err)
 	}
-	_, policyName, toolName := PlatformCatalogueNames("trial")
 	dropped := toolName(oldCat.Tools[len(oldCat.Tools)-1].Name)
 
 	newPackage := "blake3:" + strings.Repeat("b", 64)
@@ -366,7 +348,7 @@ func TestInstallPlatformReplacesPackageOnlyWhenApproved(t *testing.T) {
 	}
 
 	var profile api.CellnRuntimeProfile
-	if err := store.Get(ctx, types.NamespacedName{Name: PlatformProfileName("trial", "claude")}, &profile); err != nil || profile.Annotations[packageAnnotation] != newPackage || !strings.HasSuffix(profile.Spec.Revision, "-next") {
+	if err := store.Get(ctx, types.NamespacedName{Name: profileName}, &profile); err != nil || profile.Annotations[packageAnnotation] != newPackage || !strings.HasSuffix(profile.Spec.Revision, "-next") || !cellnplatform.MediationOnly(&profile) {
 		t.Fatalf("profile not replaced: %v %+v", err, profile.ObjectMeta)
 	}
 	var tool api.ClusterCellnTool
@@ -377,12 +359,10 @@ func TestInstallPlatformReplacesPackageOnlyWhenApproved(t *testing.T) {
 	if err := store.Get(ctx, types.NamespacedName{Name: policyName}, &policy); err != nil || policy.Annotations[packageAnnotation] != newPackage || len(policy.Spec.Tools) != len(oldCat.Tools) || !slices.ContainsFunc(policy.Spec.Tools, func(t api.CellnExecutionPolicyTool) bool { return t.Ref.Name == dropped+"-next" }) {
 		t.Fatalf("policy not replaced: %v %+v", err, policy.Spec.Tools)
 	}
-	for _, ref := range policy.Spec.RuntimeProfiles {
-		if !strings.HasSuffix(ref.Ref.Revision, "-next") {
-			t.Fatalf("policy still names the old profile revision: %+v", ref)
-		}
+	if len(policy.Spec.RuntimeProfiles) != 1 || policy.Spec.RuntimeProfiles[0].Ref != (api.CellnRuntimeProfileRef{Name: profileName, Revision: profile.Spec.Revision}) {
+		t.Fatalf("policy still names the old profile revision: %+v", policy.Spec.RuntimeProfiles)
 	}
-	for _, key := range []types.NamespacedName{{Namespace: "tenant-a", Name: "celln-claude"}, {Namespace: "tenant-b", Name: "celln-claude"}} {
+	for _, key := range []types.NamespacedName{{Namespace: "tenant-a", Name: "celln-native"}, {Namespace: "tenant-b", Name: "celln-native"}} {
 		var runtime api.AgentRuntime
 		if err := store.Get(ctx, key, &runtime); err != nil || runtime.Spec.CellnProfileRef.Revision != profile.Spec.Revision {
 			t.Fatalf("%s wrapper not rebound: %v %+v", key, err, runtime.Spec.CellnProfileRef)

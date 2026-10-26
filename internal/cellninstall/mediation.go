@@ -270,9 +270,9 @@ func MediationCertificateExpiry(pems ...[]byte) (earliest time.Time, ok bool) {
 }
 
 // AutoMediationValues are the chart values that switch mediated model access
-// on for an installer-bootstrapped cluster: the trust's identity, the
-// gateway image, and every HTTPS backend offered to an Agent's own key (the
-// starter Agent's route among them). They carry no credential.
+// on for an installer-bootstrapped cluster: the trust's identity and the
+// gateway image. They name no provider and carry no credential; an Agent's
+// own ModelConnection is its route.
 func AutoMediationValues(clusterID, keyID, gatewayImage string) ([]string, error) {
 	if clusterID == "" || strings.ContainsAny(clusterID, " \t\r\n,=") {
 		return nil, fmt.Errorf("a cluster id without whitespace, commas or equals signs is required")
@@ -287,7 +287,6 @@ func AutoMediationValues(clusterID, keyID, gatewayImage string) ([]string, error
 		"celln.mediation.enabled=true",
 		"celln.mediation.clusterId=" + clusterID,
 		"celln.mediation.issuer.keyId=" + keyID,
-		"celln.mediation.mediateBackends=true",
 		"modelGateway.image=" + gatewayImage,
 	}, nil
 }

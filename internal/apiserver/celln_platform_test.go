@@ -9,7 +9,6 @@ import (
 
 	"github.com/go-logr/logr"
 	sympoziumv1alpha1 "github.com/sympozium-ai/sympozium/api/v1alpha1"
-	"github.com/sympozium-ai/sympozium/internal/cellninstall"
 	"github.com/sympozium-ai/sympozium/internal/cellnplatform"
 	corev1 "k8s.io/api/core/v1"
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
@@ -24,19 +23,15 @@ func TestCellnPlatformProfilesAndWrappersFollowTheNamespacePolicy(t *testing.T) 
 	_ = sympoziumv1alpha1.AddToScheme(scheme)
 	_ = corev1.AddToScheme(scheme)
 	raw := func(s string) apiextensionsv1.JSON { return apiextensionsv1.JSON{Raw: []byte(s)} }
-	profile := &sympoziumv1alpha1.CellnRuntimeProfile{ObjectMeta: metav1.ObjectMeta{Name: "celln-native-trial"}, Spec: sympoziumv1alpha1.CellnRuntimeProfileSpec{Revision: "v1", Native: &sympoziumv1alpha1.CellnNativeProvisioning{CredentialProfile: "trial", SystemPrompt: "host persona", Template: raw(`{"model":"deepseek-chat","url":"https://api.deepseek.com/chat/completions"}`)}}}
+	profile := &sympoziumv1alpha1.CellnRuntimeProfile{ObjectMeta: metav1.ObjectMeta{Name: "celln-native-trial"}, Spec: sympoziumv1alpha1.CellnRuntimeProfileSpec{Revision: "v1", Native: &sympoziumv1alpha1.CellnNativeProvisioning{SystemPrompt: "host persona", Template: raw(`{"model":"deepseek-chat","url":"https://api.deepseek.com/chat/completions"}`)}}}
 	// A second backend of the same scope: its profile is labeled with the
 	// backend name and gets its own wrapper names.
-	local := &sympoziumv1alpha1.CellnRuntimeProfile{ObjectMeta: metav1.ObjectMeta{Name: "celln-native-trial-local", Labels: map[string]string{cellnplatform.BackendLabel: "local"}}, Spec: sympoziumv1alpha1.CellnRuntimeProfileSpec{Revision: "v1", Native: &sympoziumv1alpha1.CellnNativeProvisioning{TurnModelRequests: 6, TurnOutputTokens: 24576, CredentialProfile: "trial-local", SystemPrompt: "host persona", Template: raw(`{"model":"qwen.gguf","url":"http://100.81.163.75:8080/v1/chat/completions","allow_insecure":true}`)}}}
+	local := &sympoziumv1alpha1.CellnRuntimeProfile{ObjectMeta: metav1.ObjectMeta{Name: "celln-native-trial-local", Labels: map[string]string{cellnplatform.BackendLabel: "local"}}, Spec: sympoziumv1alpha1.CellnRuntimeProfileSpec{Revision: "v1", Native: &sympoziumv1alpha1.CellnNativeProvisioning{TurnModelRequests: 6, TurnOutputTokens: 24576, SystemPrompt: "host persona", Template: raw(`{"model":"qwen.gguf","url":"http://100.81.163.75:8080/v1/chat/completions","allow_insecure":true}`)}}}
 	policy := &sympoziumv1alpha1.CellnExecutionPolicy{ObjectMeta: metav1.ObjectMeta{Name: "celln-fleet-trial"}, Spec: sympoziumv1alpha1.CellnExecutionPolicySpec{
 		NamespaceSelector: cellnplatform.OpenSelector(cellnplatform.SystemNamespaces("sympozium-system")),
 		RuntimeProfiles:   []sympoziumv1alpha1.CellnExecutionPolicyRuntime{{Ref: sympoziumv1alpha1.CellnRuntimeProfileRef{Name: profile.Name, Revision: "v1"}}, {Ref: sympoziumv1alpha1.CellnRuntimeProfileRef{Name: local.Name, Revision: "v1"}}},
 		Tools:             []sympoziumv1alpha1.CellnExecutionPolicyTool{{Ref: sympoziumv1alpha1.ClusterCellnToolRef{Name: "celln-trial-workspace-read", Revision: "v1"}}},
-		Routes: []sympoziumv1alpha1.CellnExecutionPolicyRoute{
-			{Provider: "deepseek", Protocol: "openai-chat", Models: []string{"deepseek-chat"}, EndpointOrigins: []string{"https://api.deepseek.com"}, Auth: "host-profile"},
-			{Provider: "llama-server", Protocol: "openai-chat", Models: []string{"qwen.gguf"}, EndpointOrigins: []string{"http://100.81.163.75:8080"}, Auth: "host-profile", AllowInsecure: true},
-		},
-		Ceilings: sympoziumv1alpha1.CellnExecutionPolicyCeilings{MaxTurns: 256, MaxModelRequests: 1536, MaxOutputTokens: 786432, MaxParentLeaseSeconds: 86400, MaxTurnSeconds: 60},
+		Ceilings:          sympoziumv1alpha1.CellnExecutionPolicyCeilings{MaxTurns: 256, MaxModelRequests: 1536, MaxOutputTokens: 786432, MaxParentLeaseSeconds: 86400, MaxTurnSeconds: 60},
 	}}
 	ns := func(name string) *corev1.Namespace {
 		return &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: name, Labels: map[string]string{cellnplatform.NamespaceNameLabel: name}}}
@@ -61,11 +56,13 @@ func TestCellnPlatformProfilesAndWrappersFollowTheNamespacePolicy(t *testing.T) 
 	for _, p := range got {
 		byName[p.Name] = p
 	}
-	if p := byName["celln-native-trial"]; len(got) != 2 || p.Provider != "deepseek" || p.Model != "deepseek-chat" || p.CredentialProfile != "trial" || p.Backend != "native" || p.Wrapper != "celln-native" || p.Agent != "celln-agent" || len(p.Tools) != 1 || p.Tools[0].Name != "celln-trial-workspace-read" || p.SystemPrompt != "host persona" || p.Ceilings.LeaseSeconds != 86400 || p.SessionDefaults.LeaseSeconds != 14400 || p.SessionDefaults.MaxTurns != 64 || p.SessionDefaults.MaxModelRequests != 384 || p.SessionDefaults.MaxOutputTokens != 196608 {
+	// Every profile is offered as mediation-only with no provider, model or
+	// shared Agent of its own: the Agent's connection is the route.
+	if p := byName["celln-native-trial"]; len(got) != 2 || !p.MediationOnly || p.Provider != "" || p.Model != "" || p.Agent != "" || p.Backend != "native" || p.Wrapper != "celln-native" || len(p.Tools) != 1 || p.Tools[0].Name != "celln-trial-workspace-read" || p.Ceilings.MaxTurns != 256 || p.SessionDefaults.MaxTurns != 64 {
 		t.Fatalf("tenant profiles: %+v", got)
 	}
-	if p := byName["celln-native-trial-local"]; p.Provider != "llama-server" || p.Model != "qwen.gguf" || p.CredentialProfile != "trial-local" || p.Backend != "local" || p.Wrapper != "celln-local" || p.Agent != "celln-agent-local" {
-		t.Fatalf("second backend must be offered with its own wrapper names: %+v", p)
+	if p := byName["celln-native-trial-local"]; !p.MediationOnly || p.Provider != "" || p.Backend != "local" || p.Wrapper != "celln-local" || p.Agent != "" {
+		t.Fatalf("second backend must be offered with its own wrapper name: %+v", p)
 	}
 	// The local backend allows 4096 output tokens per request, so its turns
 	// reserve 24576: the shared ceilings pay for 32 of them, and its session
@@ -83,12 +80,11 @@ func TestCellnPlatformProfilesAndWrappersFollowTheNamespacePolicy(t *testing.T) 
 	}
 	res := post("team-a", `{"profile":"celln-native-trial"}`)
 	var wrappers cellnplatform.Wrappers
-	if res.Code != http.StatusOK || json.Unmarshal(res.Body.Bytes(), &wrappers) != nil || wrappers.Connection != "celln-native" || len(wrappers.Created) != 3 {
+	if res.Code != http.StatusOK || json.Unmarshal(res.Body.Bytes(), &wrappers) != nil || wrappers.Runtime != "celln-native" || wrappers.Connection != "" || wrappers.Agent != "" || len(wrappers.Created) != 1 {
 		t.Fatalf("ensure: %d %s", res.Code, res.Body.String())
 	}
-	var connection sympoziumv1alpha1.ModelConnection
-	if err := cl.Get(t.Context(), types.NamespacedName{Namespace: "team-a", Name: "celln-native"}, &connection); err != nil || connection.Spec.CredentialProfile != "trial" {
-		t.Fatalf("wrapper connection: %v", err)
+	if err := cl.Get(t.Context(), types.NamespacedName{Namespace: "team-a", Name: "celln-native"}, &sympoziumv1alpha1.ModelConnection{}); err == nil {
+		t.Fatal("a host-profile connection was created for the namespace")
 	}
 	if res := post("team-a", `{"profile":"celln-native-trial"}`); res.Code != http.StatusOK || !strings.Contains(res.Body.String(), `"created":[]`) {
 		t.Fatalf("second ensure: %d %s", res.Code, res.Body.String())
@@ -99,42 +95,27 @@ func TestCellnPlatformProfilesAndWrappersFollowTheNamespacePolicy(t *testing.T) 
 	if res := post("team-a", `{}`); res.Code != http.StatusBadRequest {
 		t.Fatalf("empty profile accepted: %d", res.Code)
 	}
-	// A run on a fleet wrapper that names no persona gets the profile's bound
-	// persona, so the API and UI never trip the plan's persona check.
-	res = httptest.NewRecorder()
-	body := `{"agentRef":"celln-agent","task":"Where is Botswana?","backend":"celln","executionLifecycle":"one-shot","model":"deepseek-chat","modelConnectionRef":"celln-native","cellnSelection":{"runtimeRef":"celln-native","toolRefs":[],"clusterToolRefs":[{"name":"celln-trial-workspace-read","revision":"v1"}]}}`
-	srv.Handler(nil).ServeHTTP(res, httptest.NewRequest(http.MethodPost, "/api/v1/runs?namespace=team-a", strings.NewReader(body)))
-	var run sympoziumv1alpha1.AgentRun
-	if res.Code != http.StatusCreated && res.Code != http.StatusOK || json.Unmarshal(res.Body.Bytes(), &run) != nil {
-		t.Fatalf("one-shot on a wrapper refused: %d %s", res.Code, res.Body.String())
-	}
-	if run.Spec.SystemPrompt != "host persona" || run.Spec.ExecutionLifecycle != "one-shot" || run.Spec.Enduring != nil || run.Spec.CellnSelection == nil || run.Spec.CellnSelection.RuntimeRef != "celln-native" {
-		t.Fatalf("run did not inherit the profile's persona as a platform one-shot: %+v", run.Spec)
-	}
 }
 
-// A backend whose key never reached the fleet is listed for Agents with their
-// own key (its runtime, the secret route's provider and model) and has no
-// shared Agent; without its mediation-only label it is not offered at all.
+// Every profile the policy admits is offered as mediation-only: no node holds
+// a model, so each entry names its runtime wrapper and no provider, model or
+// shared Agent, whether or not the profile carries the mediation-only label.
 func TestCellnPlatformListsMediationOnlyProfiles(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = sympoziumv1alpha1.AddToScheme(scheme)
 	_ = corev1.AddToScheme(scheme)
 	template := apiextensionsv1.JSON{Raw: []byte(`{"model":"deepseek-chat","url":"https://api.deepseek.com/chat/completions"}`)}
 	profile := func(name string, labels map[string]string) *sympoziumv1alpha1.CellnRuntimeProfile {
-		return &sympoziumv1alpha1.CellnRuntimeProfile{ObjectMeta: metav1.ObjectMeta{Name: name, Labels: labels}, Spec: sympoziumv1alpha1.CellnRuntimeProfileSpec{Revision: "v1", Native: &sympoziumv1alpha1.CellnNativeProvisioning{CredentialProfile: "trial", SystemPrompt: "host persona", Template: template}}}
+		return &sympoziumv1alpha1.CellnRuntimeProfile{ObjectMeta: metav1.ObjectMeta{Name: name, Labels: labels}, Spec: sympoziumv1alpha1.CellnRuntimeProfileSpec{Revision: "v1", Native: &sympoziumv1alpha1.CellnNativeProvisioning{SystemPrompt: "host persona", Template: template}}}
 	}
 	mediated := profile("celln-native-trial", map[string]string{cellnplatform.MediationOnlyLabel: "true"})
 	unlabeled := profile("celln-native-trial-other", map[string]string{cellnplatform.BackendLabel: "other"})
 	policy := &sympoziumv1alpha1.CellnExecutionPolicy{ObjectMeta: metav1.ObjectMeta{Name: "celln-fleet-trial"}, Spec: sympoziumv1alpha1.CellnExecutionPolicySpec{
 		NamespaceSelector: cellnplatform.OpenSelector(cellnplatform.SystemNamespaces("sympozium-system")),
 		RuntimeProfiles:   []sympoziumv1alpha1.CellnExecutionPolicyRuntime{{Ref: sympoziumv1alpha1.CellnRuntimeProfileRef{Name: mediated.Name, Revision: "v1"}}, {Ref: sympoziumv1alpha1.CellnRuntimeProfileRef{Name: unlabeled.Name, Revision: "v1"}}},
-		Routes:            []sympoziumv1alpha1.CellnExecutionPolicyRoute{{Provider: "deepseek", Protocol: "openai-chat", Models: []string{"deepseek-chat"}, EndpointOrigins: []string{"https://api.deepseek.com"}, Auth: "secret"}},
 		Ceilings:          sympoziumv1alpha1.CellnExecutionPolicyCeilings{MaxTurns: 256, MaxModelRequests: 1536, MaxOutputTokens: 786432, MaxParentLeaseSeconds: 86400, MaxTurnSeconds: 60},
 	}}
-	// The backend's starter Agent, whose own key is the backend's key.
-	starter := &sympoziumv1alpha1.Agent{ObjectMeta: metav1.ObjectMeta{Namespace: "ops", Name: "starter", Labels: map[string]string{cellninstall.StarterAgentLabel: "starter"}}}
-	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(mediated, unlabeled, policy, starter, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "team-a", Labels: map[string]string{cellnplatform.NamespaceNameLabel: "team-a"}}}).Build()
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(mediated, unlabeled, policy, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "team-a", Labels: map[string]string{cellnplatform.NamespaceNameLabel: "team-a"}}}).Build()
 	srv := NewServer(cl, nil, nil, logr.Discard())
 	res := httptest.NewRecorder()
 	srv.Handler(nil).ServeHTTP(res, httptest.NewRequest(http.MethodGet, "/api/v1/celln-platform/profiles?namespace=team-a", nil))
@@ -142,11 +123,14 @@ func TestCellnPlatformListsMediationOnlyProfiles(t *testing.T) {
 	if res.Code != http.StatusOK || json.Unmarshal(res.Body.Bytes(), &out) != nil {
 		t.Fatalf("status %d: %s", res.Code, res.Body.String())
 	}
-	if len(out) != 1 {
+	if len(out) != 2 {
 		t.Fatalf("profiles: %+v", out)
 	}
+	if other := out[1]; other.Name != unlabeled.Name || !other.MediationOnly || other.Provider != "" || other.Wrapper != "celln-other" {
+		t.Fatalf("unlabeled profile: %+v", other)
+	}
 	p := out[0]
-	if p.Name != mediated.Name || !p.MediationOnly || p.Agent != "" || p.CredentialProfile != "" || p.Provider != "deepseek" || p.Model != "deepseek-chat" || p.Wrapper != "celln-native" || p.SessionDefaults.MaxTurns == 0 || p.StarterAgent != "starter" || p.StarterNamespace != "ops" {
+	if p.Name != mediated.Name || !p.MediationOnly || p.Agent != "" || p.Provider != "" || p.Model != "" || p.Wrapper != "celln-native" || p.SessionDefaults.MaxTurns == 0 {
 		t.Fatalf("mediation-only profile: %+v", p)
 	}
 }
@@ -160,7 +144,7 @@ func TestCellnPlatformOffersEachBackendsToolboxWithItsProfile(t *testing.T) {
 	_ = sympoziumv1alpha1.AddToScheme(scheme)
 	_ = corev1.AddToScheme(scheme)
 	template := apiextensionsv1.JSON{Raw: []byte(`{"model":"deepseek-chat","url":"https://api.deepseek.com/chat/completions"}`)}
-	base := &sympoziumv1alpha1.CellnRuntimeProfile{ObjectMeta: metav1.ObjectMeta{Name: "celln-native-trial"}, Spec: sympoziumv1alpha1.CellnRuntimeProfileSpec{Revision: "v1", Native: &sympoziumv1alpha1.CellnNativeProvisioning{CredentialProfile: "trial", SystemPrompt: "host persona", Template: template}}}
+	base := &sympoziumv1alpha1.CellnRuntimeProfile{ObjectMeta: metav1.ObjectMeta{Name: "celln-native-trial"}, Spec: sympoziumv1alpha1.CellnRuntimeProfileSpec{Revision: "v1", Native: &sympoziumv1alpha1.CellnNativeProvisioning{SystemPrompt: "host persona", Template: template}}}
 	ordered := []sympoziumv1alpha1.ClusterCellnToolRef{{Name: "celln-trial-workspace-read", Revision: "v1"}, {Name: "celln-trial-grep", Revision: "v1"}}
 	toolbox := base.DeepCopy()
 	toolbox.Name = cellnplatform.ToolboxProfileName(base.Name)
@@ -171,7 +155,6 @@ func TestCellnPlatformOffersEachBackendsToolboxWithItsProfile(t *testing.T) {
 		RuntimeProfiles:   []sympoziumv1alpha1.CellnExecutionPolicyRuntime{{Ref: sympoziumv1alpha1.CellnRuntimeProfileRef{Name: base.Name, Revision: "v1"}}, {Ref: sympoziumv1alpha1.CellnRuntimeProfileRef{Name: toolbox.Name, Revision: "v1"}}},
 		// The policy lends them in another order; the toolbox's is the one.
 		Tools:    []sympoziumv1alpha1.CellnExecutionPolicyTool{{Ref: ordered[1]}, {Ref: ordered[0]}},
-		Routes:   []sympoziumv1alpha1.CellnExecutionPolicyRoute{{Provider: "deepseek", Protocol: "openai-chat", Models: []string{"deepseek-chat"}, EndpointOrigins: []string{"https://api.deepseek.com"}, Auth: "host-profile"}},
 		Ceilings: sympoziumv1alpha1.CellnExecutionPolicyCeilings{MaxTurns: 256, MaxModelRequests: 1536, MaxOutputTokens: 786432, MaxParentLeaseSeconds: 86400, MaxTurnSeconds: 60},
 	}}
 	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(base, toolbox, policy, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "team-a", Labels: map[string]string{cellnplatform.NamespaceNameLabel: "team-a"}}}).Build()
@@ -198,8 +181,41 @@ func TestCellnPlatformOffersEachBackendsToolboxWithItsProfile(t *testing.T) {
 	if err := cl.Get(t.Context(), types.NamespacedName{Namespace: "team-a", Name: "celln-native.toolbox"}, &wrapper); err != nil || wrapper.Spec.CellnProfileRef.Name != toolbox.Name {
 		t.Fatalf("toolbox wrapper: %v %+v", err, wrapper.Spec)
 	}
-	// The toolbox has no shared Agent or host-profile connection.
-	if res := post(`{"profile":"celln-native-trial.toolbox"}`); res.Code == http.StatusOK {
-		t.Fatalf("toolbox offered the full wrapper set: %s", res.Body.String())
+	// No profile has a shared Agent or connection: asking for the full wrapper
+	// set yields the same runtime wrapper and nothing else.
+	if res := post(`{"profile":"celln-native-trial.toolbox"}`); res.Code != http.StatusOK || json.Unmarshal(res.Body.Bytes(), &wrappers) != nil || wrappers.Agent != "" || wrappers.Connection != "" || wrappers.Runtime != "celln-native.toolbox" {
+		t.Fatalf("toolbox offered more than its runtime wrapper: %d %s", res.Code, res.Body.String())
+	}
+}
+
+// A model-free profile (a node that calls no model: its template names only
+// the scoped alias and the policy carries no route of its own for it) is
+// still offered to the namespace as mediation-only. The Agent's connection is
+// the route, so the entry names no provider, model or endpoint.
+func TestCellnPlatformListsModelFreeProfileWithoutARoute(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = sympoziumv1alpha1.AddToScheme(scheme)
+	_ = corev1.AddToScheme(scheme)
+	template := apiextensionsv1.JSON{Raw: []byte(`{"model":"mediated","url":"https://celln-model.invalid/v1/invoke"}`)}
+	modelFree := &sympoziumv1alpha1.CellnRuntimeProfile{ObjectMeta: metav1.ObjectMeta{Name: "celln-native-trial", Labels: map[string]string{cellnplatform.MediationOnlyLabel: "true"}}, Spec: sympoziumv1alpha1.CellnRuntimeProfileSpec{Revision: "v1", Native: &sympoziumv1alpha1.CellnNativeProvisioning{SystemPrompt: "host persona", Template: template}}}
+	policy := &sympoziumv1alpha1.CellnExecutionPolicy{ObjectMeta: metav1.ObjectMeta{Name: "celln-fleet-trial"}, Spec: sympoziumv1alpha1.CellnExecutionPolicySpec{
+		NamespaceSelector: cellnplatform.OpenSelector(cellnplatform.SystemNamespaces("sympozium-system")),
+		RuntimeProfiles:   []sympoziumv1alpha1.CellnExecutionPolicyRuntime{{Ref: sympoziumv1alpha1.CellnRuntimeProfileRef{Name: modelFree.Name, Revision: "v1"}}},
+		Ceilings:          sympoziumv1alpha1.CellnExecutionPolicyCeilings{MaxTurns: 256, MaxModelRequests: 1536, MaxOutputTokens: 786432, MaxParentLeaseSeconds: 86400, MaxTurnSeconds: 300},
+	}}
+	cl := fake.NewClientBuilder().WithScheme(scheme).WithObjects(modelFree, policy, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "team-a", Labels: map[string]string{cellnplatform.NamespaceNameLabel: "team-a"}}}).Build()
+	srv := NewServer(cl, nil, nil, logr.Discard())
+	res := httptest.NewRecorder()
+	srv.Handler(nil).ServeHTTP(res, httptest.NewRequest(http.MethodGet, "/api/v1/celln-platform/profiles?namespace=team-a", nil))
+	var out []CellnPlatformProfile
+	if res.Code != http.StatusOK || json.Unmarshal(res.Body.Bytes(), &out) != nil {
+		t.Fatalf("status %d: %s", res.Code, res.Body.String())
+	}
+	if len(out) != 1 {
+		t.Fatalf("a model-free profile must be offered: %+v", out)
+	}
+	p := out[0]
+	if !p.MediationOnly || p.Agent != "" || p.Provider != "" || p.Model != "" || p.Endpoint != "" || p.Wrapper != "celln-native" || p.Policy != policy.Name || p.Ceilings.MaxTurns != 256 || p.SessionDefaults.MaxTurns == 0 {
+		t.Fatalf("model-free profile entry: %+v", p)
 	}
 }

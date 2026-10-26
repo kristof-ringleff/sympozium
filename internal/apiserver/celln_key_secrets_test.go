@@ -195,7 +195,7 @@ func TestCreateOwnKeyConnectionFixesTheSecretKeyByProtocol(t *testing.T) {
 		if err := srv.client.Get(context.Background(), types.NamespacedName{Namespace: "team-a", Name: "mine-connection"}, &connection); err != nil {
 			t.Fatal(err)
 		}
-		if connection.Spec.MaxOutputTokens != 2048 || connection.Spec.Parameters == nil || connection.Spec.CredentialProfile != "" {
+		if connection.Spec.MaxOutputTokens != 2048 || connection.Spec.Parameters == nil {
 			t.Fatalf("%s: connection %+v", protocol, connection.Spec)
 		}
 	}

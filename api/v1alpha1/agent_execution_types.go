@@ -1,5 +1,7 @@
 package v1alpha1
 
+import "strings"
+
 // AgentExecutionDefaults stores Agent-level defaults for run execution choices.
 // Omission preserves historical behaviour: Kubernetes Job backend, no Celln
 // catalogue selection, and no enduring lifecycle. Defaults and toolbox
@@ -43,6 +45,25 @@ type AgentExecutionDefaults struct {
 	// Model is the default model id for inherited Celln catalogue runs.
 	// +optional
 	Model string `json:"model,omitempty"`
+
+	// SystemPrompt is this Agent's persona: the system prompt every inherited
+	// Celln run carries into its cell. It is agent configuration, not fleet
+	// material: the fleet's catalogue only supplies a default when neither
+	// the run nor the Agent names one. A cell accepts at most
+	// MaxCellnSystemPromptBytes.
+	// +kubebuilder:validation:MaxLength=2048
+	// +optional
+	SystemPrompt string `json:"systemPrompt,omitempty"`
+}
+
+// MaxCellnSystemPromptBytes is the largest system prompt a cell's native
+// harness accepts (celln-pilot json_harness: system <= 2048 bytes).
+const MaxCellnSystemPromptBytes = 2048
+
+// ValidCellnSystemPrompt reports whether a persona fits a cell: within
+// MaxCellnSystemPromptBytes and without NUL.
+func ValidCellnSystemPrompt(prompt string) bool {
+	return len(prompt) <= MaxCellnSystemPromptBytes && !strings.ContainsRune(prompt, '\x00')
 }
 
 // Validate reports an actionable reason when Agent execution defaults are inconsistent.
@@ -57,6 +78,9 @@ func (e *AgentExecutionDefaults) Validate() string {
 	}
 	if e.ExecutionLifecycle != "" && e.ExecutionLifecycle != "one-shot" && e.ExecutionLifecycle != "enduring" {
 		return "execution.executionLifecycle must be one-shot or enduring"
+	}
+	if !ValidCellnSystemPrompt(e.SystemPrompt) {
+		return "execution.systemPrompt must be at most 2048 UTF-8 bytes without NUL (the cell's bound)"
 	}
 	if e.CellnSelection != nil {
 		if e.Backend != "" && e.Backend != "celln" {

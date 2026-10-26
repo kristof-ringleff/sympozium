@@ -78,8 +78,13 @@ func (g *Gateway) PinCredentialSource(ctx context.Context, in PinRequest) (PinRe
 	if err := g.k8s.Get(ctx, types.NamespacedName{Namespace: in.Namespace, Name: in.CredentialSecretName}, &secret); err != nil {
 		return PinResponse{}, fail(ReasonUnavailable, 503, err)
 	}
-	if secret.DeletionTimestamp != nil || len(secret.Data[in.CredentialSecretKey]) == 0 {
+	if secret.DeletionTimestamp != nil || len(secret.Data[in.CredentialSecretKey]) == 0 || connection.Spec.CredentialSecretKey() != in.CredentialSecretKey {
 		return PinResponse{}, fail(ReasonCredentialChanged, 409, nil)
+	}
+	// The key goes only to the origin it was pinned to when it was created or
+	// first claimed. An unpinned key has not been claimed by its Agent yet.
+	if origin, err := connection.Spec.Origin(); err != nil || !modelkey.PinnedTo(&secret, origin) {
+		return PinResponse{}, fail(ReasonCredentialChanged, 409, err)
 	}
 	return PinResponse{ModelConnectionUID: string(connection.UID), SecretUID: string(secret.UID)}, nil
 }
@@ -335,6 +340,11 @@ func (g *Gateway) liveRoute(ctx context.Context, decision cellncapability.Decisi
 		return connection, nil, fail(ReasonCredentialChanged, 503, err)
 	}
 	if string(agent.UID) != decision.Agent.UID || agent.DeletionTimestamp != nil || !modelkey.OwnedBy(&secret, &agent) {
+		return connection, nil, fail(ReasonCredentialChanged, 403, nil)
+	}
+	// And only to the origin the key is pinned to, which the decision bound
+	// and the live connection still names.
+	if !modelkey.PinnedTo(&secret, decision.Route.EndpointOrigin) {
 		return connection, nil, fail(ReasonCredentialChanged, 403, nil)
 	}
 	return connection, append([]byte(nil), credential...), nil

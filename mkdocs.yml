@@ -77,6 +77,9 @@ plugins:
         guides/celln-tool-authority.md: design/history/celln-tool-authority.md
         guides/celln-tool-catalogue.md: design/history/celln-tool-catalogue.md
         guides/celln-tool-review.md: design/history/celln-tool-review.md
+        guides/celln-native-installation.md: guides/celln-fleet-installation.md
+        guides/celln-model-gateway-component-installation.md: guides/celln-fleet-installation.md
+        guides/celln-external-router-migration.md: guides/celln-fleet-installation.md
         architecture-simplified.md: design/history/architecture-simplified.md
 
 markdown_extensions:
@@ -147,10 +150,7 @@ nav:
       - AgentHarness UX: guides/agentharness-ux.md
     - Celln:
       - Celln Fleet Installation: guides/celln-fleet-installation.md
-      - Native Celln Installation: guides/celln-native-installation.md
-      - Mediated Model Access: guides/celln-mediated-model-access.md
-      - Model Gateway Component: guides/celln-model-gateway-component-installation.md
-      - Host Router Migration (legacy): guides/celln-external-router-migration.md
+      - Agent-bound Model Access: guides/celln-mediated-model-access.md
     - Models & Providers:
       - Model Connections: guides/model-connections.md
       - Cluster-Local Models: guides/local-models.md
@@ -159,6 +159,7 @@ nav:
       - llama-server: guides/llama-server.md
       - Unsloth: guides/unsloth.md
       - AWS Bedrock: guides/aws-bedrock.md
+      - AWS MCP with IAM Roles Anywhere: guides/aws-mcp-roles-anywhere.md
     - Extending:
       - Writing Skills: guides/writing-skills.md
       - Writing Tools: guides/writing-tools.md

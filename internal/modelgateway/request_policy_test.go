@@ -225,7 +225,7 @@ func TestInvokeAppliesLiveConnectionRequestPolicy(t *testing.T) {
 		Parameters: &apiextensionsv1.JSON{Raw: []byte(`{"temperature": 0.7, "chat_template_kwargs": {"enable_thinking": false}}`)}, MaxOutputTokens: 2048}}
 	for _, obj := range []client.Object{
 		&core.Namespace{ObjectMeta: meta.ObjectMeta{Name: ns, UID: "namespace-uid"}}, conn,
-		&core.Secret{ObjectMeta: meta.ObjectMeta{Namespace: ns, Name: "key", UID: "secret-uid", Annotations: map[string]string{modelkey.OwnerAnnotation: "Agent/agent"}}, Data: map[string][]byte{"OPENAI_API_KEY": []byte("provider-key")}},
+		&core.Secret{ObjectMeta: meta.ObjectMeta{Namespace: ns, Name: "key", UID: "secret-uid", Annotations: map[string]string{modelkey.OwnerAnnotation: "Agent/agent", modelkey.OriginAnnotation: provider.URL}}, Data: map[string][]byte{"OPENAI_API_KEY": []byte("provider-key")}},
 		&api.Agent{ObjectMeta: meta.ObjectMeta{Namespace: ns, Name: "agent", UID: "agent-uid"}},
 	} {
 		if err := k8s.Create(ctx, obj); err != nil {

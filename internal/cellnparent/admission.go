@@ -1,20 +1,31 @@
+// Package cellnparent holds the enduring-run contracts shared by the API
+// server and the controller: the turn record (NewTurn, BindTurn), the single
+// "may this parent take another turn" rule (TurnReadiness) and conversation
+// continuation (Continuation, Transcript). The native parent plane that once
+// provisioned and drove parents from this package was removed in 0.12; every
+// Celln run now executes through the scoped platform path (internal/cellnscoped).
+// The parent binding validation here still reads status.cellnParent so the API
+// can explain a run that plane left behind.
 package cellnparent
 
 import (
-	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
-	"time"
-
-	"github.com/sympozium-ai/sympozium/internal/celln"
+	"regexp"
 	"unicode"
 
 	api "github.com/sympozium-ai/sympozium/api/v1alpha1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
-	"sigs.k8s.io/controller-runtime/pkg/client"
+	"github.com/sympozium-ai/sympozium/internal/celln"
+)
+
+var (
+	// ErrReconcile reports recorded state that no longer matches the original
+	// parent identity; callers reconcile rather than invent a replacement.
+	ErrReconcile = errors.New("parent outcome requires reconciliation; preserve incarnation and turn ID")
+	hashPattern  = regexp.MustCompile(`^blake3:[0-9a-f]{64}$`)
 )
 
 // SpecDigest binds the complete typed run spec, including lifecycle, catalogue
@@ -31,8 +42,9 @@ func SpecDigest(spec api.AgentRunSpec) (string, error) {
 	return fmt.Sprintf("sha256:%x", sum), nil
 }
 
-// ValidateAdmission consumes an independently operator-approved launch binding.
-// Never construct approval from tenant annotations or reuse a one-shot grant.
+// ValidateAdmission checks that a recorded parent binding still describes this
+// run: same UID, same complete intent, well-formed identities and owner origin.
+// Never construct a binding from tenant annotations or reuse a one-shot grant.
 func ValidateAdmission(run *api.AgentRun, approval api.CellnParentBinding) error {
 	if run.Status.Phase != "" && run.Status.Phase != api.AgentRunPhasePending && run.Status.Phase != api.AgentRunPhaseRunning {
 		return fmt.Errorf("parent startup cannot admit a terminal or unrelated lifecycle phase")
@@ -58,7 +70,7 @@ func ValidateAdmission(run *api.AgentRun, approval api.CellnParentBinding) error
 	if run.Status.CellnParent != nil && run.Status.CellnParent.Binding != approval {
 		return fmt.Errorf("frozen parent admission changed; reconcile original owner")
 	}
-	if run.Status.CellnRequest != "" || run.Status.CellnIssuance != nil || run.Status.CellnActionID != "" || run.Status.JobName != "" || run.Status.DeploymentName != "" {
+	if run.Status.CellnIssuance != nil || run.Status.JobName != "" || run.Status.DeploymentName != "" {
 		return fmt.Errorf("parent admission cannot replace another execution path")
 	}
 	return nil
@@ -74,48 +86,4 @@ func validateOwnerOrigin(target string) error {
 	}
 	c.Close()
 	return nil
-}
-
-// Prepare saves the immutable binding without network effects. ResourceVersion
-// conflicts are returned to the reconciler, never overwritten with a new owner.
-func Prepare(ctx context.Context, writer client.Client, reader client.Reader, key types.NamespacedName, approval api.CellnParentBinding) error {
-	var run api.AgentRun
-	if err := reader.Get(ctx, key, &run); err != nil {
-		return err
-	}
-	if err := ValidateAdmission(&run, approval); err != nil {
-		return err
-	}
-	if run.Status.CellnParent != nil {
-		return nil
-	}
-	run.Status.CellnOnly = true
-	run.Status.CellnParent = &api.CellnParentStatus{Binding: approval}
-	return writer.Status().Update(ctx, &run)
-}
-
-// ClaimCreate persists the at-most-once attempt before a caller may POST. False
-// means reconcile only, including after a crash between this write and dispatch.
-func ClaimCreate(ctx context.Context, writer client.Client, reader client.Reader, key types.NamespacedName, approval api.CellnParentBinding) (bool, error) {
-	var run api.AgentRun
-	if err := reader.Get(ctx, key, &run); err != nil {
-		return false, err
-	}
-	if err := ValidateAdmission(&run, approval); err != nil {
-		return false, err
-	}
-	if run.Status.CellnParent == nil {
-		return false, fmt.Errorf("parent must be durably prepared before creation")
-	}
-	if run.Status.CellnParent.CreateAttempted {
-		return false, nil
-	}
-	run.Status.CellnParent.CreateAttempted = true
-	// The original execution lease starts at the first attempt. Repeat claims
-	// return early above, so this stamp is written once and never extended.
-	run.Status.CellnParent.AdmittedAt = &metav1.Time{Time: time.Now().UTC()}
-	if err := writer.Status().Update(ctx, &run); err != nil {
-		return false, err
-	}
-	return true, nil
 }

@@ -1,25 +1,13 @@
 package cellnparent
 
 import (
-	"context"
-	"encoding/json"
 	"errors"
-	"fmt"
-	"net/http"
-	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 
 	api "github.com/sympozium-ai/sympozium/api/v1alpha1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/types"
-	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
 // readyParentFixture is a Running enduring parent whose initial turn committed
@@ -146,88 +134,5 @@ func TestTurnsUsedCountsTheInitialTurnWhateverItsOutcome(t *testing.T) {
 	failed := &api.CellnParentStatus{AcceptedTurns: 2, InitialTurn: &api.CellnParentTurnStatus{Result: &api.CellnParentTurnResult{Succeeded: false, Answer: "failed"}}}
 	if TurnsUsed(failed) != 3 {
 		t.Fatalf("TurnsUsed = %d, want 3: a failed initial turn still spent its turn", TurnsUsed(failed))
-	}
-}
-
-// A follow-up after a FAILED initial turn is claimed, dispatched once and
-// committed like any other; the failed turn still counts toward maxTurns, so
-// the ceiling holds and the next turn is refused without reaching the owner.
-func TestFollowUpDispatchesAfterFailedInitialTurnWithinBudget(t *testing.T) {
-	ctx := context.Background()
-	run, binding := readyParentFixture(t, false, 2)
-	var posts atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == "POST" {
-			var body map[string]string
-			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-				t.Error(err)
-			}
-			posts.Add(1)
-			fmt.Fprintf(w, `{"kind":"completed","apiVersion":"celln.parent-context/v1","turnId":%q,"succeeded":true,"answer":"recovered"}`, body["turnId"])
-			return
-		}
-		fmt.Fprintf(w, `{"incarnation":%q,"status":"Ready","statusIsLiveOwnerObservation":true,"retryAuthorized":false}`, testID)
-	}))
-	defer server.Close()
-	binding.Target = server.URL
-	run.Status.CellnParent.Binding = binding
-	scheme := runtime.NewScheme()
-	if err := api.AddToScheme(scheme); err != nil {
-		t.Fatal(err)
-	}
-	store := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&api.AgentRun{}, &api.AgentRunTurn{}).WithObjects(run).Build()
-	root := t.TempDir()
-	token := filepath.Join(root, "token")
-	if err := os.WriteFile(token, []byte("failed-initial-turn-parent-credential"), 0600); err != nil {
-		t.Fatal(err)
-	}
-	raw, err := json.Marshal(ApprovalConfig{APIVersion: "sympozium.ai/celln-parent-controller-v1", Approvals: []RunApproval{{Namespace: run.Namespace, Name: run.Name, Binding: binding, TokenFile: token}}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	path := filepath.Join(root, "config.json")
-	if err := os.WriteFile(path, raw, 0600); err != nil {
-		t.Fatal(err)
-	}
-	reconcile := func(name string) (types.NamespacedName, error) {
-		turn, err := NewTurn(run, name, "try again")
-		if err != nil {
-			t.Fatal(err)
-		}
-		turn.UID = types.UID(name + "-uid")
-		if err := store.Create(ctx, turn); err != nil {
-			t.Fatal(err)
-		}
-		key := client.ObjectKeyFromObject(turn)
-		for range 4 {
-			done, err := ReconcileTurn(ctx, store, store, key, path)
-			if err != nil || done {
-				return key, err
-			}
-		}
-		t.Fatal("turn never completed")
-		return key, nil
-	}
-	key, err := reconcile("second")
-	if err != nil {
-		t.Fatalf("follow-up after a failed initial turn refused: %v", err)
-	}
-	var saved api.AgentRunTurn
-	if err := store.Get(ctx, key, &saved); err != nil {
-		t.Fatal(err)
-	}
-	if saved.Status.Execution == nil || saved.Status.Execution.Result == nil || !saved.Status.Execution.Result.Succeeded || saved.Status.Execution.Result.Answer != "recovered" {
-		t.Fatalf("follow-up result not durable: %+v", saved.Status.Execution)
-	}
-	var refusal *TurnRefusal
-	if _, err := reconcile("third"); !errors.As(err, &refusal) || refusal.Reason != TurnRefusedTurnLimitReached {
-		t.Fatalf("turn beyond maxTurns: %v", err)
-	}
-	var parent api.AgentRun
-	if err := store.Get(ctx, client.ObjectKeyFromObject(run), &parent); err != nil {
-		t.Fatal(err)
-	}
-	if posts.Load() != 1 || parent.Status.CellnParent.AcceptedTurns != 1 || TurnsUsed(parent.Status.CellnParent) != 2 || parent.Status.CellnParent.ActiveTurn != nil {
-		t.Fatalf("posts=%d accepted=%d active=%v: the failed initial turn must count once and the ceiling must hold", posts.Load(), parent.Status.CellnParent.AcceptedTurns, parent.Status.CellnParent.ActiveTurn)
 	}
 }

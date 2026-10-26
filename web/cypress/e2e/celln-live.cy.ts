@@ -52,9 +52,6 @@ describe("live Harness-in-Celln", () => {
       cy.get('[data-testid="celln-harness-selection"]').contains("label", `${name}@`).find("input").check();
     }
     // Observe the real request/response; never reply with fixture data.
-    cy.get('[data-testid="celln-permission-preview"]').contains("Shared cell memory ceiling:").scrollIntoView().should("be.visible");
-    cy.get('[data-testid="celln-permission-preview"]').contains("uppercase@").should("be.visible");
-    cy.get('[data-testid="celln-permission-preview"]').contains("length@").should("be.visible");
     if (String(Cypress.env("PROOF_INTERACTIVE")) === "1") {
       cy.screenshot("interactive-selection");
     }

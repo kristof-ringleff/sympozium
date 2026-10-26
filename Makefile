@@ -90,13 +90,6 @@ test-hermes-model-connection: ## Test persistent Hermes with a real llama-server
 	./test/integration/test-hermes-model-connection.sh
 
 test-integration: ## Run integration tests (requires Kind cluster + API keys)
-	@if [ -n "$$CELLN_CATALOGUE_KUBECONFIG" ]; then \
-		bash ./test/integration/test-celln-tool-catalogue.sh && \
-		bash ./test/integration/test-celln-runtime-profile.sh && \
-		bash ./test/integration/test-celln-json-contract.sh; \
-	else \
-		echo "SKIP Celln catalogue metadata proof: explicit isolated CELLN_CATALOGUE_KUBECONFIG required"; \
-	fi
 	./test/integration/test-write-file.sh
 	./test/integration/test-anthropic-write-file.sh
 	./test/integration/test-k8s-ops-nodes.sh
@@ -168,7 +161,6 @@ vet: vet-tags ## Run go vet (including build-tagged code, see vet-tags)
 vet-tags: ## Vet code `go vet ./...` cannot see (build tags, other-OS files)
 	$(GOVET) -tags system ./test/system/...
 	$(GOVET) hack/sync-harness-defaults.go
-	GOOS=windows $(GOVET) ./internal/cellnreview/...
 
 lint: ## Run golangci-lint
 	golangci-lint run ./...
@@ -580,12 +572,6 @@ helm-sync-check: ## Check that Helm charts are in sync (CI use)
 helm-lint: ## Lint the Helm charts
 	helm lint charts/sympozium/
 	helm lint charts/sympozium-crds/
-
-.PHONY: test-celln-selection-live
-test-celln-selection-live: ## Verify catalogue grants against the explicit isolated API (no runs/model calls)
-	@test -n "$(CELLN_COMPOSITION_KUBECONFIG)" || (echo 'CELLN_COMPOSITION_KUBECONFIG required' >&2; exit 1)
-	@test -n "$(CELLN_COMPOSITION_FIXTURE)" || (echo 'CELLN_COMPOSITION_FIXTURE required' >&2; exit 1)
-	go test -race ./internal/cellnreview -run TestLiveCatalogueSelectionAndGrantIsolation -count=1 -v
 
 ##@ Clean
 

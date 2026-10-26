@@ -35,8 +35,8 @@ to the serving engine. See [Positioning](positioning.md) for the boundary.
 Then deploy to your cluster and activate your first agents:
 
 ```bash
-sympozium install          # deploys CRDs, controllers, built-in Ensembles, the Celln plane and ergoz
-                           # (with DEEPSEEK_/OPENAI_/ANTHROPIC_API_KEY set: the Celln fleet on every KVM node)
+sympozium install          # deploys CRDs, controllers, built-in Ensembles, the Celln fleet on every KVM node,
+                           # the model gateway and ergoz; nothing about models is asked
 sympozium                  # launch the TUI — go to the Ensembles tab, press Enter to onboard
 sympozium serve            # open the web dashboard (port-forwards to the in-cluster UI)
 ```
@@ -59,7 +59,7 @@ Every concept that traditional agent frameworks manage in application code, Symp
 ## Key Features
 
 - **Ephemeral agent pods** — each agent run is an isolated Kubernetes Job with its own security context
-- **Hardware-isolated agents (Celln)** — one-shot and long-running agents in KVM microVMs on every labelled node, each Agent choosing its model backend; conversations continue on another node if theirs is lost
+- **Hardware-isolated agents (Celln)** — one-shot and long-running agents in KVM microVMs on every labelled node; each Agent brings its own model connection and key, which a gateway adds per call and no node ever holds
 - **AgentHarness** — run approved external harnesses (Pi, Hermes) as one-shot runs or persistent chat sessions
 - **Skill sidecars** — every skill runs in its own container with auto-provisioned, least-privilege RBAC
 - **Ensembles** — pre-configured bundles of agents that activate with a few keypresses
@@ -85,7 +85,8 @@ Every concept that traditional agent frameworks manage in application code, Symp
 | [Skills & Sidecars](concepts/skills.md) | Isolated tool containers with ephemeral RBAC |
 | [Lifecycle Hooks](concepts/lifecycle-hooks.md) | PreRun and postRun containers for setup and teardown |
 | [Celln Backend](concepts/celln-backend.md) | Hardware-isolated one-shot and enduring agents |
-| [Celln Fleet Installation](guides/celln-fleet-installation.md) | Model backends, toolbox, capacity and operations for the fleet |
+| [Celln Fleet Installation](guides/celln-fleet-installation.md) | Install, verify, upgrade and operate the fleet; toolbox and capacity |
+| [Agent-bound model access](guides/celln-mediated-model-access.md) | Connections, keys, origin pins and the model gateway |
 | [AgentHarness](guides/agentharness.md) | Approved external harnesses and persistent chat sessions |
 | [Security](concepts/security.md) | Defence-in-depth at every layer |
 | [Writing Skills](guides/writing-skills.md) | Build your own SkillPacks |

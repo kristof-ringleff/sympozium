@@ -1,7 +1,7 @@
 {{- $fleet := .Values.celln.fleet | default dict }}
 {{- if and .Values.celln.enabled $fleet.enabled }}
-{{- if or .Values.celln.dispatcher.enabled .Values.celln.installer.enabled .Values.celln.nativeParent.enabled .Values.celln.router.external }}
-{{- fail "celln.fleet replaces the single in-cluster dispatcher and cannot combine with installer, nativeParent or an external router" }}
+{{- if .Values.celln.router.external }}
+{{- fail "celln.fleet runs behind the chart's own router and cannot combine with an external router" }}
 {{- end }}
 {{- if not (regexMatch "^[a-z0-9][a-z0-9-]{0,62}$" ($fleet.scope | default "")) }}
 {{- fail "celln.fleet.scope must be a stable DNS-label installation identity" }}
@@ -19,98 +19,33 @@
 {{- if not .Values.celln.router.parentTokenSecret }}
 {{- fail "celln.fleet requires router.parentTokenSecret for gateway parent routing" }}
 {{- end }}
-{{- /* Model backends: the celln.fleet.backends list, or the legacy single
-     backend named native built from celln.fleet.model. Every node configures
-     every backend; keys come from one Secret keyed by backend name, mounted
-     once, so a backend added later needs no owner restart. */}}
-{{- if ($fleet.modelCredential | default dict).secret }}
-{{- fail "celln.fleet.modelCredential is replaced by celln.fleet.modelCredentialsSecret (one Secret keyed by backend name)" }}
+{{- /* The fleet calls no model. Every node prepares one model-free starter
+     configuration, named native, from the reviewed package: no provider, no
+     endpoint and no credential anywhere on a node. Each Agent brings its own
+     ModelConnection and key, which the model gateway adds to its requests.
+     The 0.11 inputs that declared fleet backends are refused, not ignored. */}}
+{{- if $fleet.backends }}
+{{- fail "celln.fleet.backends is removed: the fleet holds no model; every Agent brings its own ModelConnection and key (see docs/guides/celln-fleet-installation.md, Upgrading from 0.11)" }}
 {{- end }}
-{{- $credentialsSecret := $fleet.modelCredentialsSecret | default "celln-fleet-model-credentials" }}
-{{- $credentialsDir := "/etc/celln-native/credentials" }}
-{{- $backends := list }}
-{{- range $fleet.backends | default list }}
-{{- $backends = append $backends . }}
-{{- end }}
-{{- if not $backends }}
 {{- $legacyModel := $fleet.model | default dict }}
-{{- $backends = list (dict "name" "native" "provider" ($legacyModel.provider | default "") "protocol" ($legacyModel.protocol | default "") "endpoint" ($legacyModel.endpoint | default "") "model" ($legacyModel.name | default "") "allowInsecure" ($legacyModel.allowInsecure | default false) "parameters" ($legacyModel.parameters | default dict) "maxOutputTokens" ($legacyModel.maxOutputTokens | default 0)) }}
+{{- if or $legacyModel.provider $legacyModel.endpoint $legacyModel.name }}
+{{- fail "celln.fleet.model is removed: the fleet holds no model; every Agent brings its own ModelConnection and key" }}
 {{- end }}
-{{- if gt (len $backends) 32 }}
-{{- fail "celln.fleet.backends allows at most 32 model backends per scope" }}
+{{- if or $fleet.modelCredentialsSecret $fleet.backendsExtraRevision ($fleet.modelCredential | default dict).secret }}
+{{- fail "celln.fleet.modelCredentialsSecret, modelCredential and backendsExtraRevision are removed: no Celln node holds a model key" }}
 {{- end }}
-{{- $backendNames := dict }}
-{{- $backendExport := list }}
-{{- /* What one turn of the costliest backend reserves: 6 model requests of
-     its output cap (512 unless the backend sets maxOutputTokens). */}}
-{{- $costliestTurn := int64 3072 }}
-{{- $costliestBackend := "" }}
-{{- range $b := $backends }}
-{{- $name := $b.name | default "" }}
-{{- if or (not (regexMatch "^[a-z0-9][a-z0-9-]{0,31}$" $name)) (hasKey $backendNames $name) }}
-{{- fail (printf "celln.fleet.backends: names must be unique DNS labels of at most 32 characters: %q" $name) }}
-{{- end }}
-{{- $_ := set $backendNames $name true }}
-{{- if or $b.credentialSecret $b.credentialPath }}
-{{- fail (printf "celln.fleet.backends[%s]: credentialSecret/credentialPath are replaced by celln.fleet.modelCredentialsSecret keyed by backend name" $name) }}
-{{- end }}
-{{- $credential := printf "%s/%s" $credentialsDir $name }}
-{{- $endpoint := $b.endpoint | default "" }}
-{{- if and $endpoint (or (not $b.model) (not (has ($b.protocol | default "") (list "openai-chat" "anthropic-messages"))) (not $b.provider)) }}
-{{- fail (printf "celln.fleet.backends[%s].endpoint needs provider, model and protocol openai-chat or anthropic-messages" $name) }}
-{{- end }}
-{{- if and $endpoint (hasPrefix "http://" $endpoint) (not $b.allowInsecure) }}
-{{- fail (printf "celln.fleet.backends[%s].endpoint is plain HTTP; set allowInsecure=true to approve it" $name) }}
-{{- end }}
-{{- $export := dict "name" $name "provider" ($b.provider | default "") "protocol" ($b.protocol | default "") "endpoint" $endpoint "model" ($b.model | default "") "allowInsecure" ($b.allowInsecure | default false) "credentialFile" $credential }}
-{{- /* Model parameters: an object, or the same object as one JSON string (what
-     the installer sends, since --set values cannot carry an object). Only a
-     backend that has some exports the key, so every other backend's plan,
-     and this list's checksum, stay exactly as they were. Celln validates
-     the object when it configures the node. */}}
-{{- $parameters := $b.parameters | default dict }}
-{{- if kindIs "string" $parameters }}
-{{- $parameters = fromJson $parameters }}
-{{- if hasKey $parameters "Error" }}
-{{- fail (printf "celln.fleet.backends[%s].parameters is not a JSON object: %s" $name $parameters.Error) }}
-{{- end }}
-{{- end }}
-{{- if not (kindIs "map" $parameters) }}
-{{- fail (printf "celln.fleet.backends[%s].parameters must be an object" $name) }}
-{{- end }}
-{{- if $parameters }}
-{{- if not $endpoint }}
-{{- fail (printf "celln.fleet.backends[%s].parameters needs the backend's endpoint, provider, model and protocol" $name) }}
-{{- end }}
-{{- $_ := set $export "parameters" $parameters }}
-{{- end }}
-{{- /* Output tokens per model request: exported only when set and not
-     Celln's default of 512, for the same reason. A turn reserves 6 requests
-     of it, so the scope's lifetime ceiling must pay for at least one. */}}
-{{- $maxOutputTokens := int64 ($b.maxOutputTokens | default 0) }}
-{{- if and (ne $maxOutputTokens 0) (ne $maxOutputTokens 512) }}
-{{- if or (lt $maxOutputTokens 256) (gt $maxOutputTokens 4096) }}
-{{- fail (printf "celln.fleet.backends[%s].maxOutputTokens must be 256-4096 (omit it for the default 512)" $name) }}
-{{- end }}
-{{- if not $endpoint }}
-{{- fail (printf "celln.fleet.backends[%s].maxOutputTokens needs the backend's endpoint, provider, model and protocol" $name) }}
-{{- end }}
-{{- $_ := set $export "maxOutputTokens" $maxOutputTokens }}
-{{- if gt (mul 6 $maxOutputTokens) $costliestTurn }}
-{{- $costliestTurn = mul 6 $maxOutputTokens }}
-{{- $costliestBackend = $name }}
-{{- end }}
-{{- end }}
-{{- $backendExport = append $backendExport $export }}
-{{- end }}
+{{- $backendExport := list (dict "name" "native") }}
+{{- /* What one turn reserves at the largest per-request cap a connection may
+     set (6 requests × 4096 tokens); the lifetime ceiling must pay for one. */}}
+{{- $turnTokens := int64 24576 }}
 {{- $limits := $fleet.limits | default dict }}
 {{- $lease := int64 ($limits.leaseSeconds | default 0) }}
 {{- if and (ne $lease 0) (or (lt $lease 60) (gt $lease 86400)) }}
 {{- fail "celln.fleet.limits.leaseSeconds must be 60-86400" }}
 {{- end }}
 {{- $lifetimeTokens := int64 ($limits.maxOutputTokens | default 0) }}
-{{- if and $costliestBackend (ne $lifetimeTokens 0) (lt $lifetimeTokens $costliestTurn) }}
-{{- fail (printf "celln.fleet.limits.maxOutputTokens (%d) does not pay for one turn of backend %s, which reserves %d (6 requests x its maxOutputTokens); size it as turns x %d" $lifetimeTokens $costliestBackend $costliestTurn $costliestTurn) }}
+{{- if and (ne $lifetimeTokens 0) (lt $lifetimeTokens $turnTokens) }}
+{{- fail (printf "celln.fleet.limits.maxOutputTokens (%d) does not pay for one turn at the largest per-request cap a connection may set (6 requests x 4096 = %d); size it as turns x %d" $lifetimeTokens $turnTokens $turnTokens) }}
 {{- end }}
 {{- $capacity := $fleet.capacity | default "auto" }}
 {{- if not (has $capacity (list "auto" "fixed")) }}
@@ -129,34 +64,15 @@
 {{- $root := printf "%s/authority" $state }}
 {{- $image := printf "%s:%s" (.Values.celln.image.repository | default "ghcr.io/sympozium-ai/sympozium/celln-installer") (.Values.celln.image.tag | default .Chart.AppVersion) }}
 {{- $backendSecret := (.Values.celln.bootstrap | default dict).backendTokenSecret | default "celln-dispatcher-backend" }}
-{{- $journal := $fleet.journal | default dict }}
 {{- /* Mediated model access (celln.mediation): the owner's dispatcher also
      serves the scoped receiver, verifying permits against the operator's
      public JWKS and relaying model requests to the gateway. */}}
 {{- $mediated := include "sympozium.cellnMediation" . }}
 {{- $mediation := .Values.celln.mediation | default dict }}
-{{- $parentRequestDefault := printf "%s/configuration-%s-%s/scoped-parent-request.json" $state (trimPrefix "blake3:" $package.hash) (index $backends 0).name }}
+{{- $parentRequestDefault := printf "%s/configuration-%s-native/scoped-parent-request.json" $state (trimPrefix "blake3:" $package.hash) }}
 {{- $parentRequest := $mediation.parentRequestFile | default $parentRequestDefault }}
 {{- if and $mediated (or (not (hasPrefix (printf "%s/" $state) $parentRequest)) (contains "/../" $parentRequest) (regexMatch "[[:space:]]" $parentRequest)) }}
 {{- fail (printf "celln.mediation.parentRequestFile must be a file under the node state directory %s, the only host path the dispatcher mounts" $state) }}
-{{- end }}
-{{- if and $fleet.parentConfigSecret $journal.create }}
----
-apiVersion: v1
-kind: PersistentVolumeClaim
-metadata:
-  name: {{ $journal.claim | default "celln-parent-journal" | quote }}
-  namespace: {{ include "sympozium.namespace" . }}
-  labels:
-    app.kubernetes.io/part-of: sympozium
-spec:
-  accessModes: [ReadWriteOnce]
-  resources:
-    requests:
-      storage: {{ $journal.storage | default "1Gi" | quote }}
-  {{- with $journal.storageClass }}
-  storageClassName: {{ . | quote }}
-  {{- end }}
 {{- end }}
 ---
 apiVersion: v1
@@ -244,10 +160,10 @@ spec:
       targetPort: 8787
       protocol: TCP
 ---
-# Prepares every labeled node from the reviewed package and configures each
-# model backend, publishing the scope's starter configuration. Its template
-# carries the backend list, so adding a backend rolls only this DaemonSet;
-# the owner DaemonSet below keeps its parents. The pod then idles.
+# Prepares every labeled node from the reviewed package and configures the
+# model-free starter configuration, publishing it for the scope. The owner
+# DaemonSet below keeps its parents across a configure roll. The pod then
+# reports the node's cells.
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -272,9 +188,6 @@ spec:
         celln.sympozium.ai/package: {{ $package.hash | quote }}
         celln.sympozium.ai/scope: {{ $fleet.scope | quote }}
         celln.sympozium.ai/backends: {{ toJson $backendExport | sha256sum | quote }}
-        # The API server bumps this when it adds a backend, rolling the
-        # configure pods so they pick up the extra list.
-        celln.sympozium.ai/backends-extra: {{ .Values.celln.fleet.backendsExtraRevision | default "" | quote }}
     spec:
       serviceAccountName: celln-node
       automountServiceAccountToken: false
@@ -356,9 +269,6 @@ spec:
             - name: parent-clients
               mountPath: /etc/celln-fleet/clients
               readOnly: true
-            - name: backends-extra
-              mountPath: /etc/celln-fleet/backends-extra
-              readOnly: true
             {{- if $package.pullSecret }}
             - name: registry
               mountPath: /etc/celln-fleet/registry
@@ -366,11 +276,6 @@ spec:
             {{- end }}
             - name: publisher-credentials
               mountPath: /var/run/secrets/celln-fleet
-              readOnly: true
-            # Read only to know when a backend's key has reached this node's
-            # kubelet: a backend is published once its key file is present.
-            - name: model-credentials
-              mountPath: {{ $credentialsDir | quote }}
               readOnly: true
             - name: state
               mountPath: {{ $state | quote }}
@@ -386,11 +291,6 @@ spec:
               memory: "2Gi"
               cpu: "2000m"
       volumes:
-        - name: model-credentials
-          secret:
-            secretName: {{ $credentialsSecret | quote }}
-            defaultMode: 0400
-            optional: true
         - name: prepare
           configMap:
             name: celln-fleet-prepare
@@ -398,11 +298,6 @@ spec:
         - name: parent-clients
           configMap:
             name: {{ $fleet.parentClientsConfigMap | quote }}
-        # Backends added through the API after the install; absent until then.
-        - name: backends-extra
-          configMap:
-            name: celln-fleet-backends-extra
-            optional: true
         {{- if $package.pullSecret }}
         - name: registry
           secret:
@@ -467,9 +362,8 @@ spec:
           effect: NoSchedule
       initContainers:
         # The node-configure DaemonSet prepares the authority root (package
-        # admission, model backends). This owner only waits for admission so a
-        # backend change never rolls it; new model profiles are read from the
-        # root at provision time and new keys arrive through the Secret mount.
+        # admission, the model-free starter configuration). This owner only
+        # waits for admission.
         - name: wait-prepared
           image: {{ $image | quote }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
@@ -589,7 +483,7 @@ spec:
             - {{ printf "%s/tools" $root | quote }}
             - --node-name
             - $(NODE_NAME)
-            {{- range $fleet.allowEgressHosts | default (list "api.deepseek.com") }}
+            {{- range $fleet.allowEgressHosts }}
             - --allow-egress-host
             - {{ . | quote }}
             {{- end }}
@@ -651,9 +545,6 @@ spec:
               readOnly: true
             - name: state
               mountPath: {{ $state | quote }}
-            - name: model-credentials
-              mountPath: {{ $credentialsDir | quote }}
-              readOnly: true
             - name: kvm
               mountPath: /dev/kvm
             - name: boot
@@ -690,12 +581,6 @@ spec:
           secret:
             secretName: {{ $backendSecret | quote }}
             defaultMode: 0440
-        # Every backend's key, one file per backend; Secret changes reach the
-        # mount without a restart because no subPath is used.
-        - name: model-credentials
-          secret:
-            secretName: {{ $credentialsSecret | quote }}
-            defaultMode: 0400
         - name: state
           hostPath:
             path: {{ $state | quote }}

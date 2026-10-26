@@ -52,11 +52,11 @@ a Kubernetes harness; connect them through a gateway. A run against an Agent
 with a connection inherits the connection's model route.
 
 The same steps apply to **Celln**, with the same provider list as the run/agent
-flow. The Auth step collects a host credential profile instead of an API key.
-Native Celln requires an HTTPS endpoint speaking `openai-chat` or
-`anthropic-messages`; point a local provider at an HTTPS gateway, or use a
-custom HTTPS endpoint. Declarative Agents can still use the legacy DeepSeek host
-route by omitting a connection.
+flow: the Auth step takes the Agent's own API key, which becomes a Secret
+owned by that Agent and pinned to the endpoint's origin. A keyed Celln
+connection needs an HTTPS endpoint speaking `openai-chat` or
+`anthropic-messages`; a keyless local server may use HTTP on a private
+address the operator has approved. See [Native Celln](#native-celln).
 
 The API exposes `GET /api/v1/model-connections` and
 `POST /api/v1/model-connections` (body `{name, spec, apiKey?}`). When `apiKey`
@@ -82,94 +82,52 @@ Secret. Revoking a connection and rotating a Secret are different operations.
 
 ## Native Celln
 
-Native connections served by the fleet's own credential require a full HTTPS
-endpoint, an opaque `credentialProfile`, and either `openai-chat` or
-`anthropic-messages`. They cannot use the HTTP/private-network llama-server route
-above: the native host transport retains its public HTTPS boundary.
+On Celln the connection **is** the model route: there is no operator route
+list and no fleet-held credential. A keyed connection names a Secret in the
+Agent's namespace; a keyless one names none.
 
 ```yaml
 spec:
   provider: anthropic
   protocol: anthropic-messages
   endpoint: https://api.anthropic.com/v1/messages
-  credentialProfile: team-anthropic
+  secretRef: my-anthropic-key     # key ANTHROPIC_API_KEY, or the key named by secretKey
   models: [your-model-id]
+  maxOutputTokens: 4096           # optional, 256-4096 per request; 512 when omitted
 ```
 
-### An Agent's own key (gateway-mediated)
+A run is never provisioned with the key. The controller signs a permit that
+binds the connection (UID, spec digest, endpoint origin, model), and the model
+gateway adds the key from the Secret on every call after re-checking the live
+connection, Secret, Agent, owner and origin pin. Three things must hold:
 
-A shared-catalogue run (a platform wrapper runtime, cluster tools) may instead
-select a connection that names the namespace's own Secret:
+- **The Agent grants the Secret**: it selects the connection in
+  `spec.execution.modelConnectionRef`, or lists the Secret in `spec.authRefs`
+  (an empty `provider` grants it for any provider). The Secret is owned by
+  exactly one Agent (`sympozium.ai/model-key-owner`) and pinned to one
+  endpoint origin (`sympozium.ai/model-key-origin`); another Agent, or a
+  connection to another origin, is refused.
+- **The policy admits the origin**: the scope's `CellnExecutionPolicy` may
+  list `allowedOrigins`/`deniedOrigins` host patterns; empty admits any
+  origin the gateway reaches. A keyed endpoint must be HTTPS; a private
+  address needs `modelGateway.privateOrigins`. Refusals are
+  `AUTH_ROUTE_MISMATCH`.
+- **The run's budget pays for a turn**: a turn reserves 6 model requests
+  times `maxOutputTokens` output tokens, so `spec.enduring.maxOutputTokens`
+  and the policy ceiling must be at least that; otherwise admission is
+  refused with the numbers (`AUTH_LIMIT_OUT_OF_RANGE`). A connection created
+  through the API is clamped to what the namespace's policy can pay for.
 
-```yaml
-spec:
-  provider: anthropic
-  protocol: anthropic-messages
-  endpoint: https://api.anthropic.com/v1/messages
-  secretRef: my-anthropic-key
-  models: [your-model-id]
-  maxOutputTokens: 4096   # optional, 256-4096 per request; 512 when omitted
-```
+The Agent's `execution` defaults carry `modelConnectionRef`, `model`, the
+Celln selection, lifecycle and the enduring budget. Runs may select
+`spec.model.connectionRef` and `spec.model.model` explicitly. Resolution pins
+the connection revision and fills the model route before freezing host
+admission; an unresolved or changed connection refuses admission. Connections
+cannot be combined with inline credentials, headers, placement or thinking
+settings.
 
-Such a run is never provisioned with the key. The controller picks the path from
-the connection: `credentialProfile` is provisioned on the fleet as before, while
-`secretRef` (or no credential) is executed by the scoped receiver, and the model
-gateway injects the key from the Secret it pinned. Without a configured scoped
-receiver the run is held with condition `CellnScopedExecution` /
-`ScopedDispatchDisabled`; it never falls back. Three things must all hold:
-
-- The operator's `CellnExecutionPolicy` lists an `auth: secret` route with the
-  connection's exact provider, protocol and HTTPS origin, and the model: one of
-  the route's exact names, or any model when the route declares `["*"]`. Routes
-  are the operator's allow-list; origins are never a wildcard, and a connection
-  is never its own authorisation.
-- The Agent grants the Secret: it is listed in the Agent's `spec.authRefs` (an
-  empty `provider` grants it for any provider), or the Agent's
-  `spec.execution.modelConnectionRef` names this connection. A run cannot borrow
-  another Secret-backed connection in its namespace.
-- The run's budget pays for a turn. With `maxOutputTokens: N` a turn reserves
-  the worker's model requests (6 on the starter package) times N output tokens,
-  so `spec.enduring.maxOutputTokens` and the policy ceiling must be at least
-  that; otherwise admission is refused with the numbers (`AUTH_LIMIT_OUT_OF_RANGE`).
-
-The run may use the same runtime wrapper as the fleet's backend: only a
-`credentialProfile` connection is bound to the runtime profile's installed
-credential.
-
-The Agent's native `execution` defaults contain `modelConnectionRef`, `model`,
-the Celln selection, lifecycle, and existing bounded enduring settings. Runs
-may select `spec.model.connectionRef` and `spec.model.model` explicitly. Resolution
-pins the connection revision and fills the model route before freezing host
-admission. An unresolved or changed connection refuses admission.
-
-The host must support the matching protocol. The companion Celln change is in
-the `feat/model-connections` branch based on native starter release `f654f23`.
-Its model profiles carry `protocol`; old profiles default to `openai-chat`.
-Anthropic translation runs after the existing bounded chat request validator,
-retains tool IDs/results, and normalizes the reply into the unchanged guest
-format. Credentials, output budgets, redirect refusal, and host egress checks
-remain host-owned.
-
-`celln starter-configure` plans can include:
-
-```json
-"modelConnection": {
-  "provider": "anthropic",
-  "protocol": "anthropic-messages",
-  "endpoint": "https://api.anthropic.com/v1/messages",
-  "model": "your-model-id",
-  "credentialProfile": "team-anthropic"
-}
-```
-
-The plan's existing operator `credentialFile` supplies the actual local key.
-The generated receipt records the matching route for Sympozium host templates.
-For one-shot catalogue issuance, the separate operator model policy also needs
-the same provider/protocol/URL/model/credential profile. Legacy DeepSeek plans
-and manifests remain supported. Existing native parents keep their content-pinned
-host profiles; withdraw that profile to revoke live use. Disabling a Kubernetes
-connection alone is not a substitute for withdrawing an already issued native
-host profile.
+The full flow, through the API and `kubectl`, is in
+[Agent-bound model access](celln-mediated-model-access.md).
 
 ## Live Hermes acceptance test
 

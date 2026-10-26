@@ -1,73 +1,31 @@
 // A native Celln Agent owns its model backend: a namespaced ModelConnection
-// backed by a Secret in the Agent's namespace. Under open model access (the
-// default) it may name any public HTTPS provider endpoint and model; otherwise,
-// and always for plain-HTTP or private endpoints, it is matched against a
-// provider route the operator declared (exact origin; exact model, or any
-// model when the route declares ["*"]) (docs/guides/celln-mediated-model-access.md).
+// backed by a Secret in the Agent's namespace. The connection is the route —
+// any provider, any OpenAI- or Anthropic-compatible endpoint — and the
+// namespace's policy only guards the endpoint origin
+// (docs/guides/celln-mediated-model-access.md). One key belongs to one Agent
+// and is pinned to the first origin it is used with; the API refuses to move it.
 // Nothing here ever keeps an API key: it is handed to the API once and dropped.
 import { ApiError, api } from "@/lib/api";
 import type { CellnMediatedRoute, CellnPlatformProfile, EnduringLimits, ModelConnection } from "@/lib/api";
 import { turnOutputTokens, type ModelParameters } from "@/lib/model-parameters";
 import { TURN_MODEL_REQUESTS } from "@/lib/agent-execution";
-import { routeAllowsModel } from "@/lib/celln-routes";
+import { cellnPreset, endpointOrigin, secretKeyFor } from "@/lib/celln-providers";
 
 export { routeAllowsModel, routeModelsLabel, validModelName } from "@/lib/celln-routes";
 
 /** Create a Secret from a pasted key, or name one that already holds it. */
 export type KeyChoice = { mode: "create"; apiKey: string } | { mode: "existing"; secretName: string };
 
+/** The guide to an Agent's own model access through the gateway: docs/guides/celln-mediated-model-access.md. */
 export const GUIDE_URL = "https://github.com/sympozium-ai/sympozium/blob/main/docs/guides/celln-mediated-model-access.md";
 
-/** Stable identity of a declared route, for select values. */
-export function routeId(route: CellnMediatedRoute): string {
-  if (route.open) return `open|${route.provider}`;
-  return [route.policy || "", route.provider, route.protocol, route.auth || "secret", ...route.endpointOrigins].join("|");
-}
-
-/** The public endpoint origin of a hosted provider; absent when it is the user's own. */
-const PROVIDER_ORIGINS: Record<string, string> = {
-  openai: "https://api.openai.com",
-  anthropic: "https://api.anthropic.com",
-};
-
-/**
- * A provider chosen under open model access: the Agent's own key, any model,
- * any public HTTPS origin (the hosted provider's by default).
- */
-export function openRoute(provider: string): CellnMediatedRoute {
-  const protocol = provider === "anthropic" ? "anthropic-messages" : "openai-chat";
-  const origin = PROVIDER_ORIGINS[provider];
-  return { provider, protocol, models: ["*"], anyModel: true, endpointOrigins: origin ? [origin] : [], auth: "secret", secretKey: protocol === "anthropic-messages" ? "ANTHROPIC_API_KEY" : "OPENAI_API_KEY", open: true };
-}
-
-/**
- * Whether open model access admits a route without a declared entry: the
- * resolver's rule (internal/cellnauthority) — public HTTPS origins and no
- * private-endpoint approval. Plain HTTP and private origins need a route.
- */
-export function openAdmits(route: Pick<CellnMediatedRoute, "endpointOrigins" | "allowInsecure">): boolean {
-  return !route.allowInsecure && route.endpointOrigins.length > 0 && route.endpointOrigins.every((origin) => origin.toLowerCase().startsWith("https://"));
-}
-
-/** The origin of a user-typed HTTPS origin (scheme and host only), or "" when it is not one. */
-export function httpsOrigin(text: string): string {
-  try {
-    const url = new URL(text.trim());
-    return url.protocol === "https:" && (url.pathname === "/" || url.pathname === "") && !url.search && !url.hash ? url.origin : "";
-  } catch {
-    return "";
-  }
-}
-
-const SUGGESTED_MODELS: Record<string, string> = { openai: "gpt-4o", anthropic: "claude-sonnet-4-20250514", deepseek: "deepseek-chat" };
-
-/** The model a route starts with: its only declared model, a well-known default for an any-model route, or nothing to choose. */
+/** The model a route starts with: its only model, the provider preset's well-known default, or nothing to choose. */
 export function initialModelFor(route: CellnMediatedRoute): string {
-  if (route.anyModel) return SUGGESTED_MODELS[route.provider] || "";
+  if (route.anyModel) return cellnPreset(route.provider)?.suggestedModel || "";
   return route.models.length === 1 ? route.models[0] : "";
 }
 
-/** The standard request path of a protocol; an operator's gateway may differ. */
+/** The standard request path of a protocol; a provider or gateway may differ. */
 export function defaultEndpointPath(protocol: string): string {
   return protocol === "anthropic-messages" ? "/v1/messages" : "/v1/chat/completions";
 }
@@ -115,25 +73,22 @@ export function ownKeyConnectionSpec(selection: OwnKeySelection, secretRef?: str
 }
 
 /**
- * The route that admits a connection: one the operator declares, or, under
- * open model access, the connection's own public HTTPS route.
+ * The route a connection is: its own provider, protocol, models and endpoint
+ * origin, keyed by the Secret it names (under the key the connection or its
+ * protocol fixes). The origin falls back to the endpoint text when unreadable.
  */
-export function routeForConnection(connection: ModelConnection, model: string, routes: CellnMediatedRoute[], open = false): CellnMediatedRoute | undefined {
-  let origin = "";
-  try { origin = new URL(connection.spec.endpoint).origin; } catch { /* matched as no route */ }
-  const declared = routes.find((route) => (route.auth === "none") === !connection.spec.secretRef && route.provider === connection.spec.provider && route.protocol === connection.spec.protocol && route.endpointOrigins.includes(origin) && routeAllowsModel(route, model));
-  if (declared || !open || !origin || !openAdmits({ endpointOrigins: [origin], allowInsecure: connection.spec.allowInsecure })) return declared;
-  return { ...openRoute(connection.spec.provider), protocol: connection.spec.protocol, endpointOrigins: [origin], ...(connection.spec.secretRef ? {} : { auth: "none" as const, secretKey: "" }) };
-}
-
-/**
- * The fleet runtime profile an own-key Agent runs on: one admitted by the
- * policy that carries the route, the fleet's default backend first. The
- * profile's own model route is not used; only its runtime is.
- */
-export function profileForRoute(route: CellnMediatedRoute, profiles: CellnPlatformProfile[]): CellnPlatformProfile | undefined {
-  const admitted = profiles.filter((profile) => !route.policy || profile.policy === route.policy);
-  return admitted.find((profile) => profile.backend === "native") || admitted[0];
+export function routeForConnection(connection: ModelConnection, model?: string): CellnMediatedRoute {
+  const { spec } = connection;
+  const models = model && !spec.models.includes(model) ? [...spec.models, model] : spec.models;
+  return {
+    provider: spec.provider,
+    protocol: spec.protocol,
+    models,
+    endpointOrigins: [endpointOrigin(spec.endpoint) || spec.endpoint],
+    auth: spec.secretRef ? "secret" : "none",
+    secretKey: spec.secretRef ? spec.secretKey || secretKeyFor(spec.protocol) : "",
+    ...(spec.allowInsecure ? { allowInsecure: true } : {}),
+  };
 }
 
 /**
@@ -192,7 +147,8 @@ export function ownKeySelection(profile: CellnPlatformProfile): { profile: strin
  * Saves the Agent's Secret (when pasted) and ModelConnection, then makes sure
  * the namespace has the fleet's runtime wrapper (ownKeySelection's). Every call is idempotent, so
  * a retry after a failure repeats nothing harmful. Throws OwnKeyError naming
- * what exists and what does not.
+ * what exists and what does not; the API's own words are kept, in particular
+ * its 409 when a Secret is already pinned to another origin.
  */
 export async function prepareOwnKeyBackend(input: { connectionName: string; selection: OwnKeySelection; key: KeyChoice; profile: CellnPlatformProfile; agentName?: string; onConnectionSaved?: (connection: ModelConnection) => void }): Promise<{ connection: ModelConnection; runtime: string; steps: OwnKeyStep[] }> {
   const { connectionName, selection, key, profile } = input;

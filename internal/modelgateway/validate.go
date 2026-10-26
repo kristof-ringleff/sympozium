@@ -106,10 +106,10 @@ func validateConnection(decision cellncapability.Decision, name string, connecti
 		if !strings.HasPrefix(origin, "https://") {
 			return fail(ReasonDestination, 403, nil)
 		}
-		if decision.Route.CredentialSource == nil || spec.SecretRef != decision.Route.CredentialSource.SecretName || spec.CredentialProfile != "" {
+		if decision.Route.CredentialSource == nil || spec.SecretRef != decision.Route.CredentialSource.SecretName || spec.CredentialSecretKey() != decision.Route.CredentialSource.SecretKey {
 			return fail(ReasonCredentialChanged, 403, nil)
 		}
-	} else if decision.Route.Auth != "none" || spec.SecretRef != "" || spec.CredentialProfile != "" || decision.Route.CredentialSource != nil {
+	} else if decision.Route.Auth != "none" || spec.SecretRef != "" || decision.Route.CredentialSource != nil {
 		return fail(ReasonRouteChanged, 403, nil)
 	}
 	return nil

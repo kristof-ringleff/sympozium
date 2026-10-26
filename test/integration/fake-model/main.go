@@ -24,7 +24,7 @@
 //
 // Key canary: every chat request's bearer key is recorded only as a short
 // SHA-256 fingerprint, with the CANARY:<tag> a message in the conversation
-// carries, and GET /fixture/keys lists them. The mediated-fleet journey tags
+// carries, and GET /fixture/keys lists them. The fleet journey tags
 // each Agent's conversation and asserts that every call for that tag carried
 // that Agent's own key. -tls-cert/-tls-key serve HTTPS, as a provider
 // receiving a key must (the model gateway sends a key only over HTTPS).

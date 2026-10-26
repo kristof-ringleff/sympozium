@@ -164,86 +164,13 @@ template that wires one of the three includes this.
 */}}
 {{- define "sympozium.cellnMediation" -}}
 {{- $m := .Values.celln.mediation | default dict -}}
-{{- if not (kindIs "bool" (ternary $m.defaultRoutes true (hasKey $m "defaultRoutes"))) -}}
-{{- fail "celln.mediation.defaultRoutes must be true or false" -}}
-{{- end -}}
-{{- if and (not $m.enabled) (or $m.mediateBackends $m.routes) -}}
-{{- fail "celln.mediation.routes and celln.mediation.mediateBackends require celln.mediation.enabled: without mediation an Agent's own key is never used, so the declared routes would admit nothing; enable mediation or remove them" -}}
+{{- if or (hasKey $m "routes") (hasKey $m "defaultRoutes") (hasKey $m "mediateBackends") -}}
+{{- fail "celln.mediation.routes, defaultRoutes and mediateBackends are removed: an Agent's ModelConnection is its route (any provider); narrow where keys may go with allowedOrigins/deniedOrigins on the scope's CellnExecutionPolicy" -}}
 {{- end -}}
 {{- if $m.enabled -}}
-{{- if not (kindIs "bool" ($m.mediateBackends | default false)) -}}
-{{- fail "celln.mediation.mediateBackends must be true or false" -}}
-{{- end -}}
-{{- $routes := $m.routes | default list -}}
-{{- if or (not (kindIs "slice" $routes)) (gt (len $routes) 32) -}}
-{{- fail "celln.mediation.routes must be a list of at most 32 routes: one execution policy carries no more" -}}
-{{- end -}}
-{{- range $i, $route := $routes -}}
-{{- if not (kindIs "map" $route) -}}
-{{- fail (printf "celln.mediation.routes[%d] must be a route: provider, protocol, models, endpointOrigins" $i) -}}
-{{- end -}}
-{{- range $key, $_ := $route -}}
-{{- if not (has $key (list "provider" "protocol" "models" "endpointOrigins" "auth" "allowInsecure")) -}}
-{{- fail (printf "celln.mediation.routes[%d].%s is not a route field (provider, protocol, models, endpointOrigins)" $i $key) -}}
-{{- end -}}
-{{- end -}}
-{{- if not (regexMatch "^[a-zA-Z0-9_-]{1,64}$" (toString ($route.provider | default ""))) -}}
-{{- fail (printf "celln.mediation.routes[%d].provider must be 1-64 letters, digits, underscores or hyphens" $i) -}}
-{{- end -}}
-{{- if not (has ($route.protocol | default "") (list "openai-chat" "anthropic-messages")) -}}
-{{- fail (printf "celln.mediation.routes[%d].protocol must be openai-chat or anthropic-messages" $i) -}}
-{{- end -}}
-{{- $models := $route.models | default list -}}
-{{- if or (not (kindIs "slice" $models)) (lt (len $models) 1) (gt (len $models) 32) -}}
-{{- fail (printf "celln.mediation.routes[%d].models must list 1-32 exact model names, or exactly [\"*\"] for any model: a route without a model admits nothing" $i) -}}
-{{- end -}}
-{{- if not (and (eq (len $models) 1) (eq (toString (index $models 0)) "*")) -}}
-{{- range $model := $models -}}
-{{- if not (regexMatch "^[^*[:space:]]([^*\\r\\n]{0,126}[^*[:space:]])?$" (toString $model)) -}}
-{{- fail (printf "celln.mediation.routes[%d].models: %q must be an exact model name of at most 128 bytes; the only pattern is a lone \"*\" (any model), never beside a name or inside one" $i (toString $model)) -}}
-{{- end -}}
-{{- end -}}
-{{- end -}}
-{{- if ne (len ($models | uniq)) (len $models) -}}
-{{- fail (printf "celln.mediation.routes[%d].models must not repeat a model" $i) -}}
-{{- end -}}
-{{- $origins := $route.endpointOrigins | default list -}}
-{{- $auth := $route.auth | default "secret" -}}
-{{- if not (has $auth (list "secret" "none")) -}}
-{{- fail (printf "celln.mediation.routes[%d].auth must be secret or none" $i) -}}
-{{- end -}}
-{{- if and (hasKey $route "allowInsecure") (not (kindIs "bool" $route.allowInsecure)) -}}
-{{- fail (printf "celln.mediation.routes[%d].allowInsecure must be a boolean" $i) -}}
-{{- end -}}
-{{- $insecure := $route.allowInsecure | default false -}}
-{{- if and $insecure (ne $auth "none") -}}
-{{- fail (printf "celln.mediation.routes[%d].allowInsecure requires auth none; a Secret never crosses plain HTTP" $i) -}}
-{{- end -}}
-{{- if or (not (kindIs "slice" $origins)) (lt (len $origins) 1) (gt (len $origins) 16) -}}
-{{- fail (printf "celln.mediation.routes[%d].endpointOrigins must list 1-16 HTTPS origins" $i) -}}
-{{- end -}}
-{{- range $origin := $origins -}}
-{{- $pattern := "^https://[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$" -}}
-{{- if $insecure -}}
-{{- $pattern = "^https?://([A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?|\\[[0-9A-Fa-f:]+\\])(:[0-9]{1,5})?$" -}}
-{{- end -}}
-{{- if not (regexMatch $pattern (toString $origin)) -}}
-{{- fail (printf "celln.mediation.routes[%d].endpointOrigins: %q must be an https://host origin without port, path or credentials; a Secret never crosses plain HTTP" $i (toString $origin)) -}}
-{{- end -}}
-{{- if and $insecure (not (has $origin ($.Values.modelGateway.privateOrigins | default list))) -}}
-{{- fail (printf "celln.mediation.routes[%d]: an insecure keyless origin must also be listed in modelGateway.privateOrigins" $i) -}}
-{{- end -}}
-{{- end -}}
-{{- if ne (len ($origins | uniq)) (len $origins) -}}
-{{- fail (printf "celln.mediation.routes[%d].endpointOrigins must not repeat an origin" $i) -}}
-{{- end -}}
-{{- end -}}
 {{- $fleet := .Values.celln.fleet | default dict -}}
 {{- if not (and .Values.celln.enabled $fleet.enabled) -}}
 {{- fail "celln.mediation requires celln.enabled and celln.fleet.enabled: the scoped receiver runs in the fleet's celln-node dispatchers" -}}
-{{- end -}}
-{{- if and .Values.celln.dispatcher .Values.celln.dispatcher.enduring .Values.celln.dispatcher.enduring.enabled -}}
-{{- fail "celln.mediation cannot combine with celln.dispatcher.enduring" -}}
 {{- end -}}
 {{- if not (regexMatch "^[^[:space:]]{1,253}$" ($m.clusterId | default "")) -}}
 {{- fail "celln.mediation.clusterId is required: the operator-chosen cluster identity bound into every decision" -}}
@@ -323,21 +250,6 @@ else
   echo "celln scoped receiver: no parent request at $SCOPED_PARENT_REQUEST; enduring scoped runs stay disabled (one-shot only) until it exists and this pod restarts" >&2
 fi
 {{- end -}}
-
-{{/*
-The mediated routes recorded when celln.mediation is enabled, the operator
-declares no routes and celln.mediation.defaultRoutes is true (the default):
-any model ("*") of the well-known hosted providers at their exact public API
-origins, each with the Agent's own key. Mirrors cellninstall.DefaultMediatedRoutes
-(TestDefaultMediatedRoutesMatchChart keeps them equal). Renders a JSON list.
-*/}}
-{{- define "sympozium.cellnDefaultMediatedRoutes" -}}
-{{- toJson (list
-  (dict "provider" "openai" "protocol" "openai-chat" "models" (list "*") "endpointOrigins" (list "https://api.openai.com"))
-  (dict "provider" "anthropic" "protocol" "anthropic-messages" "models" (list "*") "endpointOrigins" (list "https://api.anthropic.com"))
-  (dict "provider" "deepseek" "protocol" "openai-chat" "models" (list "*") "endpointOrigins" (list "https://api.deepseek.com"))
-) -}}
-{{- end }}
 
 {{/*
 sympozium.mediationTrustChecksum: changes whenever mediation trust is rotated

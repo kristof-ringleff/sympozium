@@ -291,7 +291,7 @@ func TestRecoverScopedReview(t *testing.T) {
 		}
 		return
 	}
-	r := &controller.AgentRunReconciler{Client: c, APIReader: c, Scheme: scheme, Log: ctrl.Log.WithName("review-recovery"), ScopedOnly: true, ScopedDispatcher: d}
+	r := &controller.AgentRunReconciler{Client: c, APIReader: c, Scheme: scheme, Log: ctrl.Log.WithName("review-recovery"), ScopedDispatcher: d}
 	if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: key}); err != nil {
 		t.Fatal(err)
 	}

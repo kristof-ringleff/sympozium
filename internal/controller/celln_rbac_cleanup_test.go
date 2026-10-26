@@ -8,7 +8,6 @@ import (
 
 	"github.com/go-logr/logr"
 	api "github.com/sympozium-ai/sympozium/api/v1alpha1"
-	"github.com/sympozium-ai/sympozium/internal/cellnreview"
 	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -34,7 +33,7 @@ func TestFreshCellnBoundaryIsPersistedBeforeFinalizer(t *testing.T) {
 	if err := r.Get(ctx, client.ObjectKeyFromObject(run), &current); err != nil {
 		t.Fatal(err)
 	}
-	if !current.Status.CellnOnly || len(current.Finalizers) != 0 || current.Status.CellnActionID != "" {
+	if !current.Status.CellnOnly || len(current.Finalizers) != 0 || current.Status.CellnScoped != nil {
 		t.Fatal("boundary was not recorded before finalizer/execution")
 	}
 	// A user editing backend must not turn this cleanup exemption into Job
@@ -95,7 +94,6 @@ func TestEditedCellnIntentCannotAcquireFreshCleanupExemption(t *testing.T) {
 	run.Generation = 2
 	run.Status = api.AgentRunStatus{}
 	run.Finalizers = nil
-	run.Spec.Celln = nil
 	run.Spec.CellnSelection = &api.CellnCatalogueSelection{}
 	r := newAgentRunTestReconciler(t, run)
 	if _, err := r.Reconcile(ctx, ctrl.Request{NamespacedName: client.ObjectKeyFromObject(run)}); err != nil {
@@ -109,8 +107,7 @@ func TestEditedCellnIntentCannotAcquireFreshCleanupExemption(t *testing.T) {
 		t.Fatal("edited run acquired fresh Celln cleanup exemption")
 	}
 	// Even later-issued Celln identity cannot erase possible legacy RBAC.
-	stored.Status.CellnActionID = "issued-after-edit"
-	stored.Status.CellnRequest = `{"id":"issued-after-edit"}`
+	stored.Status.CellnScoped = &api.CellnScopedStatus{PreparationName: "issued-after-edit"}
 	observer := &rbacReadObserver{Client: r.Client}
 	r.Client = observer
 	r.cleanupSkillRBAC(ctx, logr.Discard(), &stored)
@@ -123,8 +120,7 @@ func TestRecordedCellnCleanupDoesNotRequireJobRBAC(t *testing.T) {
 	for _, kind := range []string{"celln", "legacy-issued", "unrecorded", "unissued-recorded", "recorded-job", "job", "pod", "sandbox", "claim", "deployment", "service", "post-run"} {
 		t.Run(kind, func(t *testing.T) {
 			run := newTestCellnRun(t, "cleanup", "cleanup-uid")
-			run.Status.CellnActionID = "original"
-			run.Status.CellnRequest = `{"id":"original"}`
+			run.Status.CellnScoped = &api.CellnScopedStatus{PreparationName: "original"}
 			if kind != "legacy-issued" && kind != "unrecorded" {
 				run.Status.CellnOnly = true
 			}
@@ -132,9 +128,9 @@ func TestRecordedCellnCleanupDoesNotRequireJobRBAC(t *testing.T) {
 			case "celln":
 				run.Status.CellnOnly = true
 			case "unrecorded":
-				run.Status.CellnActionID = ""
+				run.Status.CellnScoped = nil
 			case "unissued-recorded", "recorded-job":
-				run.Status.CellnActionID, run.Status.CellnRequest = "", ""
+				run.Status.CellnScoped = nil
 				run.Status.CellnOnly = true
 				if kind == "recorded-job" {
 					run.Status.JobName = "legacy"
@@ -174,15 +170,12 @@ func TestCellnTerminalFinalizerCompletesWithoutClusterRBAC(t *testing.T) {
 	run := newTestCellnRun(t, "terminal-cleanup", "terminal-cleanup-uid")
 	run.Status.Phase = api.AgentRunPhaseSucceeded
 	run.Status.CellnOnly = true
-	run.Status.CellnActionID = "original"
-	run.Status.CellnRequest = `{"id":"original"}`
 	run.Status.CellnIssuance = &api.CellnIssuanceStatus{Phase: "Issued"}
 	run.Finalizers = []string{agentRunFinalizer}
 	r := newAgentRunTestReconciler(t, run)
 	observer := &rbacReadObserver{Client: r.Client}
 	r.Client = observer
 	r.APIReader = observer
-	r.CatalogueDispatcher = &catalogueFixture{record: &cellnreview.RouterExecution{RequestID: "original", Phase: "Cancelled"}}
 	if _, err := r.reconcileCompleted(ctx, logr.Discard(), run); err != nil {
 		t.Fatal(err)
 	}

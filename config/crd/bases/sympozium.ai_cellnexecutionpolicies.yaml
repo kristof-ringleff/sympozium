@@ -38,10 +38,25 @@ spec:
           spec:
             description: |-
               CellnExecutionPolicySpec maps protected namespace labels to an intersection of
-              exact catalogue revisions, model routes, lifecycle modes, and hard ceilings.
+              exact catalogue revisions, lifecycle modes, and hard ceilings. An Agent's
+              ModelConnection is its model route; AllowedOrigins/DeniedOrigins narrow it.
               Empty tools means no tool authority; it does not make an otherwise valid
               tool-free direct request invalid.
             properties:
+              allowedOrigins:
+                description: |-
+                  AllowedOrigins narrows where an Agent's own key (or a keyless
+                  connection) may send model requests: host patterns, each an exact
+                  lowercase host with an optional port or a "*." wildcard over
+                  subdomains. Empty admits any origin the gateway can reach. The
+                  Agent's connection is the route; this is the operator's one-line
+                  guardrail over it.
+                items:
+                  pattern: ^(\*\.)?[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*(:[0-9]{1,5})?$
+                  type: string
+                maxItems: 64
+                type: array
+                x-kubernetes-list-type: set
               ceilings:
                 properties:
                   maxModelRequests:
@@ -76,6 +91,16 @@ spec:
                 - maxTurnSeconds
                 - maxTurns
                 type: object
+              deniedOrigins:
+                description: |-
+                  DeniedOrigins refuses matching origins even when AllowedOrigins admits
+                  them; same patterns.
+                items:
+                  pattern: ^(\*\.)?[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*(:[0-9]{1,5})?$
+                  type: string
+                maxItems: 64
+                type: array
+                x-kubernetes-list-type: set
               lifecycles:
                 items:
                   enum:
@@ -87,18 +112,6 @@ spec:
                 minItems: 1
                 type: array
                 x-kubernetes-list-type: set
-              modelAccess:
-                description: |-
-                  ModelAccess says which model routes an Agent's own ModelConnection may
-                  use. "open" (the default): any public HTTPS endpoint, with the Agent's
-                  own key or none, for any model; the model gateway still refuses private
-                  and loopback addresses. "declared": only an exact entry of routes.
-                  Host-profile, plain-HTTP and private origins need an exact route under
-                  either mode.
-                enum:
-                - open
-                - declared
-                type: string
               namespaceSelector:
                 description: |-
                   A label selector is a label query over a set of resources. The result of matchLabels and
@@ -148,72 +161,6 @@ spec:
                     type: object
                 type: object
                 x-kubernetes-map-type: atomic
-              routes:
-                items:
-                  description: |-
-                    CellnExecutionPolicyRoute is explicit model endpoint authority. Under the
-                    policy's modelAccess "declared", a tenant ModelConnection may choose only a
-                    route contained by one of these entries; under "open" (the default) an
-                    entry is needed only for host-profile, plain-HTTP and private origins.
-                    Models are exact names, or exactly ["*"] (CellnAnyModel) for any model name
-                    of the route's provider at its exact endpoint origins; origins are never a
-                    pattern.
-                  properties:
-                    allowInsecure:
-                      description: |-
-                        AllowInsecure approves plain-HTTP or private endpoint origins for a
-                        keyless or host-profile route (for example a LAN llama-server).
-                        A cluster Secret route can never use plain HTTP.
-                      type: boolean
-                    auth:
-                      enum:
-                      - secret
-                      - none
-                      - host-profile
-                      type: string
-                    endpointOrigins:
-                      items:
-                        type: string
-                      maxItems: 16
-                      minItems: 1
-                      type: array
-                      x-kubernetes-list-type: set
-                    models:
-                      items:
-                        type: string
-                      maxItems: 32
-                      minItems: 1
-                      type: array
-                      x-kubernetes-list-type: set
-                    protocol:
-                      enum:
-                      - openai-chat
-                      - anthropic-messages
-                      type: string
-                    provider:
-                      maxLength: 64
-                      minLength: 1
-                      type: string
-                  required:
-                  - auth
-                  - endpointOrigins
-                  - models
-                  - protocol
-                  - provider
-                  type: object
-                  x-kubernetes-validations:
-                  - message: the any-model token '*' must be a route's only model
-                      and is not allowed on a host-profile route
-                    rule: '!self.models.exists(m, m == ''*'') || (self.models.size()
-                      == 1 && self.auth != ''host-profile'')'
-                  - message: Secret routes require https; http requires auth none
-                      or host-profile and explicit allowInsecure
-                    rule: self.endpointOrigins.all(x, x.startsWith('https://') ||
-                      (x.startsWith('http://') && self.auth in ['none', 'host-profile']
-                      && has(self.allowInsecure) && self.allowInsecure))
-                maxItems: 32
-                type: array
-                x-kubernetes-list-type: atomic
               runtimeProfiles:
                 items:
                   description: |-
@@ -368,7 +315,7 @@ spec:
                               type: integer
                             maxResponseBytes:
                               format: int64
-                              maximum: 4096
+                              maximum: 65536
                               minimum: 1
                               type: integer
                             timeoutMillis:
@@ -453,7 +400,6 @@ spec:
             - ceilings
             - lifecycles
             - namespaceSelector
-            - routes
             - runtimeProfiles
             - tools
             type: object

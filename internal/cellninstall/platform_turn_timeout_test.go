@@ -55,91 +55,36 @@ func rewriteWorker(t *testing.T, dir, backend string, native, catalogue func(cap
 	}
 }
 
-// A backend with a larger output-token cap is configured with a longer turn.
-// It is still the same package: its profile carries its own lifetime and the
-// policy's turn ceiling admits the longest one.
-func TestInstallPlatformAdmitsBackendsDifferingOnlyInTurnLifetime(t *testing.T) {
-	ctx := context.Background()
+// A worker request whose lifetime the catalogue does not state is refused:
+// the profile's limits and the request must grant one turn the same time.
+func TestInstallPlatformRefusesWorkerLifetimeTheCatalogueDoesNotState(t *testing.T) {
 	dir, packageHash, principal := starterConfiguration(t)
-	writeBackendConfiguration(t, dir, testBackend{"slow", "llama-server", "openai-chat", "slow.gguf", "https://slow.example/v1/chat/completions", "trial-slow"})
-	rewriteWorker(t, dir, "slow",
+	rewriteWorker(t, dir, "native",
+		func(capabilities, _ map[string]any) { capabilities["timeoutMs"] = 240000 },
+		func(_, _ map[string]any) {})
+	o := PlatformOptions{Namespace: "tenant-a", ConfigurationDir: dir, OutputDir: filepath.Join(t.TempDir(), "out"), Scope: "trial", ClusterID: "cluster-uid", PackageHash: packageHash, Principal: principal, ControllerNamespace: "sympozium-system"}
+	err := InstallPlatform(context.Background(), platformInstallStore(t), o)
+	if err == nil || !strings.Contains(err.Error(), "bounded lifetime matching its catalogue") {
+		t.Fatalf("err = %v, want the lifetime refusal", err)
+	}
+	// Stated in both, a longer lifetime is the scope's turn ceiling.
+	dir, packageHash, principal = starterConfiguration(t)
+	rewriteWorker(t, dir, "native",
 		func(capabilities, _ map[string]any) { capabilities["timeoutMs"] = 240000 },
 		func(_, limits map[string]any) { limits["timeoutMillis"] = 240000 })
+	o.ConfigurationDir, o.PackageHash, o.Principal, o.OutputDir = dir, packageHash, principal, filepath.Join(t.TempDir(), "out-long")
 	store := platformInstallStore(t)
-	o := PlatformOptions{Namespace: "tenant-a", ConfigurationDir: dir, OutputDir: filepath.Join(t.TempDir(), "out"), Scope: "trial", ClusterID: "cluster-uid", PackageHash: packageHash, Principal: principal, ControllerNamespace: "sympozium-system"}
+	ctx := context.Background()
 	if err := InstallPlatform(ctx, store, o); err != nil {
 		t.Fatalf("a longer turn lifetime was refused: %v", err)
 	}
 	_, policyName, _ := PlatformCatalogueNames("trial")
 	var policy api.CellnExecutionPolicy
-	if err := store.Get(ctx, types.NamespacedName{Name: policyName}, &policy); err != nil {
-		t.Fatal(err)
+	if err := store.Get(ctx, types.NamespacedName{Name: policyName}, &policy); err != nil || policy.Spec.Ceilings.MaxTurnSeconds != 240 {
+		t.Fatalf("maxTurnSeconds: %v %+v", err, policy.Spec.Ceilings)
 	}
-	if policy.Spec.Ceilings.MaxTurnSeconds != 240 {
-		t.Fatalf("maxTurnSeconds = %d, want the longest backend's 240", policy.Spec.Ceilings.MaxTurnSeconds)
-	}
-	for backend, want := range map[string]int64{"native": 60000, "slow": 240000} {
-		var profile api.CellnRuntimeProfile
-		if err := store.Get(ctx, types.NamespacedName{Name: PlatformProfileName("trial", backend)}, &profile); err != nil {
-			t.Fatal(err)
-		}
-		if profile.Spec.Limits.TimeoutMillis != want {
-			t.Fatalf("%s timeoutMillis = %d, want %d", backend, profile.Spec.Limits.TimeoutMillis, want)
-		}
-	}
-}
-
-func TestInstallPlatformStillRefusesOtherWorkerDifferences(t *testing.T) {
-	for name, edit := range map[string]struct {
-		native, catalogue func(capabilities, limits map[string]any)
-		want              string
-	}{
-		"another memory grant": {
-			func(capabilities, _ map[string]any) { capabilities["memoryBytes"] = 134217728 },
-			func(_, _ map[string]any) {},
-			"one scope carries one package",
-		},
-		"a lifetime the catalogue does not state": {
-			func(capabilities, _ map[string]any) { capabilities["timeoutMs"] = 240000 },
-			func(_, _ map[string]any) {},
-			"bounded lifetime matching its catalogue",
-		},
-	} {
-		t.Run(name, func(t *testing.T) {
-			dir, packageHash, principal := starterConfiguration(t)
-			rewriteWorker(t, dir, "claude", edit.native, edit.catalogue)
-			o := PlatformOptions{Namespace: "tenant-a", ConfigurationDir: dir, OutputDir: filepath.Join(t.TempDir(), "out"), Scope: "trial", ClusterID: "cluster-uid", PackageHash: packageHash, Principal: principal, ControllerNamespace: "sympozium-system"}
-			err := InstallPlatform(context.Background(), platformInstallStore(t), o)
-			if err == nil || !strings.Contains(err.Error(), edit.want) {
-				t.Fatalf("err = %v, want %q", err, edit.want)
-			}
-		})
-	}
-}
-
-// Added to a running scope, the longer-lived backend raises the policy's turn
-// ceiling; without that its runs would still be held to the old one.
-func TestInstallPlatformRaisesTurnCeilingForAnAddedBackend(t *testing.T) {
-	ctx := context.Background()
-	dir, packageHash, principal := starterConfiguration(t)
-	store := platformInstallStore(t)
-	o := PlatformOptions{Namespace: "tenant-a", ConfigurationDir: dir, OutputDir: filepath.Join(t.TempDir(), "out"), Scope: "trial", ClusterID: "cluster-uid", PackageHash: packageHash, Principal: principal, ControllerNamespace: "sympozium-system"}
-	if err := InstallPlatform(ctx, store, o); err != nil {
-		t.Fatal(err)
-	}
-	writeBackendConfiguration(t, dir, testBackend{"slow", "llama-server", "openai-chat", "slow.gguf", "https://slow.example/v1/chat/completions", "trial-slow"})
-	rewriteWorker(t, dir, "slow",
-		func(capabilities, _ map[string]any) { capabilities["timeoutMs"] = 240000 },
-		func(_, limits map[string]any) { limits["timeoutMillis"] = 240000 })
-	if err := InstallPlatform(ctx, store, o); err != nil {
-		t.Fatalf("rerun with a longer-lived backend refused: %v", err)
-	}
-	_, policyName, _ := PlatformCatalogueNames("trial")
-	var policy api.CellnExecutionPolicy
-	if err := store.Get(ctx, types.NamespacedName{Name: policyName}, &policy); err != nil {
-		t.Fatal(err)
-	}
-	if policy.Spec.Ceilings.MaxTurnSeconds != 240 || len(policy.Spec.RuntimeProfiles) != 3 {
-		t.Fatalf("policy after the added backend: %+v", policy.Spec.Ceilings)
+	var profile api.CellnRuntimeProfile
+	if err := store.Get(ctx, types.NamespacedName{Name: PlatformProfileName("trial", "native")}, &profile); err != nil || profile.Spec.Limits.TimeoutMillis != 240000 {
+		t.Fatalf("profile timeoutMillis: %v %d", err, profile.Spec.Limits.TimeoutMillis)
 	}
 }

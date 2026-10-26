@@ -26,7 +26,7 @@ func mediationStore(t *testing.T, objects ...client.Object) client.Client {
 		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "sympozium-system"}},
 		&corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: fleetNamespace}},
 	}
-	return extraStore(t, append(namespaces, objects...)...)
+	return fleetStoreWith(append(namespaces, objects...)...)
 }
 
 func mediationOptions() MediationOptions {

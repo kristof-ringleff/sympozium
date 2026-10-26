@@ -69,8 +69,14 @@ func (w flushingWriter) Write(data []byte) (int, error) {
 	return n, err
 }
 
+// requestNamespace is the namespace a request addresses: the namespace query
+// parameter, or the X-Sympozium-Namespace header for clients that cannot add
+// one (OpenAI SDKs pointed at an Agent's base URL), or "default".
 func requestNamespace(r *http.Request) string {
 	if ns := r.URL.Query().Get("namespace"); ns != "" {
+		return ns
+	}
+	if ns := strings.TrimSpace(r.Header.Get("X-Sympozium-Namespace")); ns != "" {
 		return ns
 	}
 	return "default"
@@ -181,7 +187,13 @@ func (s *Server) deleteHarnessSession(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) chatHarnessSession(w http.ResponseWriter, r *http.Request) {
-	ns, name := requestNamespace(r), r.PathValue("name")
+	s.serveSessionChat(w, r, requestNamespace(r), r.PathValue("name"), nil)
+}
+
+// serveSessionChat proxies one OpenAI-shaped chat request to the session's
+// adapter. body is the request body already read by the caller, or nil to
+// read it from r. The target is built from checked CR fields only.
+func (s *Server) serveSessionChat(w http.ResponseWriter, r *http.Request, ns, name string, body []byte) {
 	var session sympoziumv1alpha1.HarnessSession
 	if err := s.client.Get(r.Context(), types.NamespacedName{Name: name, Namespace: ns}, &session); err != nil {
 		if k8serrors.IsNotFound(err) {
@@ -219,10 +231,13 @@ func (s *Server) chatHarnessSession(w http.ResponseWriter, r *http.Request) {
 		s.recordHarnessSessionRequest(auditContext, ns, name, requestID, requestState, metav1.Now(), false)
 		s.log.Info("harness session request completed", "session", types.NamespacedName{Namespace: ns, Name: name}, "requestID", requestID, "state", requestState, "duration", time.Since(startedAt.Time))
 	}()
-	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 1_048_576))
-	if err != nil {
-		http.Error(w, "invalid chat request: "+err.Error(), http.StatusBadRequest)
-		return
+	if body == nil {
+		var err error
+		body, err = io.ReadAll(http.MaxBytesReader(w, r.Body, 1_048_576))
+		if err != nil {
+			http.Error(w, "invalid chat request: "+err.Error(), http.StatusBadRequest)
+			return
+		}
 	}
 	if !json.Valid(body) {
 		http.Error(w, "chat request must be valid JSON", http.StatusBadRequest)

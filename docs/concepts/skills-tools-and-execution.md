@@ -53,13 +53,10 @@ not an AI sub-agent or nested VM. Live context is bounded by the starter package
 Run-owned files and live context belong to the parent; controller/API restarts
 do not destroy it.
 
-When a parent is lost with its node (or its owner is replaced), the run
-reports `ContextLost` and the controller creates a **continuation**: a new run
-seeded with the conversation's committed exchanges, placed on any node with
-capacity (`spec.conversation`, `status.cellnParent.continuedBy`; **Restart
-elsewhere** in the UI). This carries the conversation forward, not the VM:
-workspace files, tool output and failed turns are not restored. See
-[Conversations survive their node](celln-backend.md#conversations-survive-their-node).
+When a parent is lost with its node (or its owner is replaced), the run ends
+with `AUTH_CONTEXT_LOST`; nothing is re-placed on another node, and workspace
+files end with the parent. Start a new run. See
+[Lifecycles](celln-backend.md#lifecycles).
 
 Existing OCI `HarnessSession` chat is different. Supported adapters may retain
 state on a PVC and implement stop/resume; that does not transfer to Celln.
@@ -77,6 +74,7 @@ wrappers on first use; see
 
 The run form blocks native selection for an Agent with SkillPacks. The API and
 admission webhook also reject SkillPacks and Agent MCP connections explicitly;
-use a backend's wrapper Agent (`celln-agent`, `celln-agent-<backend>`).
+a Celln Agent has a runtime wrapper (`celln-native.toolbox` or
+`celln-native`), its own `ModelConnection` and no SkillPacks.
 Incompatible selections must not silently drop skills or switch backends; this
 is not a capability-parity claim.

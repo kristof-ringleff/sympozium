@@ -97,17 +97,6 @@ spec:
               set -e
               NAMESPACE="{{ include "sympozium.namespace" . }}"
 
-              {{- if .Values.celln.nativeParent.enabled }}
-              # Refuse BEFORE scaling controllers or stripping anything. A failed
-              # read is not evidence of teardown. The operator must close new
-              # admission, delete runs normally and await joined cleanup first.
-              parent_runs=$(kubectl get agentruns.sympozium.ai -n {{ .Values.celln.nativeParent.namespace | quote }} -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}')
-              if [ -n "$parent_runs" ]; then
-                echo "Refusing uninstall: delete native parent runs and wait for confirmed cleanup first." >&2
-                exit 1
-              fi
-              {{- end }}
-
               # Scale down the controller first so it cannot re-add finalizers
               echo "Scaling down controller deployment..."
               kubectl scale deployment sympozium-controller-manager -n "$NAMESPACE" --replicas=0 2>/dev/null || true

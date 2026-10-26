@@ -1,9 +1,6 @@
-// Package celln is the control-plane client for Celln. It owns the base-URL,
-// credential and transport policy shared by the one-shot execution protocol
-// (`/v1/executions*`) and the enduring parent protocol (`/v1/parents*`), so both
-// lifecycles are reached through a single Celln service.
-//
-// See docs/design/celln-single-execution-plane.md.
+// Package celln is the control-plane client for Celln: the base-URL,
+// credential and transport policy for the API server's read-only fleet
+// discovery (`/v1/capabilities`, `/v1/cells`) against the router Service.
 package celln
 
 import (

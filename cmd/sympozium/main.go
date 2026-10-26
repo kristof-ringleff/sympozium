@@ -47,7 +47,6 @@ import (
 
 	sympoziumv1alpha1 "github.com/sympozium-ai/sympozium/api/v1alpha1"
 	"github.com/sympozium-ai/sympozium/internal/agentedit"
-	"github.com/sympozium-ai/sympozium/internal/cellninstall"
 	"github.com/sympozium-ai/sympozium/internal/helmchart"
 )
 
@@ -102,7 +101,6 @@ Running without a subcommand launches the interactive TUI.`,
 		newAgentsCmd(),
 		newRunsCmd(),
 		newWorkspaceCmd(),
-		newCellnToolCmd(),
 		newCellnMediationCmd(),
 		newPoliciesCmd(),
 		newSkillsCmd(),
@@ -1265,15 +1263,9 @@ func newInstallCmd() *cobra.Command {
 	var enableHermeticWorkloads bool
 	var noCelln bool
 	var noErgoz bool
-	var cellnBackends []string
 	var cellnRouterImage string
 	var cellnInstallerImage string
 	var cellnRouterReplicas int
-	var cellnHostInstaller bool
-	var cellnNative bool
-	var cellnNativeApprove bool
-	var nativeOpts cellninstall.Options
-	var nativePlane cellninstall.PlaneOptions
 	var fleet cellnFleetFlags
 	cmd := &cobra.Command{
 		Use:   "install",
@@ -1282,117 +1274,57 @@ func newInstallCmd() *cobra.Command {
 the controller manager, API server, admission webhook, RBAC rules,
 network policies, default SkillPacks/Policies/Ensembles, and the Celln backend.
 
-Celln is deployed by default: an in-cluster (pod-based) dispatcher, an
-unprivileged router, and generated router/backend/capability credentials plus
-the ownership PVC. The router reaches the dispatcher over the celln-dispatcher
-Service; override with --celln-backend for an external dispatcher. Pass
---celln-host-installer to run the privileged host-installer DaemonSet (bare-metal
-systemd dispatcher) instead of the in-cluster pod dispatcher; it mounts the host
-root filesystem, is a materially different trust boundary, and requires
---celln-backend. Pass --no-celln to skip Celln entirely.
-See docs/concepts/celln-backend.md before relying on it.
+Celln is deployed by default: the per-node fleet (every node labeled
+celln.dev/kvm=true boots micro-VMs), an unprivileged router, the model gateway
+and generated router/backend/capability credentials plus the ownership PVC.
+Pass --no-celln to skip Celln entirely. See docs/concepts/celln-backend.md.
 
 Use --image-tag to override the container image tag, for example when you have
 sideloaded images into Kind with a custom tag.
 
 Use --set to override arbitrary Helm values (e.g. --set controller.replicas=2).
 
-A Celln fleet install mediates model access by default: the model gateway
-holds provider keys, the installer's key becomes the starter Agent's own key
-and Celln nodes hold none. --no-celln-mediation opts out; a source build
-needs --model-gateway-image (repository@sha256:...) to turn it on.
-
-Use --celln-native to also install the native Celln starter catalogue and grant
-layers (enduring native parents); it requires the operator-reviewed
---celln-native-* inputs and --celln-native-approve-starter-tools.`,
+The Celln fleet is installed by default (every node with KVM joins by
+itself) and asks nothing about models: each Agent brings its own connection
+and key, which the model gateway adds to its requests; Celln nodes hold none.
+The fleet's two DaemonSets are privileged (they boot micro-VMs); the install
+says so before it proceeds. A source build needs --model-gateway-image
+(repository@sha256:...).
+`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if note := sourceBuildInstallerNote(cellnInstallerImage); note != "" && !noCelln {
 				fmt.Println(note)
 			}
-			if !fleet.enabled && !noCelln && !cellnHostInstaller && !cellnNative && len(cellnBackends) == 0 {
+			if !fleet.enabled && !noCelln {
 				// A build that pins a starter package makes the fleet the
-				// default Celln plane: no package flags, backend from the
-				// environment or a prompt, KVM nodes labelled by the probe.
-				enabled, err := fleet.enableByDefault(bufio.NewReader(os.Stdin))
-				if err != nil {
-					return err
-				}
-				fleet.enabled = enabled
-			}
-			if !fleet.enabled && (fleet.mediateBackends || len(fleet.mediatedRouteSpecs) != 0) {
-				return fmt.Errorf("--celln-mediated-route and --celln-mediate-backends extend a Celln fleet's execution policy; this install has no fleet (pass --celln-fleet)")
+				// default Celln plane: no package flags, no model questions,
+				// KVM nodes labelled by the probe.
+				fleet.enabled = fleet.enableByDefault()
 			}
 			if fleet.enabled {
-				if noCelln || cellnHostInstaller || cellnNative || len(cellnBackends) != 0 {
-					return fmt.Errorf("--celln-fleet replaces the single dispatcher and cannot combine with --no-celln, --celln-host-installer, --celln-native or --celln-backend")
+				if noCelln {
+					return fmt.Errorf("--celln-fleet cannot combine with --no-celln")
 				}
-				cellnValues, err := cellnInstallSetValues(cmd.Context(), cellnRouterImage, cellnInstallerImage, nil, cellnRouterReplicas, false)
+				cellnValues, err := cellnInstallSetValues(cmd.Context(), cellnRouterImage, cellnInstallerImage, cellnRouterReplicas)
 				if err != nil {
 					return err
 				}
-				if err := installCellnFleet(cmd.Context(), fleet, imageTag, append(setValues, cellnValues...), cellnNativeApprove); err != nil {
+				if err := installCellnFleet(cmd.Context(), fleet, imageTag, append(setValues, cellnValues...)); err != nil {
 					return err
 				}
 				return installErgozUnless(noErgoz)
 			}
-			if cellnNative {
-				if noCelln || cellnHostInstaller || len(cellnBackends) != 0 {
-					return fmt.Errorf("--celln-native requires the managed in-cluster dispatcher")
-				}
-				if !cellnNativeApprove || nativePlane.NodeName == "" || nativePlane.OwnerTokenFile == "" {
-					return fmt.Errorf("--celln-native requires --celln-native-approve-starter-tools, --celln-native-node and --celln-native-owner-token-file")
-				}
-				if nativeOpts.ConfigurationDir == "" || nativeOpts.OutputDir == "" || nativeOpts.StatePath == "" || nativeOpts.Scope == "" || nativeOpts.PackageHash == "" {
-					return fmt.Errorf("--celln-native requires configuration-dir, output-dir, state-path, scope and package-hash inputs")
-				}
-				if nativeOpts.OwnerTarget != "" && nativeOpts.OwnerTarget != cellninstall.ManagedRouterURL {
-					return fmt.Errorf("managed native runs must use the shared Celln router origin")
-				}
-				nativeOpts.ControllerNamespace = helmNamespace
-				if nativeOpts.OwnerTarget == "" {
-					nativeOpts.OwnerTarget = cellninstall.ManagedRouterURL
-				}
-			}
 			if !noCelln {
-				cellnValues, err := cellnInstallSetValues(cmd.Context(), cellnRouterImage, cellnInstallerImage, cellnBackends, cellnRouterReplicas, cellnHostInstaller)
-				if err != nil {
-					return err
-				}
-				setValues = append(setValues, cellnValues...)
+				// A build that pins no starter package has no fleet to deploy;
+				// the router alone serves nothing. Say so instead of
+				// installing half a plane.
+				return fmt.Errorf("this build pins no Celln starter package: pass --celln-fleet with --celln-fleet-package-image, --celln-fleet-package-hash and --celln-fleet-publisher, or --no-celln")
 			}
 			if err := runInstall(imageTag, setValues); err != nil {
 				return err
 			}
 			if err := installErgozUnless(noErgoz); err != nil {
 				return err
-			}
-			if !noCelln && !cellnNative {
-				// The plain install deploys the one-shot router only; say so
-				// here rather than leaving "Celln parent" greyed out in the UI.
-				fmt.Println("\n  Celln: the one-shot router is installed (New Run → Celln cell). Enduring Celln parents")
-				fmt.Println("  need the fleet: rerun with a model backend (DEEPSEEK_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY")
-				fmt.Println("  or SYMPOZIUM_CELLN_BACKEND=name=native,provider=…,model=…,endpoint=…) or with --celln-fleet and")
-				fmt.Println("  its inputs. Nodes with KVM and a boot kernel join by themselves. Guide: docs/guides/celln-fleet-installation.md")
-			}
-			if cellnNative {
-				if err := initClient(); err != nil {
-					return err
-				}
-				if !cellnNativeApprove {
-					return fmt.Errorf("--celln-native requires --celln-native-approve-starter-tools: grants include run-owned read/write and bounded example.com HTTPS")
-				}
-				nativeOpts.Namespace = namespace
-				if err := cellninstall.Install(cmd.Context(), k8sClient, nativeOpts); err != nil {
-					return err
-				}
-				planeValues, err := cellninstall.ConfigurePlane(cmd.Context(), k8sClient, nativeOpts, nativePlane)
-				if err != nil {
-					return err
-				}
-				if err := runInstall(imageTag, append(setValues, planeValues...)); err != nil {
-					return err
-				}
-				fmt.Printf("  Enabled enduring Celln runs on the managed execution plane in %s; no run submitted.\n", nativeOpts.Namespace)
 			}
 			return nil
 		},
@@ -1403,28 +1335,16 @@ layers (enduring native parents); it requires the operator-reviewed
 	cmd.Flags().BoolVar(&enableHermeticWorkloads, "enable-hermetic-workloads", false, "Deprecated: Celln is enabled by default; use --no-celln to skip it")
 	cmd.Flags().BoolVar(&noCelln, "no-celln", false, "Do not deploy the Celln backend (dispatcher, router, credentials, ownership PVC)")
 	cmd.Flags().BoolVar(&noErgoz, "no-ergoz", false, "Do not install ergoz (accelerator power telemetry) into ergoz-system")
-	cmd.Flags().BoolVar(&cellnHostInstaller, "celln-host-installer", false, "Deploy the privileged host-installer DaemonSet (bare-metal systemd dispatcher) instead of the in-cluster pod dispatcher; requires --celln-backend")
-	cmd.Flags().StringArrayVar(&cellnBackends, "celln-backend", nil, "Celln router dispatcher origin(s) http://host:port (repeatable); defaults to the in-cluster celln-dispatcher Service")
 	cmd.Flags().StringVar(&cellnRouterImage, "celln-router-image", "", "Celln router image repo:tag or repo@sha256:... (default "+defaultCellnRouterRepo+":"+defaultCellnRouterTag+")")
 	cmd.Flags().StringVar(&cellnInstallerImage, "celln-installer-image", "", "Celln host-installer image repo:tag (default ghcr.io/sympozium-ai/sympozium/celln-installer, tagged with this release; a source build uses the embedded chart's appVersion, never 'latest')")
 	cmd.Flags().IntVar(&cellnRouterReplicas, "celln-router-replicas", 1, "Celln router replicas for the generated ReadWriteOnce ownership PVC")
-	cmd.Flags().BoolVar(&cellnNative, "celln-native", false, "Also install the native Celln starter catalogue and grant layers (requires the operator --celln-native-* inputs)")
-	cmd.Flags().BoolVar(&cellnNativeApprove, "celln-native-approve-starter-tools", false, "Explicitly approve the three bounded starter tool grants for --celln-native")
-	cmd.Flags().StringVar(&nativePlane.NodeName, "celln-native-node", "", "KVM node holding the prepared shared state; pins controller and dispatcher")
-	cmd.Flags().StringVar(&nativePlane.OwnerTokenFile, "celln-native-owner-token-file", "", "Absolute owner credential matching the prepared parent principal; mounted into the router only")
-	cmd.Flags().StringVar(&nativeOpts.ConfigurationDir, "celln-native-configuration-dir", "", "Absolute operator configuration produced by 'celln starter-configure'")
-	cmd.Flags().StringVar(&nativeOpts.OutputDir, "celln-native-output-dir", "", "New absolute private output directory")
-	cmd.Flags().StringVar(&nativeOpts.StatePath, "celln-native-state-path", "", "Existing dedicated host state path")
-	cmd.Flags().StringVar(&nativeOpts.OwnerTarget, "celln-native-owner-target", "", "Stable owner origin. HTTPS is required for external owners; a cluster-local owner may use http:// when the plane's insecure acknowledgement is set")
-	cmd.Flags().StringVar(&nativeOpts.Scope, "celln-native-scope", "", "Stable installation identity; never change to renew consumed authority")
-	cmd.Flags().StringVar(&nativeOpts.PackageHash, "celln-native-package-hash", "", "Exact operator-approved package BLAKE3 identity")
 	fleet.register(cmd)
 	return cmd
 }
 
 // cellnInstallSetValues builds the Helm --set values that deploy the one-shot
 // Celln stack: generated credentials, ownership PVC, router and installer.
-func cellnInstallSetValues(ctx context.Context, routerImage, installerImage string, backends []string, replicas int, hostInstaller bool) ([]string, error) {
+func cellnInstallSetValues(ctx context.Context, routerImage, installerImage string, replicas int) ([]string, error) {
 	if replicas <= 0 {
 		replicas = 1
 	}
@@ -1434,25 +1354,10 @@ func cellnInstallSetValues(ctx context.Context, routerImage, installerImage stri
 		return nil, err
 	}
 	installerRepo, installerTag, _ := splitImageRef(installerImage, defaultCellnInstallerRepo, releaseTag)
-
-	// Default execution path is the in-cluster (pod-based) dispatcher, reached
-	// by the router over the celln-dispatcher Service. `--celln-host-installer`
-	// swaps in the host systemd dispatcher instead: both are alternative
-	// deployments of the same binary and contend for the same state root, so
-	// exactly one is enabled. `--celln-backend` overrides the router's backend
-	// origins (e.g. the host dispatcher or its TLS proxy).
-	dispatcherEnabled := "true"
-	if hostInstaller {
-		dispatcherEnabled = "false"
-		if len(backends) == 0 {
-			return nil, fmt.Errorf("--celln-host-installer requires --celln-backend pointing at the host dispatcher or its proxy")
-		}
-	}
 	vals := []string{
 		"celln.enabled=true",
 		"celln.allowInsecureHttp=true",
 		"celln.bootstrap.enabled=true",
-		"celln.dispatcher.enabled=" + dispatcherEnabled,
 		"celln.tokenSecret=celln-router-client",
 		"celln.capabilityTokenSecret=celln-discovery",
 		"celln.router.external=false",
@@ -1463,17 +1368,9 @@ func cellnInstallSetValues(ctx context.Context, routerImage, installerImage stri
 		"celln.router.allowInsecureBackends=true",
 		"celln.router.ownershipClaim=celln-router-ownership",
 		"celln.router.image.repository=" + routerRepo,
-		// The full image (celln binary + runtime assets + Rust) serves both the
-		// in-cluster dispatcher and, optionally, the host installer DaemonSet.
+		// The fleet node image: the celln binary and its runtime assets.
 		"celln.image.repository=" + installerRepo,
 		"celln.image.tag=" + installerTag,
-	}
-	if len(backends) == 0 {
-		backends = []string{"http://celln-dispatcher.celln-system.svc.cluster.local:8787"}
-	}
-	vals = append(vals, "celln.router.backends={"+strings.Join(backends, ",")+"}")
-	if hostInstaller {
-		vals = append(vals, "celln.installer.enabled=true")
 	}
 	if routerIsDigest {
 		vals = append(vals, "celln.router.image.digest="+routerRef)

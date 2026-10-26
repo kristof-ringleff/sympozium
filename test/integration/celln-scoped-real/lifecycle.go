@@ -305,7 +305,6 @@ func createAuthorityAndRuns(ctx context.Context, c client.Client, o options, pkg
 		NamespaceSelector: metav1.LabelSelector{MatchLabels: map[string]string{"sympozium.ai/celln-review": marker, "sympozium.ai/celln-review-tenant": "enabled"}},
 		RuntimeProfiles:   []api.CellnExecutionPolicyRuntime{{Ref: api.CellnRuntimeProfileRef{Name: pkg.OneShot.Name, Revision: pkg.OneShot.Spec.Revision}}, {Ref: api.CellnRuntimeProfileRef{Name: pkg.Enduring.Name, Revision: pkg.Enduring.Spec.Revision}}},
 		Tools:             []api.CellnExecutionPolicyTool{{Ref: api.ClusterCellnToolRef{Name: pkg.Uppercase.Name, Revision: pkg.Uppercase.Spec.Revision}}}, Lifecycles: []string{"direct-one-shot", "harness-one-shot", "enduring"},
-		Routes:   []api.CellnExecutionPolicyRoute{{Provider: modelProvider, Protocol: modelProtocol, Models: []string{modelName}, EndpointOrigins: []string{providerURL}, Auth: "secret"}},
 		Ceilings: api.CellnExecutionPolicyCeilings{MaxTurns: 2, MaxModelRequests: 4, MaxOutputTokens: 2048, MaxParentLeaseSeconds: 300, MaxTurnSeconds: 120},
 	}}
 	if err := create(objects.policy); err != nil {

@@ -7,7 +7,7 @@ import (
 
 // AgentRunSpec defines the desired state of an AgentRun.
 // Each agent invocation (including sub-agents) produces an AgentRun CR.
-// +kubebuilder:validation:XValidation:rule="!has(self.cellnSelection) || (has(self.backend) && self.backend == 'celln' && !has(self.celln))",message="catalogue selection requires backend celln and cannot mix explicit artifacts"
+// +kubebuilder:validation:XValidation:rule="!has(self.cellnSelection) || (has(self.backend) && self.backend == 'celln')",message="catalogue selection requires backend celln"
 // +kubebuilder:validation:XValidation:rule="!has(self.executionLifecycle) || self.executionLifecycle != 'enduring' || (has(self.enduring) && has(self.backend) && self.backend == 'celln' && has(self.cellnSelection) && (!has(self.mode) || self.mode == 'task'))",message="enduring lifecycle requires Celln catalogue selection, limits, and task mode"
 // +kubebuilder:validation:XValidation:rule="!has(self.enduring) || (has(self.executionLifecycle) && self.executionLifecycle == 'enduring')",message="enduring limits require enduring lifecycle"
 // +kubebuilder:validation:XValidation:rule="!has(self.conversation) || (has(self.executionLifecycle) && self.executionLifecycle == 'enduring')",message="conversation continuation requires enduring lifecycle"
@@ -141,18 +141,11 @@ type AgentRunSpec struct {
 	// +optional
 	Backend string `json:"backend,omitempty"`
 
-	// Celln names an immutable program and bounded data for backend=celln.
-	// A direct program invocation does not send task text to a model. An explicit
-	// Harness binding sends bounded task/persona data through its host model grant.
-	// Task text never supplies executable authority.
-	// The Celln operator must independently approve every referenced artifact.
-	// +optional
-	Celln *CellnExecutionSpec `json:"celln,omitempty"`
-
-	// CellnSelection requests same-namespace approved catalogue revisions.
-	// This is intent, not host authority or readiness. Until durable issuance
-	// is committed, the controller waits without entering legacy execution.
-	// Mutually exclusive with the advanced explicit Celln artifact binding.
+	// CellnSelection selects what a backend=celln run may use from the shared
+	// platform catalogue (cluster tools, a platform runtime profile). This is
+	// intent, not host authority or readiness: the controller executes the run
+	// through the Celln platform's scoped receiver and model gateway, and holds
+	// it when that receiver is not configured.
 	// +optional
 	CellnSelection *CellnCatalogueSelection `json:"cellnSelection,omitempty"`
 
@@ -228,9 +221,6 @@ type ModelSpec struct {
 	// Protocol is the host API adapter selected by the connection.
 	// +optional
 	Protocol string `json:"protocol,omitempty"`
-	// CredentialProfile is the independently approved opaque host mapping.
-	// +optional
-	CredentialProfile string `json:"credentialProfile,omitempty"`
 	// AllowInsecure is the operator opt-in for an HTTP or self-signed private
 	// model endpoint, carried from the selected connection.
 	// +optional
@@ -565,17 +555,6 @@ type AgentRunStatus struct {
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
 
-	// CellnActionID is the execution identifier returned by the Celln dispatcher
-	// when this run is dispatched through the Celln backend. Empty for
-	// non-Celln backends. The controller polls /v1/executions/<id> on the
-	// router to track progress.
-	// +optional
-	CellnActionID string `json:"cellnActionId,omitempty"`
-
-	// CellnRequest freezes the exact versioned request before first dispatch.
-	// +kubebuilder:validation:MaxLength=131072
-	// +optional
-	CellnRequest string `json:"cellnRequest,omitempty"`
 	// CellnIssuance persists the exact approved payload before remote provisioning.
 	// It is history, not dispatch permission or artifact readiness.
 	// +optional
@@ -588,10 +567,6 @@ type AgentRunStatus struct {
 	// retain their namespace-aware parent incarnation here.
 	// +optional
 	CellnScoped *CellnScopedStatus `json:"cellnScoped,omitempty"`
-	// CellnReceipt retains the validated versioned terminal receipt as JSON.
-	// +kubebuilder:validation:MaxLength=131072
-	// +optional
-	CellnReceipt string `json:"cellnReceipt,omitempty"`
 }
 
 // CellnScopedStatus is the durable controller-side recovery record for the

@@ -102,7 +102,7 @@ type CellnHTTPSLimits struct {
 	// +kubebuilder:validation:Maximum=16
 	MaxRequests int64 `json:"maxRequests"`
 	// +kubebuilder:validation:Minimum=1
-	// +kubebuilder:validation:Maximum=4096
+	// +kubebuilder:validation:Maximum=65536
 	MaxResponseBytes int64 `json:"maxResponseBytes"`
 	// +kubebuilder:validation:Minimum=1
 	// +kubebuilder:validation:Maximum=30000

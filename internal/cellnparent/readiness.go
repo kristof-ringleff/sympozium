@@ -1,6 +1,7 @@
 package cellnparent
 
 import (
+	"errors"
 	"fmt"
 	"time"
 
@@ -9,10 +10,33 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// ParentReadyCondition is the run condition the controller writes from the
-// owner's own status report. It is the only recorded evidence that the parent
-// is live and initialized.
+// ParentReadyCondition is the run condition the native parent controller wrote
+// from the owner's own status report. It remains the only recorded evidence
+// that such a parent was live and initialized.
 const ParentReadyCondition = "CellnParentReady"
+
+// OwnerCreateRefused is the owner status recorded when the owner refused the
+// single create for an incarnation.
+const OwnerCreateRefused = "CreateRefused"
+
+var ErrTurnBusy = errors.New("parent already owns a different turn; wait for its reconciliation")
+
+// ErrParentLeaseExpired marks refusals of new turn claims after the original
+// execution lease elapsed. It never fires for the already-owning turn's
+// idempotent re-claim. Callers use errors.Is to surface an actionable reason.
+var ErrParentLeaseExpired = errors.New("parent lease expired")
+
+// ParentLeaseExpired reports whether the original execution lease recorded at
+// parent admission has elapsed. A missing admission stamp predates lease
+// enforcement and is not treated as expiry. The deadline is inclusive: the
+// lease covers [admittedAt, admittedAt+leaseSeconds), so work starting exactly
+// at the deadline is already outside the original authority.
+func ParentLeaseExpired(parent *api.CellnParentStatus, leaseSeconds int64, now time.Time) bool {
+	if parent == nil || parent.AdmittedAt == nil || parent.AdmittedAt.IsZero() || leaseSeconds <= 0 {
+		return false
+	}
+	return !now.Before(parent.AdmittedAt.Add(time.Duration(leaseSeconds) * time.Second))
+}
 
 // Reasons a native parent refuses another turn. They are stable: the API
 // reports them to callers and the console explains them.
@@ -60,9 +84,9 @@ func TurnsUsed(parent *api.CellnParentStatus) int32 {
 }
 
 // TurnReadiness is the single rule for "may this native parent run take
-// another turn". The API applies it before recording a turn and the controller
-// applies it again, against a fresh read, before claiming the parent's slot.
-// It returns nil when the turn may proceed and a *TurnRefusal otherwise.
+// another turn". The API applies it before recording a turn against a run
+// that a native parent (status.cellnParent) owns. It returns nil when the
+// turn may proceed and a *TurnRefusal otherwise.
 //
 // A turn is accepted when the run is a live enduring run in phase Running, no
 // terminal owner outcome is recorded, the initial turn has a committed result,

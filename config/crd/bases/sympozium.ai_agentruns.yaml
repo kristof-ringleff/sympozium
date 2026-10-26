@@ -133,249 +133,13 @@ spec:
                   cluster info, k8s resources) and one minimal LLM call to verify
                   provider connectivity, then outputs a structured JSON result.
                 type: boolean
-              celln:
-                description: |-
-                  Celln names an immutable program and bounded data for backend=celln.
-                  A direct program invocation does not send task text to a model. An explicit
-                  Harness binding sends bounded task/persona data through its host model grant.
-                  Task text never supplies executable authority.
-                  The Celln operator must independently approve every referenced artifact.
-                properties:
-                  capabilities:
-                    properties:
-                      egress:
-                        items:
-                          type: string
-                        maxItems: 32
-                        type: array
-                      memoryBytes:
-                        description: Timeout is supplied by AgentRun.spec.timeout,
-                          not this object.
-                        format: int64
-                        maximum: 268435456
-                        minimum: 1
-                        type: integer
-                      outputBytes:
-                        format: int64
-                        maximum: 65536
-                        minimum: 1
-                        type: integer
-                      workspace:
-                        enum:
-                        - none
-                        - read-only
-                        - read-write
-                        type: string
-                    required:
-                    - memoryBytes
-                    - outputBytes
-                    - workspace
-                    type: object
-                  harness:
-                    description: |-
-                      Harness opts into an explicitly versioned sealed native runtime contract.
-                      This is not the container-replacing task.mode=harness adapter.
-                    properties:
-                      borrowedTools:
-                        items:
-                          properties:
-                            description:
-                              maxLength: 512
-                              minLength: 1
-                              type: string
-                            hash:
-                              pattern: ^blake3:[0-9a-f]{64}$
-                              type: string
-                            jsonStdio:
-                              description: CellnJSONToolIO names immutable schema
-                                data and the separate JSON stdio ABI.
-                              properties:
-                                abi:
-                                  enum:
-                                  - celln.json-stdio/v1
-                                  type: string
-                                inputBytes:
-                                  format: int64
-                                  maximum: 65536
-                                  minimum: 1
-                                  type: integer
-                                inputSchema:
-                                  maxLength: 71
-                                  pattern: ^blake3:[0-9a-f]{64}$
-                                  type: string
-                                outputBytes:
-                                  format: int64
-                                  maximum: 65536
-                                  minimum: 1
-                                  type: integer
-                                outputSchema:
-                                  maxLength: 71
-                                  pattern: ^blake3:[0-9a-f]{64}$
-                                  type: string
-                                timeoutMs:
-                                  format: int64
-                                  maximum: 30000
-                                  minimum: 1
-                                  type: integer
-                              required:
-                              - abi
-                              - inputBytes
-                              - inputSchema
-                              - outputBytes
-                              - outputSchema
-                              - timeoutMs
-                              type: object
-                            name:
-                              pattern: ^[a-zA-Z0-9_-]{1,64}$
-                              type: string
-                            path:
-                              maxLength: 256
-                              pattern: ^/
-                              type: string
-                          required:
-                          - description
-                          - hash
-                          - name
-                          - path
-                          type: object
-                        maxItems: 24
-                        minItems: 0
-                        type: array
-                      contractVersion:
-                        enum:
-                        - celln.reference-functions/v1
-                        - celln.json-tools/v1
-                        type: string
-                      json:
-                        description: CellnHarnessJSONLimits are explicit bounded loop
-                          ceilings, not model grants.
-                        properties:
-                          maxCalls:
-                            format: int64
-                            maximum: 16
-                            minimum: 0
-                            type: integer
-                          maxTurns:
-                            format: int64
-                            maximum: 6
-                            minimum: 1
-                            type: integer
-                        required:
-                        - maxCalls
-                        - maxTurns
-                        type: object
-                      modelGrant:
-                        properties:
-                          hash:
-                            maxLength: 71
-                            pattern: ^blake3:[0-9a-f]{64}$
-                            type: string
-                        required:
-                        - hash
-                        type: object
-                    required:
-                    - borrowedTools
-                    - contractVersion
-                    - modelGrant
-                    type: object
-                    x-kubernetes-validations:
-                    - message: JSON and reference Harness fields must match the selected
-                        contract
-                      rule: 'self.contractVersion == ''celln.json-tools/v1'' ? has(self.json)
-                        && self.borrowedTools.all(t, has(t.jsonStdio)) : !has(self.json)
-                        && size(self.borrowedTools) == 2 && self.borrowedTools.all(t,
-                        !has(t.jsonStdio))'
-                  inputs:
-                    items:
-                      properties:
-                        bytes:
-                          format: int64
-                          maximum: 65536
-                          minimum: 1
-                          type: integer
-                        hash:
-                          pattern: ^blake3:[0-9a-f]{64}$
-                          type: string
-                        mediaType:
-                          minLength: 1
-                          type: string
-                        name:
-                          pattern: ^[a-z0-9._-]{1,64}$
-                          type: string
-                      required:
-                      - bytes
-                      - hash
-                      - mediaType
-                      - name
-                      type: object
-                    maxItems: 16
-                    type: array
-                  invocation:
-                    properties:
-                      alias:
-                        type: string
-                      args:
-                        items:
-                          type: string
-                        maxItems: 128
-                        type: array
-                    required:
-                    - alias
-                    type: object
-                  lane:
-                    description: Lane never promotes an agent-authored artifact to
-                      tool authority.
-                    enum:
-                    - agent
-                    - tool
-                    type: string
-                  mote:
-                    properties:
-                      hash:
-                        maxLength: 71
-                        pattern: ^blake3:[0-9a-f]{64}$
-                        type: string
-                    required:
-                    - hash
-                    type: object
-                  tools:
-                    items:
-                      properties:
-                        alias:
-                          pattern: ^/
-                          type: string
-                        closure:
-                          properties:
-                            hash:
-                              maxLength: 71
-                              pattern: ^blake3:[0-9a-f]{64}$
-                              type: string
-                          required:
-                          - hash
-                          type: object
-                        hash:
-                          pattern: ^blake3:[0-9a-f]{64}$
-                          type: string
-                      required:
-                      - alias
-                      - hash
-                      type: object
-                    maxItems: 16
-                    minItems: 1
-                    type: array
-                required:
-                - capabilities
-                - invocation
-                - lane
-                - mote
-                - tools
-                type: object
               cellnSelection:
                 description: |-
-                  CellnSelection requests same-namespace approved catalogue revisions.
-                  This is intent, not host authority or readiness. Until durable issuance
-                  is committed, the controller waits without entering legacy execution.
-                  Mutually exclusive with the advanced explicit Celln artifact binding.
+                  CellnSelection selects what a backend=celln run may use from the shared
+                  platform catalogue (cluster tools, a platform runtime profile). This is
+                  intent, not host authority or readiness: the controller executes the run
+                  through the Celln platform's scoped receiver and model gateway, and holds
+                  it when that receiver is not configured.
                 properties:
                   clusterToolRefs:
                     description: |-
@@ -948,10 +712,6 @@ spec:
                   connectionRevision:
                     description: ConnectionRevision pins the connection UID and spec
                       after resolution.
-                    type: string
-                  credentialProfile:
-                    description: CredentialProfile is the independently approved opaque
-                      host mapping.
                     type: string
                   model:
                     description: Model is the model identifier.
@@ -3187,10 +2947,9 @@ spec:
             - sessionKey
             type: object
             x-kubernetes-validations:
-            - message: catalogue selection requires backend celln and cannot mix explicit
-                artifacts
+            - message: catalogue selection requires backend celln
               rule: '!has(self.cellnSelection) || (has(self.backend) && self.backend
-                == ''celln'' && !has(self.celln))'
+                == ''celln'')'
             - message: enduring lifecycle requires Celln catalogue selection, limits,
                 and task mode
               rule: '!has(self.executionLifecycle) || self.executionLifecycle != ''enduring''
@@ -3344,13 +3103,6 @@ spec:
                   - attempt
                   type: object
                 type: array
-              cellnActionId:
-                description: |-
-                  CellnActionID is the execution identifier returned by the Celln dispatcher
-                  when this run is dispatched through the Celln backend. Empty for
-                  non-Celln backends. The controller polls /v1/executions/<id> on the
-                  router to track progress.
-                type: string
               cellnIssuance:
                 description: |-
                   CellnIssuance persists the exact approved payload before remote provisioning.
@@ -3607,16 +3359,6 @@ spec:
                 - message: parent admission time is immutable
                   rule: '!has(oldSelf.admittedAt) || (has(self.admittedAt) && self.admittedAt
                     == oldSelf.admittedAt)'
-              cellnReceipt:
-                description: CellnReceipt retains the validated versioned terminal
-                  receipt as JSON.
-                maxLength: 131072
-                type: string
-              cellnRequest:
-                description: CellnRequest freezes the exact versioned request before
-                  first dispatch.
-                maxLength: 131072
-                type: string
               cellnScoped:
                 description: |-
                   CellnScoped binds a shared-catalogue run to immutable protected

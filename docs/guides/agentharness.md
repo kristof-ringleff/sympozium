@@ -5,7 +5,7 @@
     uses an enduring `AgentRun` with a live parent and disposable turn cells;
     it does not inherit OCI session PVC/resume, SkillPack or MCP support.
     See [skills, tools and execution](../concepts/skills-tools-and-execution.md)
-    and [native installation](celln-native-installation.md) for that path.
+    and [Celln fleet installation](celln-fleet-installation.md) for that path.
 
 ## The problem
 
@@ -124,6 +124,13 @@ For operators, the trust boundary is unchanged:
   writable root filesystem; and
 - only Sympozium's API server proxies the fixed `/v1/chat/completions` target,
   with bounded requests/responses and redirects refused.
+
+An Agent on a session runtime is also reachable as an OpenAI-compatible
+endpoint at `/api/v1/agents/{name}/v1/chat/completions` (the Sympozium token
+as the API key, `X-Sympozium-Namespace` naming the namespace): the API server
+hands the request to the Agent's running session, history and streaming
+included. Celln Agents have the same endpoint; see
+[Agent-bound model access](celln-mediated-model-access.md).
 
 <figure markdown="span">
   <img src="../assets/agentharness/lifecycle.svg" alt="AgentHarness lifecycle: approve a digest-pinned AgentRuntime, select it on an AgentRun, execute it in an isolated pod, then validate and record the result." width="1200">

@@ -36,31 +36,41 @@ See [`charts/sympozium/values.yaml`](https://github.com/sympozium-ai/sympozium/b
 ### Celln (hardware-isolated execution)
 
 The raw chart default is `celln.enabled: false`; `sympozium install` turns it
-on (and `--no-celln` leaves it off). Every Celln workload schedules only on
-nodes labelled `celln.dev/kvm=true` (except the single in-cluster dispatcher,
-below); the node probe applies that label to
-nodes with `/dev/kvm` and a kernel under `/boot` (`nodeProbe.labelKVMNodes`).
-See [Celln Backend](../concepts/celln-backend.md).
+on and sets every value below (`--no-celln` leaves it off). Celln's two
+DaemonSets are **privileged** (they mount `/dev/kvm`, `/boot`, `/lib/modules`
+and a state directory to boot micro-VMs) and schedule only on nodes labelled
+`celln.dev/kvm=true`; the node probe applies that label to nodes with
+`/dev/kvm` and a kernel under `/boot` (`nodeProbe.labelKVMNodes`). The fleet
+holds no model: every Agent brings its own `ModelConnection` and key, which
+the model gateway adds to its requests. See
+[Celln Backend](../concepts/celln-backend.md).
 
-- **`celln.fleet.*`** (the default when `sympozium install` finds a model
-  backend) runs one owner per labeled node: a `celln-node` DaemonSet prepares
-  each node from a digest-pinned, signed starter package and serves one-shot
-  and enduring parents; a `celln-node-configure` DaemonSet configures each
-  model backend; the router discovers owners through a headless Service; and
-  the controller keeps its parent journal on a claim instead of a node. Its
-  values (scope, package, publisher, backends, capacity, HTTPS hosts) are
-  set by the installer; driving them by hand is possible but see
-  [Celln Fleet Installation](../guides/celln-fleet-installation.md) for what
-  must exist first.
-- **`celln.dispatcher.*`** is the single in-cluster dispatcher used by the
-  one-shot router when no fleet is configured. It carries no node selector
-  but mounts the node's `/dev/kvm`, so the node it lands on must provide KVM.
-  `celln.dispatcher.tolerations` lets it run on a tainted KVM node (for
-  example a single-node cluster's control plane).
-- **`celln.installer.enabled`** deploys the legacy privileged host-installer
-  DaemonSet (bare-metal systemd dispatcher, labelled nodes only); it is
-  mutually exclusive with the in-cluster dispatcher. Only this path reads `celln.anthropicApiKey`,
-  `openaiApiKey`, `deepseekApiKey` and `openaiBaseUrl`.
+- **`celln.fleet.*`** runs one owner per labeled node: `celln-node-configure`
+  prepares each node from a digest-pinned, signed starter package
+  (`scope`, `package.image`, `package.hash`, `publisher`, `principal`) and
+  `celln-node` serves one-shot and enduring parents. `limits` are the scope's
+  per-parent ceilings, `httpsHosts` the hosts the HTTPS tools may reach, and
+  `capacity`/`memoryPercent`/`cellMemoryBytes`/`maxCellsCeiling` size each
+  node. The 0.11 values `backends`, `model`, `modelCredentialsSecret`,
+  `modelCredential` and `backendsExtraRevision` are refused.
+- **`celln.mediation.*`** wires the controller, the fleet dispatchers and the
+  model gateway to one issuer, keyset, CA and token set. It requires the
+  fleet and `modelGateway.image`, and `clusterId`, `issuer.keyId` and the
+  four trust objects (`controllerSecret`, `gatewaySecret`, `nodeSecret`,
+  `trustConfigMap`), which the installer bootstraps and which a Helm-only
+  install gets from `sympozium celln-mediation bootstrap`. The 0.11 values
+  `routes`, `defaultRoutes` and `mediateBackends` are refused: an Agent's
+  `ModelConnection` is its route; narrow it with `allowedOrigins` and
+  `deniedOrigins` on the scope's `CellnExecutionPolicy`.
+- **`celln.router.*`, `celln.bootstrap.*`, `celln.tokenSecret`,
+  `celln.capabilityTokenSecret`, `celln.image.*`** are the router and the
+  generated credentials the installer sets; the router needs the fleet (the
+  single in-cluster dispatcher and the host installer were removed in 0.12).
+
+Driving the fleet by plain Helm is possible but the installer derives a dozen
+values, publishes trust the chart never renders and installs the scope's
+catalogue; prefer `sympozium install`. See
+[Celln Fleet Installation](../guides/celln-fleet-installation.md).
 
 Disable all Celln resources with `--set celln.enabled=false`.
 
@@ -98,11 +108,25 @@ always exempt.
 
 ### Model gateway
 
-`modelGateway.enabled` (default `false`) packages the separate Celln model
-gateway for controlled qualification. It requires an immutable image digest,
-a configuration claim and explicit egress peers, and does not by itself
-enable mediated Celln admission. See
-[Model gateway component installation](../guides/celln-model-gateway-component-installation.md).
+The model gateway is how every Celln Agent's model requests leave a cell: it
+adds that Agent's own key, from the Secret its `ModelConnection` names, and
+no node holds one. `celln.mediation.enabled` deploys it from Secret/ConfigMap
+volumes; `modelGateway.image` must be an immutable `repository@sha256:…`
+digest (the installer pins the release's). Operator inputs:
+
+```yaml
+modelGateway:
+  image: ghcr.io/sympozium-ai/sympozium/model-gateway@sha256:<digest>
+  egress: []              # NetworkPolicy egress; empty allows any provider, a list restricts it
+  namespaces: []          # tenant namespaces the gateway may read; empty keeps the cluster-wide get
+  privateOrigins: []      # exact origins on private addresses the gateway may reach, e.g. http://192.168.1.237:8080
+  providerCA: {configMap: "", key: ca.crt}   # extra CA, trusted only for privateOrigins
+  database:
+    secretName: ""        # your PostgreSQL URL Secret (key database-url); empty runs the bundled single-pod PostgreSQL
+    bundled: {storage: 1Gi, storageClassName: ""}
+```
+
+See [Agent-bound model access](../guides/celln-mediated-model-access.md).
 
 ### AgentHarness examples
 

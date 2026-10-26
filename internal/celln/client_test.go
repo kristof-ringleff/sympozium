@@ -56,7 +56,7 @@ func TestRequestCarriesCredentialAndRejectsBadTokens(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	req, err := c.Request(context.Background(), http.MethodGet, "/v1/executions/x", nil)
+	req, err := c.Request(context.Background(), http.MethodGet, "/v1/capabilities", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -74,7 +74,7 @@ func TestRequestCarriesCredentialAndRejectsBadTokens(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := c.Request(context.Background(), http.MethodGet, "/v1/executions/x", nil); err == nil {
+		if _, err := c.Request(context.Background(), http.MethodGet, "/v1/capabilities", nil); err == nil {
 			t.Errorf("%s token accepted", name)
 		}
 	}
@@ -83,7 +83,7 @@ func TestRequestCarriesCredentialAndRejectsBadTokens(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := missing.Request(context.Background(), http.MethodGet, "/v1/executions/x", nil); err == nil {
+	if _, err := missing.Request(context.Background(), http.MethodGet, "/v1/capabilities", nil); err == nil {
 		t.Error("missing credential accepted")
 	}
 
@@ -91,7 +91,7 @@ func TestRequestCarriesCredentialAndRejectsBadTokens(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := noCred.Request(context.Background(), http.MethodGet, "/v1/executions/x", nil); err == nil {
+	if _, err := noCred.Request(context.Background(), http.MethodGet, "/v1/capabilities", nil); err == nil {
 		t.Error("unconfigured credential accepted")
 	}
 }

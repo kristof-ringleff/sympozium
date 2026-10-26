@@ -1,29 +1,21 @@
 #!/usr/bin/env bash
 # Prepares one KVM node's native Celln authority root from an operator-signed
-# starter package and publishes the resulting starter configuration once per
-# scope: one configuration per model backend, all from the same package.
-# Every step is idempotent for the same package hash. Nothing here issues a
-# run, reads a model credential or starts a guest outside the package's own
-# admission checks.
+# starter package and publishes the resulting model-free starter configuration
+# once per scope. Every step is idempotent for the same package hash. Nothing
+# here issues a run, holds a model credential or starts a guest outside the
+# package's own admission checks.
 set -euo pipefail
 
 : "${FLEET_STATE:?}" "${FLEET_PACKAGE_IMAGE:?}" "${FLEET_PACKAGE_HASH:?}" "${FLEET_PUBLISHER:?}"
 : "${FLEET_PRINCIPAL:?}" "${FLEET_SCOPE:?}" "${FLEET_BACKENDS:?}" "${FLEET_PARENT_CLIENTS:?}"
 : "${FLEET_CONFIGURATION_CONFIGMAP:?}" "${FLEET_NAMESPACE:?}" "${NODE_NAME:?}"
 
-# Backends added after the install arrive through a ConfigMap the API server
-# writes (the same shape as the install-time list); they join it here so the
-# rest of this script sees one list. A name the chart already carries wins.
-extra=/etc/celln-fleet/backends-extra/backends.json
-if [ -s "$extra" ]; then
-	FLEET_BACKENDS="$(python3 -c 'import json, sys
-base = json.loads(sys.argv[1])
-names = {b["name"] for b in base}
-print(json.dumps(base + [b for b in json.load(open(sys.argv[2])) if b["name"] not in names]))' "$FLEET_BACKENDS" "$extra")"
-	export FLEET_BACKENDS
-fi
-
 celln=/usr/local/bin/celln
+# The configuration a node derives depends on the package and on the Celln
+# binary that configures it (its persona, tool limits and template shape), so
+# both identify a configuration: a new celln-node-configure image re-derives
+# and republishes it even for the same package.
+celln_id="$(sha256sum "$celln" | cut -c1-16)"
 root="$FLEET_STATE/authority"
 hex="${FLEET_PACKAGE_HASH#blake3:}"
 if [ "${#hex}" -ne 64 ] || [ -n "${hex//[0-9a-f]/}" ]; then
@@ -88,16 +80,24 @@ if [ ! -f "$admitted" ]; then
 	: >"$admitted"
 fi
 
-# Configure every backend from the same admitted package. Each backend gets
-# its own model connection, credential profile (scope for native, scope-name
-# otherwise) and configuration directory; the host limits are shared.
+# Configure the model-free starter configuration from the admitted package.
+# A configuration an earlier install made with a model (a fleet-held key,
+# before 0.12) is replaced: the node then holds no model and no key.
 backend_names="$(python3 -c 'import json, sys
 for b in json.loads(sys.argv[1]):
     print(b["name"])' "$FLEET_BACKENDS")"
 for backend in $backend_names; do
 	configuration="$FLEET_STATE/configuration-$hex-$backend"
 	if [ -f "$configuration/configured.json" ]; then
-		continue
+		if python3 -c 'import json, sys; sys.exit(0 if "modelProfile" in json.load(open(sys.argv[1])) else 1)' "$configuration/configured.json"; then
+			echo "replacing the model-bound starter configuration of $backend with a model-free one; Agents bring their own model connection" >&2
+			rm -rf "$configuration"
+		elif [ "$(cat "$configuration/.configured-by" 2>/dev/null)" != "$celln_id" ]; then
+			echo "re-deriving the starter configuration of $backend: the Celln binary changed (now $celln_id)" >&2
+			rm -rf "$configuration"
+		else
+			continue
+		fi
 	fi
 	rm -rf "$configuration"
 	output="$FLEET_STATE/.configure-$hex-$backend-$$"
@@ -117,30 +117,18 @@ for backend in $backend_names; do
 		exit 1
 	fi
 	rm -f "$plan"
+	printf '%s' "$celln_id" >"$output/.configured-by"
 	mv "$output" "$configuration"
 done
 
-# A backend is published only once its key has reached this node's kubelet
-# (the owner's mount of the same Secret follows within the kubelet's sync
-# period), so a parent is never issued on a backend whose key is not there.
-for backend in $backend_names; do
-	credential="$(python3 -c 'import json, sys
-print(next(b["credentialFile"] for b in json.loads(sys.argv[1]) if b["name"] == sys.argv[2]))' "$FLEET_BACKENDS" "$backend")"
-	waited=0
-	until [ -s "$credential" ]; do
-		[ "$waited" -lt 600 ] || { echo "key for backend $backend never reached $credential; publish it with sympozium install" >&2; exit 1; }
-		[ $((waited % 60)) -ne 0 ] || echo "waiting for backend $backend key at $credential" >&2
-		sleep 5
-		waited=$((waited + 5))
-	done
-done
-
 # Publish the scope's starter configuration, keyed <backend>.<file>. Every
-# node derives identical files from the same package, so a later publisher
-# only verifies what is there and adds the backends it lacks (a backend added
-# to a running scope); an existing backend's files are never rewritten. A
-# different package or scope replaces the configuration only once the
-# installer has approved exactly this node's package and scope
+# node derives identical files from the same package with the same Celln
+# binary, so a later publisher only verifies what is there and adds the
+# backends it lacks (a backend added to a running scope); an existing
+# backend's files are never rewritten. A node whose Celln binary differs from
+# the publisher's replaces the configuration (an image rollout converges on
+# the last node to publish). A different package or scope replaces it only
+# once the installer has approved exactly this node's package and scope
 # (fleet-publish.py decides).
 api=https://kubernetes.default.svc
 credentials=/var/run/secrets/celln-fleet
@@ -148,7 +136,7 @@ resource="$api/api/v1/namespaces/$FLEET_NAMESPACE/configmaps"
 # Bodies travel through files: with several backends the configuration
 # exceeds what one command-line argument may carry.
 body="$(mktemp "$FLEET_STATE/.body-XXXXXX")"
-python3 - "$FLEET_CONFIGURATION_CONFIGMAP" "$FLEET_NAMESPACE" "$FLEET_STATE/configuration-$hex" "$FLEET_PACKAGE_HASH" "$NODE_NAME" >"$body" <<'PY'
+FLEET_CELLN_ID="$celln_id" python3 - "$FLEET_CONFIGURATION_CONFIGMAP" "$FLEET_NAMESPACE" "$FLEET_STATE/configuration-$hex" "$FLEET_PACKAGE_HASH" "$NODE_NAME" >"$body" <<'PY'
 import json, os, sys
 name, namespace, prefix, package_hash, node = sys.argv[1:]
 data = {}
@@ -160,6 +148,7 @@ print(json.dumps({"apiVersion": "v1", "kind": "ConfigMap",
                                "labels": {"app.kubernetes.io/part-of": "sympozium"},
                                "annotations": {"celln.sympozium.ai/package": package_hash,
                                                "celln.sympozium.ai/scope": os.environ["FLEET_SCOPE"],
+                                               "celln.sympozium.ai/configured-by": os.environ["FLEET_CELLN_ID"],
                                                "celln.sympozium.ai/published-by": node}},
                   "data": data}))
 PY

@@ -124,9 +124,9 @@ graph TB
     end
 
     subgraph CELLN["backend: celln"]
-        ROUTER["celln-router<br/><small>gateway, parent ↔ owner ledger</small>"]
+        ROUTER["celln-router<br/><small>scoped receiver, parent ↔ owner ledger</small>"]
         subgraph NODES["celln-node DaemonSet · every celln.dev/kvm=true node"]
-            OWN["Owner / dispatcher<br/><small>package from a signed starter</small>"]
+            OWN["Owner / dispatcher<br/><small>model-free package from a signed starter</small>"]
             PARENT["Parent cell<br/><small>leased, live context</small>"]
             CHILD["Child cell per turn<br/><small>borrowed tools</small>"]
             OWN --> PARENT --> CHILD
@@ -136,12 +136,12 @@ graph TB
 
     CM -- "creates" --> JOB
     CM -- "creates" --> HS
-    CM -- "provisions parents<br/>POST /v1/parents/provision" --> ROUTER
+    CM -- "signed permit per run<br/>POST /v1/scoped/*" --> ROUTER
     POL[("CellnExecutionPolicy<br/>CellnRuntimeProfile<br/>ClusterCellnTool")] -. "admits" .-> CM
-    GW["Model gateway<br/><small>holds each Agent's own key</small>"]
-    AKEYS[("Agent key Secrets<br/><small>one owner each</small>")] -. "read per call" .-> GW
-    OWN -- "model calls<br/>(mediated, default)" --> GW
-    KEYS[("celln-fleet-model-credentials<br/><small>only with --no-celln-mediation</small>")] -. "mounted into" .-> OWN
+    CONN[("ModelConnection<br/><small>the Agent's route</small>")] -. "bound into the permit" .-> CM
+    GW["Model gateway<br/><small>adds the Agent's own key per call</small>"]
+    AKEYS[("Agent key Secrets<br/><small>one owner, one origin each</small>")] -. "read per call" .-> GW
+    OWN -- "model calls" --> GW
 
     style K8S stroke:#53354a,stroke-width:2px
     style CELLN stroke:#0ea5e9,stroke-width:2px
@@ -154,11 +154,12 @@ graph TB
 - **Celln (`celln`)** — KVM microVMs on every node the node probe labels
   `celln.dev/kvm=true`. One-shot runs are single-turn parents; enduring runs
   keep a leased parent and take follow-up `AgentRunTurn`s. The controller
-  resolves policy, runtime profile, tools and model route into one decision,
-  provisions the parent through the router on the node with the most spare
-  capacity, and continues a conversation on another node if its parent is
-  lost. Model keys stay in the node dispatchers. See
-  [Celln Backend](concepts/celln-backend.md).
+  resolves policy, runtime profile, tools and the Agent's `ModelConnection`
+  into one signed decision and provisions the parent through the router on
+  the node with the most spare capacity. Celln holds no model: the gateway
+  adds each Agent's own key per call, and no node ever holds one. See
+  [Celln Backend](concepts/celln-backend.md) and
+  [Agent-bound model access](guides/celln-mediated-model-access.md).
 
 ### Channels & Web Endpoints
 
@@ -359,7 +360,7 @@ sympozium/
 │   ├── mcp-bridge/         # MCP bridge sidecar
 │   ├── web-proxy/          # Web proxy (OpenAI-compat API + MCP gateway)
 │   ├── node-probe/         # Node probe DaemonSet (inference discovery, KVM labels)
-│   ├── model-gateway/      # Celln model gateway (opt-in, qualification)
+│   ├── model-gateway/      # Celln model gateway (adds each Agent's own key per call)
 │   ├── celln-*/            # Celln parent proxy, scoped controller, review/evidence tools
 │   └── sympozium/          # CLI + interactive TUI
 ├── internal/               # Internal packages

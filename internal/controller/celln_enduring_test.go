@@ -11,9 +11,20 @@ import (
 	"testing"
 )
 
+// newTestCellnRun is a pending backend=celln run with a string task.
+func newTestCellnRun(t *testing.T, name string, uid types.UID) *api.AgentRun {
+	t.Helper()
+	return &api.AgentRun{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default", UID: uid, Generation: 1},
+		Spec:       api.AgentRunSpec{AgentRef: "my-instance", Backend: "celln", Task: api.NewStringTask("do stuff")},
+	}
+}
+
+// reconcilePending is reached only for a run the scoped path did not select;
+// enduring intent there has no plane left and must fail closed, never become a
+// one-shot Job.
 func TestEnduringIntentCannotFallThroughToOneShotExecution(t *testing.T) {
 	run := newTestCellnRun(t, "enduring-refusal", "enduring-refusal-uid")
-	run.Spec.Celln = nil
 	run.Spec.CellnSelection = &api.CellnCatalogueSelection{}
 	run.Spec.ExecutionLifecycle = "enduring"
 	run.Spec.Enduring = &api.EnduringRunSpec{LeaseSeconds: 3600, MaxTurns: 10, MaxModelRequests: 20, MaxOutputTokens: 10240}
@@ -25,7 +36,7 @@ func TestEnduringIntentCannotFallThroughToOneShotExecution(t *testing.T) {
 	if err := r.Get(context.Background(), client.ObjectKeyFromObject(run), &current); err != nil {
 		t.Fatal(err)
 	}
-	if current.Status.Phase != api.AgentRunPhaseFailed || current.Status.CellnActionID != "" || current.Status.JobName != "" || current.Status.DeploymentName != "" {
+	if current.Status.Phase != api.AgentRunPhaseFailed || current.Status.JobName != "" || current.Status.DeploymentName != "" {
 		t.Fatalf("enduring intent was not refused before execution: %+v", current.Status)
 	}
 }
@@ -44,7 +55,7 @@ func TestEnduringCatalogueCannotFallBackWhenScopedDispatcherIsDisabled(t *testin
 	if err := r.Get(context.Background(), client.ObjectKeyFromObject(run), &current); err != nil {
 		t.Fatal(err)
 	}
-	if current.Status.CellnParent != nil || current.Status.CellnActionID != "" || current.Status.JobName != "" || current.Status.Phase == api.AgentRunPhaseFailed {
+	if current.Status.CellnParent != nil || current.Status.JobName != "" || current.Status.Phase == api.AgentRunPhaseFailed {
 		t.Fatalf("enduring catalogue intent escaped to replacement work: %+v", current.Status)
 	}
 }

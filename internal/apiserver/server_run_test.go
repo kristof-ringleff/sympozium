@@ -221,7 +221,7 @@ func TestCreateCatalogueRunPreservesIntentAndUsesHostModelAuthority(t *testing.T
 	if err := json.Unmarshal(response.Body.Bytes(), &run); err != nil {
 		t.Fatal(err)
 	}
-	if !run.Spec.Task.IsString() || run.Spec.Celln != nil || run.Spec.CellnSelection == nil || run.Spec.CellnSelection.RuntimeRef != "override-runtime" || len(run.Spec.CellnSelection.ToolRefs) != 2 || run.Spec.CellnSelection.ToolRefs[0].Name != "uppercase" || run.Spec.CellnSelection.ToolRefs[1].Name != "length" {
+	if !run.Spec.Task.IsString() || run.Spec.CellnSelection == nil || run.Spec.CellnSelection.RuntimeRef != "override-runtime" || len(run.Spec.CellnSelection.ToolRefs) != 2 || run.Spec.CellnSelection.ToolRefs[0].Name != "uppercase" || run.Spec.CellnSelection.ToolRefs[1].Name != "length" {
 		t.Fatal("catalogue intent changed or converted to OCI task")
 	}
 	if run.Spec.Model.Provider != "deepseek" || run.Spec.Model.Model != "deepseek-chat" || run.Spec.Model.AuthSecretRef != "" || run.Spec.Model.BaseURL != "" {
@@ -231,7 +231,6 @@ func TestCreateCatalogueRunPreservesIntentAndUsesHostModelAuthority(t *testing.T
 
 func TestCreateCatalogueRunRefusesAmbiguousOrImplicitModel(t *testing.T) {
 	for _, body := range []string{
-		`{"agentRef":"agent","task":"task","backend":"celln","provider":"deepseek","model":"deepseek-chat","celln":{},"cellnSelection":{"toolRefs":[]}}`,
 		`{"agentRef":"agent","task":"task","backend":"job","provider":"deepseek","model":"deepseek-chat","cellnSelection":{"toolRefs":[]}}`,
 		`{"agentRef":"agent","task":"task","backend":"celln","model":"deepseek-chat","cellnSelection":{"toolRefs":[]}}`,
 		`{"agentRef":"agent","task":"task","backend":"celln","provider":"deepseek","cellnSelection":{"toolRefs":[]}}`,

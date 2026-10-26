@@ -198,10 +198,11 @@ export interface CellnNodeCells {
 }
 
 /**
- * One provider route the operator declared for Agents that bring their own
- * key (GET /api/v1/celln-platform/mediation). A ModelConnection matches it
- * only with exactly this provider and protocol, one of these models and an
- * endpoint on one of these origins.
+ * The route an Agent's own ModelConnection takes (lib/celln-providers.ts
+ * builds it from a provider preset): this provider and protocol, any model
+ * (["*"]) or exact ones, at exactly these endpoint origins, with the Agent's
+ * own key or none. Operators no longer declare routes; the policy's origin
+ * globs (CellnMediation) are the guardrail over it.
  */
 export interface CellnMediatedRoute {
   auth?: "secret" | "none";
@@ -209,12 +210,12 @@ export interface CellnMediatedRoute {
   provider: string;
   protocol: "openai-chat" | "anthropic-messages";
   models: string[];
-  /** The route declares models ["*"]: any model name of this provider at these exact origins. */
+  /** Any model name of this provider at these exact origins. */
   anyModel?: boolean;
   endpointOrigins: string[];
-  /** The execution policy carrying the route; absent on a pending one. */
+  /** The execution policy whose guardrail applies, when known. */
   policy?: string;
-  /** The fixed key name the provider Secret must hold for this protocol. */
+  /** The fixed key name the provider Secret must hold for this protocol; "" when keyless. */
   secretKey: string;
   /**
    * Client-side only: a provider chosen under open model access. Its models
@@ -223,18 +224,26 @@ export interface CellnMediatedRoute {
   open?: boolean;
 }
 
+/**
+ * How an Agent in the namespace may use its own model key
+ * (GET /api/v1/celln-platform/mediation, apiserver CellnMediation). Nothing
+ * here is a credential; the Agent's connection is the route and this is the
+ * operator's guardrail over it (lib/celln-providers.ts originStatus).
+ */
 export interface CellnMediation {
+  /** The release runs the model gateway, which is how every Celln Agent's model requests leave a cell. */
   enabled: boolean;
-  mediateBackends: boolean;
-  /**
-   * Every policy selecting the namespace has open model access: any public
-   * HTTPS provider endpoint and model with the Agent's own key, besides routes.
-   */
-  open: boolean;
-  /** Routes the namespace's policies carry now: what a run is matched against. */
-  routes: CellnMediatedRoute[];
-  /** Declared routes no policy carries yet (sympozium celln-mediation apply-routes). */
-  pending: CellnMediatedRoute[];
+  /** Host globs (exact host[:port] or "*.suffix") the namespace's policies place on an Agent's connection; empty = any public origin. */
+  allowedOrigins: string[];
+  /** Host globs refused whatever else matches. */
+  deniedOrigins: string[];
+  /** The policies that apply to the namespace. */
+  policies: string[];
+  /** Exact scheme://host[:port] origins the operator approved for private, LAN or loopback endpoints (chart value modelGateway.privateOrigins). */
+  privateOrigins?: string[];
+  /** Always empty: 0.11 consoles iterated declared routes. */
+  routes?: unknown[];
+  pending?: unknown[];
 }
 
 /** A Secret in the namespace that already holds a model key. Names only, never values. */
@@ -245,35 +254,35 @@ export interface CellnKeySecret {
   managed?: boolean;
 }
 
+/**
+ * What a tenant sees of a fleet runtime profile its namespace may run
+ * (apiserver CellnPlatformProfile): identity, runtime wrapper, lent tools and
+ * budgets. Celln is isolation and holds no model: every profile is
+ * mediation-only and names no provider, model, endpoint or Agent of its own
+ * (those fields are empty); an Agent's own ModelConnection is its route.
+ */
 export interface CellnPlatformProfile {
   name: string;
   revision: string;
   policy: string;
+  /** Empty: the fleet serves no model of its own. */
   model: string;
   provider: string;
   endpoint: string;
-  credentialProfile: string;
   systemPrompt: string;
-  /** Fleet model backend this profile runs on ("native" is the default). */
+  /** Fleet backend this profile runs on ("native" is the default). */
   backend: string;
-  /** Name of the AgentRuntime wrapper a run selects (created on first use). */
+  /** Name of the AgentRuntime wrapper a run selects (POST celln-platform/wrappers creates it on first use). */
   wrapper: string;
-  /** Name of the Agent the wrappers create for this backend. */
+  /** Empty: no shared Agent is created for a profile. */
   agent: string;
   /** Shared catalogue revisions the policy lends to runs on this profile (cellnSelection.clusterToolRefs). */
   tools: { name: string; revision: string }[];
   /** The policy's per-parent maxima and the budget a new conversation should ask for. */
   ceilings: EnduringLimits;
   sessionDefaults: EnduringLimits;
-  /** The backend's key never reached the fleet: only Agents with their own key run on it (no shared agent). */
+  /** Always set: the profile runs only Agents with their own key. */
   mediationOnly?: boolean;
-  /**
-   * For a mediation-only backend, the starter Agent whose own key is the
-   * backend's provider key (an installer backend, or one added through the
-   * API under mediation). Names only; that key is never lent to another Agent.
-   */
-  starterAgent?: string;
-  starterNamespace?: string;
   /**
    * What an Agent with its own key selects to lend the starter toolbox: the
    * backend's toolbox profile and wrapper, and exactly these tools in this
@@ -333,15 +342,6 @@ export interface CellnSelection {
   clusterToolRefs?: { name: string; revision: string }[];
 }
 
-export interface CellnPermissionPreview {
-  agent: { name: string; uid: string };
-  runtime: { name: string; uid: string };
-  tools: { tool: { name: string; revision: string }; limits: CellnTool["spec"]["limits"] }[];
-  runtimeLimits: { memoryBytes: number; timeoutMillis: number; workspace: string };
-  executionAuthorized: false;
-  readiness: "not-established";
-}
-
 export interface CellnTool {
   metadata: ObjectMeta;
   spec: {
@@ -388,7 +388,6 @@ export interface ModelSpec {
   connectionRef?: string;
   connectionRevision?: string;
   protocol?: string;
-  credentialProfile?: string;
   provider?: string;
   model?: string;
   baseURL?: string;
@@ -1228,7 +1227,19 @@ export interface CapabilitiesResponse {
 
 export interface ModelConnection {
   metadata: ObjectMeta;
-  spec: { provider: string; protocol: "openai-chat" | "anthropic-messages"; endpoint: string; credentialProfile?: string; secretRef?: string; models: string[]; disabled?: boolean; allowInsecure?: boolean; parameters?: Record<string, unknown>; maxOutputTokens?: number };
+  spec: {
+    provider: string;
+    protocol: "openai-chat" | "anthropic-messages";
+    endpoint: string;
+    secretRef?: string;
+    /** Key of secretRef holding the credential; omitted, the protocol fixes it (OPENAI_API_KEY / ANTHROPIC_API_KEY). */
+    secretKey?: string;
+    models: string[];
+    disabled?: boolean;
+    allowInsecure?: boolean;
+    parameters?: Record<string, unknown>;
+    maxOutputTokens?: number;
+  };
 }
 
 export interface AgentExecutionDefaults {
@@ -1239,6 +1250,8 @@ export interface AgentExecutionDefaults {
   cellnSelection?: CellnSelection;
   provider?: string;
   model?: string;
+  /** The Agent's persona: the system prompt its Celln runs carry into the cell (at most 2048 bytes). Empty: the fleet's default. */
+  systemPrompt?: string;
 }
 
 // ── Model Density (llmfit DaemonSet telemetry) ─────────────────────────────────────
@@ -1703,7 +1716,6 @@ export const api = {
 
   cellnTools: {
     list: () => apiFetch<CellnTool[]>("/api/v1/celln-tools"),
-    preview: (agentRef: string, cellnSelection: CellnSelection, executionLifecycle?: "enduring") => apiFetch<CellnPermissionPreview>("/api/v1/celln-selection/preview", { method: "POST", body: JSON.stringify({ agentRef, cellnSelection, executionLifecycle }) }),
   },
 
   harnessSessions: {

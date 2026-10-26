@@ -12,6 +12,15 @@ export interface WizardExecution {
   modelConnectionRef?: string;
   /** Budget a platform profile suggests for one conversation (within its policy ceilings). */
   enduringDefaults?: EnduringLimits;
+  /** The Agent's persona (execution.systemPrompt); empty keeps the fleet's default. */
+  systemPrompt?: string;
+}
+
+/** A cell accepts at most this many bytes of system prompt (api MaxCellnSystemPromptBytes). */
+export const MAX_CELLN_SYSTEM_PROMPT_BYTES = 2048;
+
+export function systemPromptBytes(prompt: string): number {
+  return new TextEncoder().encode(prompt).length;
 }
 
 /**
@@ -57,6 +66,7 @@ export function executionFromWizard(form: WizardExecution): AgentExecutionDefaul
     ...(form.executionLifecycle === "enduring" ? {
       enduring: { ...(form.enduringDefaults || LEGACY_ENDURING_DEFAULTS) },
     } : {}),
+    ...(form.systemPrompt?.trim() ? { systemPrompt: form.systemPrompt.trim() } : {}),
   };
 }
 

@@ -34,7 +34,7 @@ are in the `sympozium.ai/v1alpha1` API group.
 | `CellnRuntimeProfile` | Cluster | Immutable, operator-published runtime revision: executable hashes, lifecycles, ceilings and the native parent/worker material for the fleet |
 | `CellnExecutionPolicy` | Cluster | Which namespaces may run which profiles, tools and model routes, with lease/turn/request/token ceilings |
 | `ClusterCellnTool` | Cluster | Shared, immutable tool revision lent to cells (brokered tools and commands borrowed from pinned images; `spec.sourceImage`) |
-| `CellnTool` | Namespaced | Legacy namespaced tool catalogue metadata, published by `sympozium celln-tool approve` |
+| `CellnTool` | Namespaced | Legacy namespaced tool metadata from the pre-0.12 catalogue; nothing publishes or executes it any more (the fleet lends `ClusterCellnTool`s) |
 | `CellnToolSubmission` | Namespaced | Untrusted request to publish a tool; creating it approves nothing |
 
 The [Celln fleet installer](../guides/celln-fleet-installation.md) creates

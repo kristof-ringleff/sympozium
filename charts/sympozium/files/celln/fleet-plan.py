@@ -5,6 +5,12 @@ Usage: fleet-plan.py PACKAGE PACKAGE_HASH PRINCIPAL BACKEND OUTPUT
 Reads FLEET_BACKENDS, FLEET_SCOPE, FLEET_LIMIT_* and FLEET_HTTPS_HOSTS from
 the environment and prints the plan as one JSON line.
 
+A backend without an endpoint is model-free: its plan names neither a model
+connection nor a credential file, the node calls no model and holds no key,
+and every run brings its own route through the gateway. (Celln v0.5.34 and
+earlier read such a plan as the DeepSeek default and required the credential;
+the fleet image carries a newer Celln.)
+
 A backend's model parameters join the plan only when it has some: a plan
 without them is byte-identical to the one built before parameters existed,
 and a Celln up to v0.5.22 refuses a plan that names them.
@@ -34,7 +40,12 @@ def build(package, package_hash, principal, name, output, environ):
     backend = next(b for b in json.loads(environ["FLEET_BACKENDS"]) if b["name"] == name)
     scope = environ["FLEET_SCOPE"]
     plan = {"apiVersion": "celln.native-starter-config/v1", "package": package, "packageHash": package_hash,
-            "principal": principal, "credentialFile": backend["credentialFile"], "output": output}
+            "principal": principal}
+    if backend.get("endpoint"):
+        # Keyed before output, so a keyed backend's plan keeps the bytes it
+        # always had; a model-free plan simply lacks the key.
+        plan["credentialFile"] = backend["credentialFile"]
+    plan["output"] = output
     if backend.get("endpoint"):
         # The operator's model route; Celln validates it again before configuring.
         plan["modelConnection"] = {
@@ -79,6 +90,9 @@ if __name__ == "__main__":
     if len(sys.argv) == 3 and sys.argv[1] == "--has-parameters":
         backend = next(b for b in json.loads(os.environ["FLEET_BACKENDS"]) if b["name"] == sys.argv[2])
         sys.exit(0 if backend.get("parameters") else 1)
+    if len(sys.argv) == 3 and sys.argv[1] == "--model-free":
+        backend = next(b for b in json.loads(os.environ["FLEET_BACKENDS"]) if b["name"] == sys.argv[2])
+        sys.exit(0 if not backend.get("endpoint") else 1)
     if len(sys.argv) == 3 and sys.argv[1] == "--has-max-output-tokens":
         backend = next(b for b in json.loads(os.environ["FLEET_BACKENDS"]) if b["name"] == sys.argv[2])
         sys.exit(0 if max_output_tokens(backend) is not None else 1)

@@ -43,18 +43,19 @@ import {
   Info,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
-import { providersForPlane } from "@/lib/creation";
+import { providersForPlane, type ExecutionPlane } from "@/lib/creation";
 import { PlanePicker } from "@/components/plane-picker";
+import { CellnFleetSetup } from "@/components/celln-fleet-setup";
 import { CellnKeyStep, CellnModelStep, CellnRouteStep, OwnKeyProgress } from "@/components/celln-own-key";
 import { useCapabilities, useModels, useCellnMediation, useCellnPlatformProfiles } from "@/hooks/use-api";
 import { persistentHarnesses, persistentHarnessName } from "@/lib/persistent-harness";
-import { modelConnectionName, modelConnectionEndpoint, describeEnduringLimits } from "@/lib/agent-execution";
-import { OwnKeyError, ownKeyConnectionSpec, defaultEndpointPath, httpsOrigin, initialModelFor, routeAllowsModel, enduringForOutputTokens, keyChoiceReady, managedSecretName, prepareOwnKeyBackend, profileForRoute, ownKeySelection, type KeyChoice, type OwnKeyStep } from "@/lib/celln-own-key";
+import { modelConnectionName, modelConnectionEndpoint, describeEnduringLimits, systemPromptBytes, MAX_CELLN_SYSTEM_PROMPT_BYTES } from "@/lib/agent-execution";
+import { OwnKeyError, ownKeyConnectionSpec, initialModelFor, routeAllowsModel, enduringForOutputTokens, keyChoiceReady, managedSecretName, prepareOwnKeyBackend, ownKeySelection, type KeyChoice, type OwnKeyStep } from "@/lib/celln-own-key";
+import { cellnPreset, originStatus, presetPath, routeFromSelection, type CellnProviderSelection } from "@/lib/celln-providers";
 import { parseMaxOutputTokens, parseModelParameters } from "@/lib/model-parameters";
-import { api, getNamespace } from "@/lib/api";
-import { Link } from "react-router-dom";
+import { api } from "@/lib/api";
 import type { WizardExecution } from "@/lib/agent-execution";
-import type { AgentRuntime, SympoziumPolicy, CellnSelection, CellnMediatedRoute, ModelConnection } from "@/lib/api";
+import type { AgentRuntime, SympoziumPolicy, CellnSelection, ModelConnection } from "@/lib/api";
 import {
   YamlModal,
   instanceYamlFromWizard,
@@ -235,6 +236,8 @@ export interface WizardResult {
   executionBackend?: "job" | "celln";
   /** Default Celln lifecycle when executionBackend is celln. */
   executionLifecycle?: "one-shot" | "enduring";
+  /** The Agent's persona (execution.systemPrompt) for a Celln Agent; empty keeps the fleet's default. */
+  systemPrompt?: string;
   /** Immutable catalogue revisions requested as defaults; never permission grants. */
   borrowedTools?: CellnSelection["toolRefs"];
   /** Shared platform catalogue revisions when the runtime is a profile wrapper. */
@@ -299,9 +302,9 @@ function stepsForMode(
       return [
         "name",
         "plane",
-        // A Celln Agent owns its model backend: the operator's declared
-        // provider, this Agent's key and one of the route's models. Its runtime
-        // and starter toolbox are the fleet's (lent by the policy), so there is
+        // A Celln Agent owns its model backend: a provider and endpoint of
+        // its choosing, this Agent's key and a model name. Its runtime and
+        // starter toolbox are the fleet's (lent by the policy), so there is
         // no runtime, tool or SkillPack to choose.
         ...(celln
           ? ["provider", "apikey", "model"]
@@ -597,7 +600,9 @@ export function OnboardingWizard({
   const persistentRuntimes = persistentHarnesses(availableRuntimes);
   // The fleet's runtime profiles the namespace's policy admits. A Celln Agent
   // runs on one of them; its runtime wrapper is created on completion.
-  const platformProfiles = useCellnPlatformProfiles(mode === "agent");
+  // While an operator installs the fleet, poll until its profiles reach the namespace.
+  const [watchingFleet, setWatchingFleet] = useState(false);
+  const platformProfiles = useCellnPlatformProfiles(mode === "agent", watchingFleet ? 5_000 : false);
   const fleetAvailable = (platformProfiles.data || []).length > 0;
   const defaultRuntimeRef = availableRuntimes.some(
     (runtime) => runtime.metadata.name === defaults?.runtimeRef,
@@ -670,36 +675,76 @@ export function OnboardingWizard({
   }, [open, runtimeImplicit, singleRuntimeRef, form.runtimeRef, incompatibleSkillsKey]);
   const selectedRuntime = persistentRuntimes.find((runtime) => runtime.metadata.name === form.runtimeRef);
   const steps = stepsForMode(mode, celln, creationKind === "agent", runtimeImplicit);
-  // A Celln Agent's own model backend: a provider route the operator declared
-  // for this namespace, this Agent's key, and one of the route's models. The
-  // pasted key lives here, outside the form, so it never reaches the YAML
-  // preview or the Agent request; it goes to the API once, on completion.
+  // A Celln Agent's own model backend: a provider preset or endpoint of the
+  // user's choosing (the connection is the route; the namespace's policy only
+  // guards its origin), this Agent's key, and a model name. The pasted key
+  // lives here, outside the form, so it never reaches the YAML preview or the
+  // Agent request; it goes to the API once, on completion.
   const mediation = useCellnMediation(celln);
-  const [cellnRoute, setCellnRoute] = useState<CellnMediatedRoute>();
+  const [cellnSelection, setCellnSelection] = useState<CellnProviderSelection>();
+  const cellnRoute = useMemo(() => routeFromSelection(cellnSelection, mediation.data), [cellnSelection, mediation.data]);
   const [cellnKey, setCellnKey] = useState<KeyChoice>({ mode: "create", apiKey: "" });
-  const [cellnOrigin, setCellnOrigin] = useState("");
+  const cellnOrigin = cellnRoute?.endpointOrigins[0] || "";
+  const cellnOriginStatus = cellnRoute && mediation.data ? originStatus(cellnOrigin, mediation.data) : undefined;
   const [cellnPath, setCellnPath] = useState("");
   const [cellnParameters, setCellnParameters] = useState("");
   const [cellnMaxOutputTokens, setCellnMaxOutputTokens] = useState("");
   const [cellnFailure, setCellnFailure] = useState<{ error: string; steps: OwnKeyStep[] } | null>(null);
   const cellnSecretName = !cellnRoute || cellnRoute.auth === "none" ? "" : cellnKey.mode === "existing" ? cellnKey.secretName : managedSecretName(modelConnectionName(form.name), cellnRoute.provider);
-  const cellnProfile = cellnRoute ? profileForRoute(cellnRoute, platformProfiles.data || []) : undefined;
+  // The fleet offers the namespace its runtime profile; every profile is
+  // mediation-only (no model of its own), so the first one is the Agent's.
+  const cellnProfile = (platformProfiles.data || [])[0];
   const cellnParsedParameters = parseModelParameters(cellnParameters);
   const cellnParsedTokens = parseMaxOutputTokens(cellnMaxOutputTokens);
   const cellnEnduring = cellnProfile ? enduringForOutputTokens(cellnProfile, cellnParsedTokens.maxOutputTokens) : undefined;
-  function chooseCellnRoute(route: CellnMediatedRoute) {
-    setCellnRoute(route);
-    setCellnOrigin(route.endpointOrigins[0] || "");
-    setCellnPath(defaultEndpointPath(route.protocol));
+  function chooseCellnProvider(selection: CellnProviderSelection) {
+    const preset = cellnPreset(selection.preset);
+    const changedProvider = selection.preset !== cellnSelection?.preset;
+    setCellnSelection(selection);
+    if (preset) setCellnPath(presetPath(preset, selection.endpoint, selection.protocol));
+    setCellnFailure(null);
+    if (!changedProvider) return;
     // A key or Secret chosen for another provider is not carried over.
     setCellnKey({ mode: "create", apiKey: "" });
-    setCellnFailure(null);
-    setForm((current) => ({ ...current, provider: route.provider, model: initialModelFor(route) }));
+    const route = routeFromSelection(selection, mediation.data);
+    setForm((current) => ({ ...current, provider: selection.preset, model: route ? initialModelFor(route) : "" }));
   }
+  function choosePlane(plane: ExecutionPlane) {
+    if (plane === form.executionBackend) return;
+    setCellnSelection(undefined);
+    setCellnKey({ mode: "create", apiKey: "" });
+    setCellnFailure(null);
+    setForm({
+      ...form,
+      // The Celln runtime is the fleet's, bound on completion.
+      runtimeRef: plane === "celln" ? "" : persistentRuntimes.some((runtime) => runtime.metadata.name === form.runtimeRef) ? form.runtimeRef : "",
+      skills: plane === "celln" ? [] : form.skills,
+      borrowedTools: [],
+      executionBackend: plane,
+      executionLifecycle: plane === "celln" ? "enduring" : "one-shot",
+      modelConnectionRef: undefined,
+      // A Celln provider and model are chosen on its own Provider step.
+      provider: plane === "celln" ? "" : form.provider || "openai",
+      model: plane === "celln" ? "" : form.model || "gpt-4o",
+      apiKey: plane === "celln" ? "" : form.apiKey,
+      secretName: plane === "celln" ? "" : form.secretName,
+      baseURL: plane === "celln" ? "" : form.baseURL,
+      modelRef: plane === "celln" ? undefined : form.modelRef,
+      agentSandboxEnabled: plane === "celln" ? false : form.agentSandboxEnabled,
+      channels: plane === "celln" ? [] : form.channels,
+      heartbeatInterval: plane === "celln" ? "" : form.heartbeatInterval,
+    });
+  }
+  // The fleet an operator was installing has reached the namespace: continue on it.
+  useEffect(() => {
+    if (!watchingFleet || !fleetAvailable) return;
+    setWatchingFleet(false);
+    choosePlane("celln");
+  }, [watchingFleet, fleetAvailable]);
   const compatibleRuntime = celln ? !!cellnProfile : !form.runtimeRef || !!selectedRuntime?.spec.image;
   // Provider choices come from the shared creation model so the Run dialog and
   // this wizard can never drift into showing a provider the plane cannot reach.
-  // (The Celln plane lists the same providers through CellnRouteStep.)
+  // (The Celln plane has its own provider presets: lib/celln-providers.ts.)
   const providerChoices = useMemo(
     () =>
       providersForPlane(PROVIDERS, {
@@ -791,8 +836,8 @@ export function OnboardingWizard({
       case "runtime":
         return !!form.runtimeRef && compatibleRuntime;
       case "provider":
-        // Only a declared route, on a profile its policy admits, can run.
-        if (celln) return !!cellnRoute && !!cellnProfile;
+        // Only an origin the policy admits, on the fleet's offered profile, can run.
+        if (celln) return !!cellnRoute && cellnOriginStatus === "allowed" && !!cellnProfile;
         return !!form.provider;
       case "plane":
         return true;
@@ -815,7 +860,7 @@ export function OnboardingWizard({
           return !!form.secretName || !!form.awsRegion;
         return !!form.secretName || !!form.apiKey;
       case "model":
-        if (celln) return !!cellnRoute && routeAllowsModel(cellnRoute, form.model) && (cellnRoute.open ? !!httpsOrigin(cellnOrigin) : cellnRoute.endpointOrigins.includes(cellnOrigin)) && cellnPath.startsWith("/") && !cellnParsedParameters.error && !cellnParsedTokens.error;
+        if (celln) return !!cellnRoute && routeAllowsModel(cellnRoute, form.model) && cellnRoute.endpointOrigins.includes(cellnOrigin) && cellnPath.startsWith("/") && !cellnParsedParameters.error && !cellnParsedTokens.error;
         return !!form.model;
       case "skills":
         return !form.runtimeRef || !form.skills.some((skill) => harnessIncompatibleSkills.includes(skill));
@@ -894,7 +939,7 @@ export function OnboardingWizard({
     try {
       const prepared = await prepareOwnKeyBackend({
         connectionName: modelConnectionName(result.name),
-        selection: { route: cellnRoute, origin: cellnRoute.open ? httpsOrigin(cellnOrigin) : cellnOrigin, path: cellnPath, model: result.model, parameters: cellnParsedParameters.parameters, maxOutputTokens: cellnParsedTokens.maxOutputTokens },
+        selection: { route: cellnRoute, origin: cellnOrigin, path: cellnPath, model: result.model, parameters: cellnParsedParameters.parameters, maxOutputTokens: cellnParsedTokens.maxOutputTokens },
         key: cellnKey,
         profile: cellnProfile,
         agentName: result.name,
@@ -985,7 +1030,7 @@ export function OnboardingWizard({
 
   // Reset form when defaults change (new wizard opened)
   function resetWith(d: Partial<WizardResult>) {
-    setCellnRoute(undefined);
+    setCellnSelection(undefined);
     setCellnKey({ mode: "create", apiKey: "" });
     setCellnParameters("");
     setCellnMaxOutputTokens("");
@@ -1180,45 +1225,20 @@ export function OnboardingWizard({
                 kind="harness"
                 value={form.executionBackend || "job"}
                 disabledPlanes={fleetAvailable ? [] : ["celln"]}
-                disabledHint={{ celln: "Needs the Celln fleet (sympozium install --celln-fleet …); the one-shot router alone does not run parents" }}
-                onChange={(plane) => {
-                  if (plane === form.executionBackend) return;
-                  setCellnRoute(undefined);
-                  setCellnKey({ mode: "create", apiKey: "" });
-                  setCellnFailure(null);
-                  setForm({
-                    ...form,
-                    // The Celln runtime is the fleet's, bound on completion.
-                    runtimeRef: plane === "celln" ? "" : persistentRuntimes.some((runtime) => runtime.metadata.name === form.runtimeRef) ? form.runtimeRef : "",
-                    skills: plane === "celln" ? [] : form.skills,
-                    borrowedTools: [],
-                    executionBackend: plane,
-                    executionLifecycle: plane === "celln" ? "enduring" : "one-shot",
-                    modelConnectionRef: undefined,
-                    // A Celln provider and model come from a declared route only.
-                    provider: plane === "celln" ? "" : form.provider || "openai",
-                    model: plane === "celln" ? "" : form.model || "gpt-4o",
-                    apiKey: plane === "celln" ? "" : form.apiKey,
-                    secretName: plane === "celln" ? "" : form.secretName,
-                    baseURL: plane === "celln" ? "" : form.baseURL,
-                    modelRef: plane === "celln" ? undefined : form.modelRef,
-                    agentSandboxEnabled: plane === "celln" ? false : form.agentSandboxEnabled,
-                    channels: plane === "celln" ? [] : form.channels,
-                    heartbeatInterval: plane === "celln" ? "" : form.heartbeatInterval,
-                  });
-                }}
+                disabledHint={{ celln: "Needs the Celln fleet, which sympozium install deploys on nodes labeled celln.dev/kvm=true" }}
+                onChange={choosePlane}
               />
               {form.executionBackend === "job" && persistentRuntimes.length === 0 && (
                 <p role="status" className="text-xs text-amber-500">No persistent Pi or Hermes harness is installed in this namespace. Install the default harnesses{fleetAvailable ? ", or choose Celln parent" : ""}.</p>
               )}
               {!fleetAvailable && !platformProfiles.isLoading && (
-                <p role="status" className="text-xs text-amber-500">The <strong>Celln parent</strong> plane runs the native harness inside a hardware-isolated cell on the Celln fleet. This cluster has no fleet this namespace may use yet: the plain install only deploys the one-shot router that powers <strong>New Run → Celln cell</strong>. An operator installs the fleet with <code className="break-all">sympozium install --celln-fleet …</code>; nodes with KVM join by themselves. See the <a className="underline" href="https://github.com/sympozium-ai/sympozium/blob/main/docs/guides/celln-fleet-installation.md" target="_blank" rel="noreferrer">fleet installation guide</a>. Pi and Hermes run on the Kubernetes plane.</p>
+                <CellnFleetSetup watching={watchingFleet} onWatch={setWatchingFleet} />
               )}
               {form.executionBackend === "celln" && (
                 <div className="space-y-2 rounded-md border p-3">
                   <Label>Enduring Celln parent</Label>
                   <p className="text-xs text-muted-foreground">
-                    This Agent owns its model backend: next you choose a provider, give the Agent its own key, and pick a model, as for any other Agent. Nothing is shared with another Agent. It gets the fleet's starter toolbox (run workspace files and public HTTPS web tools); SkillPacks, borrowed tools, channels and heartbeats are not part of a Celln Agent. {capabilities?.celln?.available ? capabilities.celln.reason : `Celln readiness: ${capabilities?.celln?.state || "unknown"} — ${capabilities?.celln?.reason || "not confirmed"}.`}
+                    This Agent owns its model backend: next you choose its provider and endpoint (any OpenAI- or Anthropic-compatible one the namespace's policy admits), give the Agent its own key, and name the model. Nothing is shared with another Agent, and Celln itself holds no model. It gets the fleet's starter toolbox (run workspace files and public HTTPS web tools); SkillPacks, borrowed tools, channels and heartbeats are not part of a Celln Agent. {capabilities?.celln?.available ? capabilities.celln.reason : `Celln readiness: ${capabilities?.celln?.state || "unknown"} — ${capabilities?.celln?.reason || "not confirmed"}.`}
                   </p>
                 </div>
               )}
@@ -1233,21 +1253,12 @@ export function OnboardingWizard({
             isLoading={mediation.isLoading}
             error={mediation.isError ? (mediation.error instanceof Error ? mediation.error.message : "request failed") : undefined}
             providers={PROVIDERS}
-            selected={cellnRoute}
-            onSelect={chooseCellnRoute}
+            selection={cellnSelection}
+            onSelect={chooseCellnProvider}
           />
         )}
         {step === "provider" && celln && cellnRoute && !cellnProfile && !platformProfiles.isLoading && (
-          <p role="alert" className="text-xs text-red-400">No fleet runtime profile {cellnRoute.policy ? <>of policy <code>{cellnRoute.policy}</code> </> : ""}is offered to this namespace, so an Agent on this provider could not run. Ask the operator to check the policy with <code>sympozium doctor</code>.</p>
-        )}
-        {step === "provider" && celln && cellnProfile?.mediationOnly && (
-          <p className="text-xs text-muted-foreground" data-testid="celln-starter-agent-note">
-            Fleet backend <code>{cellnProfile.backend}</code> holds no key on any node: under mediated model access its provider key is the own key of its starter Agent
-            {cellnProfile.starterAgent ? (
-              <> {cellnProfile.starterNamespace === getNamespace() ? <Link to={`/agents/${cellnProfile.starterAgent}`} className="underline" data-testid="celln-starter-agent-link">{cellnProfile.starterAgent}</Link> : <code>{cellnProfile.starterAgent}</code>} in namespace <code>{cellnProfile.starterNamespace}</code></>
-            ) : null}
-            , and no other Agent may use it. Use that Agent, or give this one its own key below.
-          </p>
+          <p role="alert" className="text-xs text-red-400" data-testid="celln-no-profile">No fleet runtime profile is offered to this namespace, so an Agent could not run here. Ask the operator to check the fleet's execution policy with <code>sympozium doctor</code>.</p>
         )}
         {step === "provider" && !celln && (
           <div className="space-y-4">
@@ -1627,12 +1638,15 @@ export function OnboardingWizard({
 
         {/* ── Model step ────────────────────────────────────────────── */}
         {step === "model" && celln && cellnRoute && (
+          // Bounded like the other steps: with the advanced parameters open and
+          // the persona below, this step outgrows the dialog and would push the
+          // footer out of view.
+          <div className="max-h-[60vh] space-y-4 overflow-y-auto pr-1">
           <CellnModelStep
             route={cellnRoute}
             model={form.model}
             onModel={(model) => setForm({ ...form, model })}
             origin={cellnOrigin}
-            onOrigin={setCellnOrigin}
             path={cellnPath}
             onPath={setCellnPath}
             parameters={cellnParameters}
@@ -1640,6 +1654,20 @@ export function OnboardingWizard({
             maxOutputTokens={cellnMaxOutputTokens}
             onMaxOutputTokens={setCellnMaxOutputTokens}
           />
+          <div className="space-y-1" data-testid="celln-persona">
+            <Label className="text-xs">Persona (optional)</Label>
+            <Textarea
+              rows={3}
+              value={form.systemPrompt || ""}
+              onChange={(e) => setForm({ ...form, systemPrompt: e.target.value })}
+              placeholder={cellnProfile?.systemPrompt || "System prompt this Agent carries into its cell"}
+            />
+            <p className="text-xs text-muted-foreground">
+              The system prompt every run of this Agent carries into its cell; leave empty for the fleet's default. {systemPromptBytes(form.systemPrompt || "")}/{MAX_CELLN_SYSTEM_PROMPT_BYTES} bytes.
+            </p>
+            {systemPromptBytes(form.systemPrompt || "") > MAX_CELLN_SYSTEM_PROMPT_BYTES && <p role="alert" className="text-xs text-red-400">A cell accepts at most {MAX_CELLN_SYSTEM_PROMPT_BYTES} bytes.</p>}
+          </div>
+          </div>
         )}
         {step === "model" && !celln && (
           <div className="space-y-2">
@@ -2072,7 +2100,7 @@ export function OnboardingWizard({
 
         {/* ── Confirm step ──────────────────────────────────────────── */}
         {step === "confirm" && (
-          <div className="space-y-3">
+          <div className="max-h-[55vh] space-y-3 overflow-y-auto pr-1">
             <div className="rounded-lg border border-blue-500/20 bg-blue-500/5 p-4 space-y-2 text-sm">
               {mode === "agent" && (
                 <div className="flex justify-between">
@@ -2085,13 +2113,13 @@ export function OnboardingWizard({
                 {!celln && form.runtimeRef && <p>Model connection: {form.provider} / {form.model} (saved for this harness)</p>}
                 {celln && cellnRoute && <div className="space-y-1 text-xs" data-testid="celln-own-key-confirmation">
                   <p className="text-sm">This Agent's own model backend</p>
-                  <p>Provider: {cellnRoute.provider} ({cellnRoute.protocol}), declared in policy <code>{cellnRoute.policy}</code></p>
-                  <p>Endpoint: <span className="break-all font-mono">{cellnOrigin}{cellnPath}</span></p>
-                  <p>Key: {cellnRoute.auth === "none" ? "Not required — keyless route" : cellnKey.mode === "create"
-                    ? <>a new Secret <code>{cellnSecretName}</code> holding <code>{cellnRoute.secretKey}</code></>
-                    : <>existing Secret <code>{cellnKey.secretName}</code> (<code>{cellnRoute.secretKey}</code>)</>}</p>
+                  <p>Provider: {cellnRoute.provider} ({cellnRoute.protocol}){cellnRoute.policy ? <>; origin admitted by policy <code>{cellnRoute.policy}</code></> : ""}</p>
+                  <p>Endpoint origin: <span className="break-all font-mono" data-testid="celln-confirm-origin">{cellnOrigin}</span>{cellnRoute.allowInsecure ? " (plain HTTP, allowInsecure)" : ""}; request <span className="break-all font-mono">{cellnOrigin}{cellnPath}</span></p>
+                  <p>Key: {cellnRoute.auth === "none" ? "Not required — keyless endpoint" : cellnKey.mode === "create"
+                    ? <>a new Secret <code>{cellnSecretName}</code> holding <code>{cellnRoute.secretKey}</code>, pinned to {cellnOrigin}</>
+                    : <>existing Secret <code>{cellnKey.secretName}</code> (<code>{cellnRoute.secretKey}</code>), pinned to {cellnOrigin}</>}</p>
                   <p>Model connection: <code>{modelConnectionName(form.name)}</code>{cellnParsedTokens.maxOutputTokens ? `, up to ${cellnParsedTokens.maxOutputTokens} output tokens per request` : ""}{cellnParsedParameters.parameters ? ", with model parameters" : ""}</p>
-                  <p>Runtime: <code>{cellnProfile && ownKeySelection(cellnProfile).wrapper}</code> (the fleet's; created in this namespace if missing)</p>
+                  <p>Runtime wrapper: <code>{cellnProfile && ownKeySelection(cellnProfile).wrapper}</code> (the fleet's runtime profile <code>{cellnProfile?.name}</code>; created in this namespace if missing)</p>
                   {cellnEnduring && <p className="text-muted-foreground">One conversation: {describeEnduringLimits(cellnEnduring)}. Starter tools: {(cellnProfile ? ownKeySelection(cellnProfile).tools : []).map((tool) => tool.name).join(", ") || "none"}. Context and workspace files are lost with the parent.</p>}
                 </div>}
               </div>}

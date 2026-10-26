@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	"os"
 	"reflect"
 	"strings"
@@ -94,7 +95,6 @@ func newPlatformFixture(t *testing.T, namespace string, model bool) platformFixt
 			RuntimeProfiles:   []api.CellnExecutionPolicyRuntime{{Ref: api.CellnRuntimeProfileRef{Name: profile.Name, Revision: "v1"}, Limits: limits}},
 			Tools:             []api.CellnExecutionPolicyTool{{Ref: api.ClusterCellnToolRef{Name: tool.Name, Revision: "v1"}, Limits: toolPolicyLimits}},
 			Lifecycles:        []string{"direct-one-shot", "harness-one-shot", "enduring"},
-			Routes:            []api.CellnExecutionPolicyRoute{{Provider: "openai", Protocol: "openai-chat", Models: []string{"gpt-test"}, EndpointOrigins: []string{"https://model.example"}, Auth: "secret"}},
 			Ceilings:          api.CellnExecutionPolicyCeilings{MaxTurns: 4, MaxModelRequests: 8, MaxOutputTokens: 4096, MaxParentLeaseSeconds: 300, MaxTurnSeconds: 60},
 		}}
 	}
@@ -130,12 +130,6 @@ func TestPlatformResolverAllowsExplicitPrivateTLSCredentialRoute(t *testing.T) {
 	if err := f.client.List(ctx, &policies); err != nil || len(policies.Items) != 2 {
 		t.Fatalf("policy list: count=%d err=%v", len(policies.Items), err)
 	}
-	for i := range policies.Items {
-		policies.Items[i].Spec.Routes[0].EndpointOrigins = []string{"https://127.0.0.1:9443"}
-		if err := f.client.Update(ctx, &policies.Items[i]); err != nil {
-			t.Fatal(err)
-		}
-	}
 	resolved, err := f.resolver.Resolve(ctx, f.runKey, PlatformResolveRequest{ClusterID: "cluster", Now: f.now, AdmissionWindow: time.Minute, Operation: "execution.start"})
 	if err != nil {
 		t.Fatal(err)
@@ -152,7 +146,11 @@ func TestPlatformResolverAllowsExplicitPrivateTLSCredentialRoute(t *testing.T) {
 	}
 }
 
-func TestPlatformResolverKeylessLANRequiresPolicyApproval(t *testing.T) {
+// A keyless connection is its own route: the tenant's allowInsecure admits a
+// plain-HTTP LAN model at the resolver (the gateway still needs the operator's
+// listing of that private origin before it connects), and the policy's origin
+// guardrail is the operator's say over where any own connection may go.
+func TestPlatformResolverKeylessLANIsTheConnectionsRoute(t *testing.T) {
 	f := newPlatformFixture(t, "keyless-lan-route", true)
 	ctx := context.Background()
 	var connection api.ModelConnection
@@ -165,108 +163,45 @@ func TestPlatformResolverKeylessLANRequiresPolicyApproval(t *testing.T) {
 	if err := f.client.Update(ctx, &connection); err != nil {
 		t.Fatal(err)
 	}
-	var policies api.CellnExecutionPolicyList
-	if err := f.client.List(ctx, &policies); err != nil {
-		t.Fatal(err)
-	}
-	for i := range policies.Items {
-		policies.Items[i].Spec.Routes[0].Auth = "none"
-		policies.Items[i].Spec.Routes[0].EndpointOrigins = []string{"http://192.168.1.237:8080"}
-		if err := f.client.Update(ctx, &policies.Items[i]); err != nil {
-			t.Fatal(err)
-		}
-	}
 	request := PlatformResolveRequest{ClusterID: "cluster", Now: f.now, AdmissionWindow: time.Minute, Operation: "execution.start"}
-	if _, err := f.resolver.Resolve(ctx, f.runKey, request); PlatformReason(err) != ReasonRouteMismatch {
-		t.Fatalf("tenant-only approval accepted: %v", err)
-	}
-	for i := range policies.Items {
-		policies.Items[i].Spec.Routes[0].AllowInsecure = true
-		if err := f.client.Update(ctx, &policies.Items[i]); err != nil {
-			t.Fatal(err)
-		}
-	}
 	resolved, err := f.resolver.Resolve(ctx, f.runKey, request)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resolved.Decision.Route.Auth != "none" || resolved.Decision.Route.CredentialSource != nil {
+	if resolved.Decision.Route.Auth != "none" || resolved.Decision.Route.CredentialSource != nil || resolved.Decision.Route.EndpointOrigin != "http://192.168.1.237:8080" {
 		t.Fatalf("unexpected keyless route: %+v", resolved.Decision.Route)
 	}
-}
-
-// Open model access admits an Agent's own public HTTPS route that no policy
-// declares; "declared" on any one selecting policy takes that back, and plain
-// HTTP or a private origin never rides on open access.
-func TestPlatformResolverOpenModelAccess(t *testing.T) {
-	f := newPlatformFixture(t, "open-access", true)
-	ctx := context.Background()
-	var connection api.ModelConnection
-	if err := f.client.Get(ctx, types.NamespacedName{Namespace: f.runKey.Namespace, Name: "model"}, &connection); err != nil {
-		t.Fatal(err)
+	setOrigins := func(allowed, denied []string) {
+		var policies api.CellnExecutionPolicyList
+		if err := f.client.List(ctx, &policies); err != nil {
+			t.Fatal(err)
+		}
+		for i := range policies.Items {
+			policies.Items[i].Spec.AllowedOrigins, policies.Items[i].Spec.DeniedOrigins = allowed, denied
+			if err := f.client.Update(ctx, &policies.Items[i]); err != nil {
+				t.Fatal(err)
+			}
+		}
 	}
-	connection.Spec.Provider = "anthropic"
-	connection.Spec.Protocol = "anthropic-messages"
-	connection.Spec.Endpoint = "https://api.anthropic.com/v1/messages"
-	connection.Spec.Models = []string{"claude-undeclared"}
-	if err := f.client.Update(ctx, &connection); err != nil {
-		t.Fatal(err)
+	setOrigins(nil, []string{"192.168.1.237:8080"})
+	if _, err := f.resolver.Resolve(ctx, f.runKey, request); PlatformReason(err) != ReasonRouteMismatch || !strings.Contains(err.Error(), "denies") {
+		t.Fatalf("denied origin admitted: %v", err)
 	}
-	var run api.AgentRun
-	if err := f.client.Get(ctx, f.runKey, &run); err != nil {
-		t.Fatal(err)
+	setOrigins([]string{"*.openai.com"}, nil)
+	if _, err := f.resolver.Resolve(ctx, f.runKey, request); PlatformReason(err) != ReasonRouteMismatch || !strings.Contains(err.Error(), "only to *.openai.com") {
+		t.Fatalf("origin outside the allow-list admitted: %v", err)
 	}
-	run.Spec.Model.Model = "claude-undeclared"
-	if err := f.client.Update(ctx, &run); err != nil {
-		t.Fatal(err)
-	}
-	var agent api.Agent
-	if err := f.client.Get(ctx, types.NamespacedName{Namespace: f.runKey.Namespace, Name: "agent"}, &agent); err != nil {
-		t.Fatal(err)
-	}
-	agent.Spec.AuthRefs = []api.SecretRef{{Provider: "anthropic", Secret: "model-secret"}}
-	if err := f.client.Update(ctx, &agent); err != nil {
-		t.Fatal(err)
-	}
-	request := PlatformResolveRequest{ClusterID: "cluster", Now: f.now, AdmissionWindow: time.Minute, Operation: "execution.start"}
-	resolved, err := f.resolver.Resolve(ctx, f.runKey, request)
-	if err != nil {
-		t.Fatalf("open access refused an undeclared public route: %v", err)
-	}
-	if got := resolved.Decision.Route; got.Provider != "anthropic" || got.Model != "claude-undeclared" || got.EndpointOrigin != "https://api.anthropic.com" || got.Auth != "secret" || got.CredentialSourceRef == nil || got.CredentialSourceRef.SecretKey != "ANTHROPIC_API_KEY" {
-		t.Fatalf("unexpected open route: %+v", got)
-	}
-
-	// A private origin needs the operator's route even with open access.
-	connection.Spec.Endpoint = "https://10.0.0.5/v1/messages"
-	connection.Spec.AllowInsecure = true
-	if err := f.client.Update(ctx, &connection); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := f.resolver.Resolve(ctx, f.runKey, request); PlatformReason(err) != ReasonRouteMismatch {
-		t.Fatalf("private origin admitted by open access: %v", err)
-	}
-	connection.Spec.Endpoint = "https://api.anthropic.com/v1/messages"
-	connection.Spec.AllowInsecure = false
-	if err := f.client.Update(ctx, &connection); err != nil {
-		t.Fatal(err)
-	}
-
-	var policy api.CellnExecutionPolicy
-	if err := f.client.Get(ctx, types.NamespacedName{Name: "z-policy"}, &policy); err != nil {
-		t.Fatal(err)
-	}
-	policy.Spec.ModelAccess = api.CellnModelAccessDeclared
-	if err := f.client.Update(ctx, &policy); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := f.resolver.Resolve(ctx, f.runKey, request); PlatformReason(err) != ReasonRouteMismatch {
-		t.Fatalf("declared access admitted an undeclared route: %v", err)
+	setOrigins([]string{"*.openai.com", "192.168.1.237"}, nil)
+	if _, err := f.resolver.Resolve(ctx, f.runKey, request); err != nil {
+		t.Fatalf("allowed origin refused: %v", err)
 	}
 }
 
+// platformRequest is the controller's start request: it always carries the
+// run's parent incarnation (the dispatcher derives one for every scoped run);
+// a plain one-shot ignores it, a parent binds to it.
 func platformRequest(f platformFixture) PlatformResolveRequest {
-	return PlatformResolveRequest{ClusterID: "cluster-test", Now: f.now, AdmissionWindow: 60 * time.Second}
+	return PlatformResolveRequest{ClusterID: "cluster-test", Now: f.now, AdmissionWindow: 60 * time.Second, ParentIncarnation: "blake3:" + strings.Repeat("c", 64)}
 }
 
 func TestPlatformResolverBindsNamespacePolicyToolsAndRouteWithoutSecrets(t *testing.T) {
@@ -349,6 +284,74 @@ func TestPlatformResolverAllowsModelFreeDirectAndDeniesMissingRoute(t *testing.T
 	}
 	if _, err := f.resolver.Resolve(t.Context(), f.runKey, platformRequest(f)); PlatformReason(err) != ReasonRouteMismatch {
 		t.Fatalf("missing model route reason = %q, error %v", PlatformReason(err), err)
+	}
+}
+
+// The persona rides into the cell as the harness system prompt, which the
+// native harness bounds at 2048 bytes; a longer one is refused with a reason
+// instead of failing inside the cell.
+func TestPlatformResolverBoundsTheSystemPrompt(t *testing.T) {
+	f := newPlatformFixture(t, "tenant", false)
+	var run api.AgentRun
+	if err := f.client.Get(t.Context(), f.runKey, &run); err != nil {
+		t.Fatal(err)
+	}
+	run.Spec.SystemPrompt = strings.Repeat("p", api.MaxCellnSystemPromptBytes)
+	if err := f.client.Update(t.Context(), &run); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.resolver.Resolve(t.Context(), f.runKey, platformRequest(f)); err != nil {
+		t.Fatalf("a persona at the bound refused: %v", err)
+	}
+	run.Spec.SystemPrompt += "p"
+	if err := f.client.Update(t.Context(), &run); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.resolver.Resolve(t.Context(), f.runKey, platformRequest(f)); PlatformReason(err) != ReasonLimitRange {
+		t.Fatalf("oversized persona reason = %q, error %v", PlatformReason(err), err)
+	}
+}
+
+// A model-bound one-shot on a native (fleet) profile is a single-turn
+// parent: the fleet's worker runs only as a parent's turn, so the decision is
+// an enduring-initial parent with one turn, a lease that covers it, and the
+// turn's allowance as the whole run budget; the policy admits it as a
+// harness-one-shot. The controller stops the parent once it has answered.
+func TestPlatformResolverNativeOneShotIsASingleTurnParent(t *testing.T) {
+	f := newPlatformFixture(t, "tenant", true)
+	// The fleet's profile is native: its worker runs as a parent's turn.
+	var profile api.CellnRuntimeProfile
+	if err := f.client.Get(t.Context(), types.NamespacedName{Name: "json-agent-v1"}, &profile); err != nil {
+		t.Fatal(err)
+	}
+	profile.Spec.Native = &api.CellnNativeProvisioning{AdmissionWindowMs: 120000, Parent: apiextensionsv1.JSON{Raw: []byte(`{}`)}, Worker: apiextensionsv1.JSON{Raw: []byte(`{}`)}, Template: apiextensionsv1.JSON{Raw: []byte(`{}`)}, ReservedMemoryBytes: 1 << 30, TurnModelRequests: 2, TurnOutputTokens: 1024, SystemPrompt: "fleet default"}
+	if err := f.client.Update(t.Context(), &profile); err != nil {
+		t.Fatal(err)
+	}
+	request := platformRequest(f)
+	resolution, err := f.resolver.Resolve(t.Context(), f.runKey, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := resolution.Decision
+	if d.Lifecycle != "enduring-initial" || d.Parent == nil || d.Parent.Incarnation != request.ParentIncarnation || d.Parent.TurnID != nil {
+		t.Fatalf("native one-shot is not a single-turn parent: lifecycle=%s parent=%+v", d.Lifecycle, d.Parent)
+	}
+	b := d.Budget
+	if b.MaxTurns != 1 || b.ParentDeadlineUnix < b.TurnDeadlineUnix || b.ParentDeadlineUnix > b.TurnDeadlineUnix+SingleTurnParentGraceSeconds || b.RunCap != b.TurnCap || b.TurnCap.Requests < 1 {
+		t.Fatalf("single-turn parent budget: %+v", b)
+	}
+	canonical, err := d.Canonical()
+	if err != nil {
+		t.Fatal(err)
+	}
+	validateDecisionSchema(t, canonical)
+	// Without the incarnation the controller always supplies, it is refused
+	// rather than issued as a parentless worker the fleet cannot run.
+	bare := platformRequest(f)
+	bare.ParentIncarnation = ""
+	if _, err := f.resolver.Resolve(t.Context(), f.runKey, bare); PlatformReason(err) != ReasonParentTurn {
+		t.Fatalf("incarnation-less native one-shot reason = %q, error %v", PlatformReason(err), err)
 	}
 }
 

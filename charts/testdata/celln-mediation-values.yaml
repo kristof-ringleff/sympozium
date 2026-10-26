@@ -9,15 +9,9 @@ celln:
     clusterId: evaluation-cluster
     issuer:
       keyId: mediation-2026-09
-    # The providers an Agent may bring its own key for; declaring any route
-    # replaces the built-in ones (any model of openai, anthropic, deepseek).
-    # Exact provider, protocol and https://host origin (never a wildcard);
-    # exact model names, or ["*"] alone for any model.
-    routes:
-      - provider: anthropic
-        protocol: anthropic-messages
-        models: [claude-sonnet-5]
-        endpointOrigins: [https://api.anthropic.com]
+    # There is no provider route list: an Agent's ModelConnection is its
+    # route. Narrow where keys may go with allowedOrigins/deniedOrigins on
+    # the scope's CellnExecutionPolicy.
 modelGateway:
   # Build images/model-gateway and pin its digest.
   image: ghcr.io/sympozium-ai/sympozium/model-gateway@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
