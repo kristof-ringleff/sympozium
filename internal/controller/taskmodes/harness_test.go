@@ -182,7 +182,7 @@ func TestHarnessHandler_Validate_RejectsUnknownCapability(t *testing.T) {
 
 func TestHarnessHandler_Validate_RejectsUnmediatedCapabilities(t *testing.T) {
 	h := NewHarnessHandler()
-	for _, capability := range []string{CapabilityOutputSchema, CapabilitySubagents, CapabilityResume} {
+	for _, capability := range []string{CapabilityOutputSchema, CapabilitySubagents} {
 		t.Run(capability, func(t *testing.T) {
 			err := h.Validate(harnessTask(map[string]string{harnessParamCapabilities: capability}))
 			if err == nil {
@@ -192,6 +192,21 @@ func TestHarnessHandler_Validate_RejectsUnmediatedCapabilities(t *testing.T) {
 				t.Errorf("error should name %q, got: %v", capability, err)
 			}
 		})
+	}
+}
+
+// resume is the adapter's own promise to resume its session between gate attempts (see
+// docs/modes/harness-adapters.md). The platform side — the gate channel and
+// the verdict — exists, so the declaration is no longer a claim Sympozium
+// cannot back.
+func TestHarnessHandler_Validate_AcceptsResume(t *testing.T) {
+	h := NewHarnessHandler()
+	task := harnessTask(map[string]string{harnessParamCapabilities: CapabilityResume})
+	if err := h.Validate(task); err != nil {
+		t.Fatalf("Validate(resume) = %v, want nil", err)
+	}
+	if !CapabilitiesFor(h, task).Resume {
+		t.Error("a task declaring resume does not report it")
 	}
 }
 

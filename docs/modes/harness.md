@@ -188,7 +188,7 @@ task.mode "harness" does not support [toolFilter] requested by this AgentRun
 | `toolFilter` | honours `spec.toolPolicy` |
 | `persona` | honours `spec.systemPrompt` |
 | `subagents` | can spawn child runs |
-| `resume` | can be parked and resumed mid-run |
+| `resume` | resumes its session in a new pod for each response-gate attempt ([how](harness-adapters.md#resuming-between-gate-attempts-resume)) |
 
 For harness mode the descriptor is **the operator's own declaration**. Sympozium did not
 build the image and cannot inspect it, so `parameters.capabilities` is the whole basis for
@@ -413,8 +413,8 @@ spec:
 
 The controller validates the runtime and records `status.resolvedImageDigest` plus a `Ready`
 condition. The same rules as inline harness mode apply: the image must be digest-pinned, and
-`outputSchema` / `subagents` / `resume` are rejected because no external runtime can implement
-them safely yet.
+`outputSchema` / `subagents` are rejected because no external runtime can implement them
+safely yet. `resume` is accepted on `v1alpha1` runtimes only.
 
 A run references a runtime by name instead of repeating its image and capability claims:
 
@@ -488,9 +488,9 @@ OOM-killed.
 
 ### Unsupported controls
 
-Harness declarations are currently limited to `persona` and `toolFilter`. Claims for
-`outputSchema`, `subagents`, or `resume` are rejected because Sympozium has no mediated
-surface for an external process to implement them safely. `mode: server`, `dryRun`, and
+Harness declarations are currently limited to `persona`, `toolFilter`, and `resume`. Claims
+for `outputSchema` or `subagents` are rejected because Sympozium has no mediated surface for
+an external process to implement them safely. `mode: server`, `dryRun`, and
 `canaryMode` are also rejected rather than being silently handled by logic that only exists
 inside `agent-runner`.
 

@@ -304,6 +304,12 @@ func TestResolveInPlaceGate_ContinuesOnTheSameRun(t *testing.T) {
 	if !verdicts[0].Verify(testGateKey) {
 		t.Error("the published verdict is not signed with the run's gate key")
 	}
+	// agent-runner renders its own card. A field it does not know would drop
+	// out when an older runner re-encodes the verdict to check its MAC, and
+	// the verdict would never verify.
+	if verdicts[0].Card != "" {
+		t.Errorf("an agent-runner verdict carries a card: %q", verdicts[0].Card)
+	}
 }
 
 // No successor CR is created on this path: that is the whole difference from
@@ -1200,5 +1206,352 @@ func TestGateInPlace_IsOffForAHarnessRun(t *testing.T) {
 				t.Errorf("container %s mounts the gate channel", c.Name)
 			}
 		}
+	}
+}
+
+// harnessDigest is the digest of the harness image in these tests.
+var harnessDigest = "sha256:" + strings.Repeat("a", 64)
+
+// resumingHarnessTask is a harness task whose adapter declares resume: it
+// resumes its session in each attempt's new pod (docs/modes/harness-adapters.md).
+func resumingHarnessTask(t *testing.T) *sympoziumv1alpha1.TaskSpec {
+	t.Helper()
+	return objectTask(t, `{"mode":"harness","parameters":{"image":"registry.example/harness@`+harnessDigest+`","prompt":"Ship the feature","capabilities":"resume"}}`)
+}
+
+// A harness that declares resume runs each attempt in its own pod. It gets
+// the gate channel and the attempt settings, but no park timeout and never
+// the key: the model runs shell tools in that container and could read it.
+// Its HOME is a PVC, so the next attempt's pod can resume the session.
+func TestBuildJob_ResumingHarnessRunsEachAttemptInItsOwnPod(t *testing.T) {
+	r := &AgentRunReconciler{}
+	run := gatedRun("harness-resume", inPlace(&sympoziumv1alpha1.RetrySpec{MaxAttempts: 3}))
+	run.Spec.Task = resumingHarnessTask(t)
+
+	if !gateInPlaceEnabled(run) {
+		t.Fatal("a harness that declares resume does not retry in place")
+	}
+
+	job, err := r.buildJob(context.Background(), run, false, nil, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("buildJob: %v", err)
+	}
+	if got := *job.Spec.ActiveDeadlineSeconds; got != 600 {
+		t.Errorf("activeDeadlineSeconds = %d, want 600: a harness pod runs one attempt", got)
+	}
+	spec := job.Spec.Template.Spec
+	findVolume(t, spec.Volumes, gateChannelVolume)
+	home := findVolume(t, spec.Volumes, "harness-home")
+	if home.PersistentVolumeClaim == nil || home.PersistentVolumeClaim.ClaimName != harnessHomePVCName(run) {
+		t.Errorf("harness HOME = %+v, want PVC %s", home.VolumeSource, harnessHomePVCName(run))
+	}
+
+	var agent *corev1.Container
+	for i := range spec.Containers {
+		if spec.Containers[i].Name == "agent" {
+			agent = &spec.Containers[i]
+		}
+	}
+	if agent == nil {
+		t.Fatal("no agent container")
+	}
+	env := map[string]string{}
+	for _, e := range agent.Env {
+		env[e.Name] = e.Value
+	}
+	for _, name := range []string{"GATE_IN_PLACE_ENABLED", "GATE_IN_PLACE_MAX_ATTEMPTS", "GATE_IN_PLACE_START_ATTEMPT"} {
+		if env[name] == "" {
+			t.Errorf("the harness has no %s", name)
+		}
+	}
+	if _, ok := env["GATE_PARK_TIMEOUT"]; ok {
+		t.Error("the harness has a park timeout, but it never parks")
+	}
+	var mounted bool
+	for _, m := range agent.VolumeMounts {
+		if m.Name == gateChannelVolume {
+			mounted = m.MountPath == ipc.GateDir && m.ReadOnly && m.SubPath == ""
+		}
+	}
+	if !mounted {
+		t.Errorf("the harness does not mount the gate channel read-only at %s", ipc.GateDir)
+	}
+
+	for _, c := range append(append([]corev1.Container{}, spec.InitContainers...), spec.Containers...) {
+		for _, e := range c.Env {
+			if e.Name == ipc.GateKeyEnv {
+				t.Errorf("container %s holds %s", c.Name, e.Name)
+			}
+			if e.ValueFrom != nil && e.ValueFrom.SecretKeyRef != nil && e.ValueFrom.SecretKeyRef.Name == agentRunGateSecretName(run) {
+				t.Errorf("container %s reads the gate Secret through %s", c.Name, e.Name)
+			}
+		}
+	}
+}
+
+// A later attempt continues in the workspace the first pod's preRun hooks
+// prepared. Running them again could reset it. Its Job needs a name of its
+// own, because the first attempt's Job still exists.
+func TestBuildJob_ALaterHarnessAttemptRunsNoPreRunHooks(t *testing.T) {
+	r := &AgentRunReconciler{}
+	run := gatedRun("harness-later", inPlace(&sympoziumv1alpha1.RetrySpec{MaxAttempts: 3}))
+	run.Spec.Task = resumingHarnessTask(t)
+	run.Spec.Lifecycle.PreRun = []sympoziumv1alpha1.LifecycleHookContainer{{Name: "clone", Image: "clone:latest"}}
+
+	preRunHooks := func() int {
+		job, err := r.buildJob(context.Background(), run, false, nil, nil, nil, nil)
+		if err != nil {
+			t.Fatalf("buildJob: %v", err)
+		}
+		n := 0
+		for _, c := range job.Spec.Template.Spec.InitContainers {
+			if c.Name == "pre-clone" {
+				n++
+			}
+		}
+		return n
+	}
+
+	if got := preRunHooks(); got != 1 {
+		t.Fatalf("first attempt runs %d preRun hooks, want 1", got)
+	}
+	if got := agentJobName(run); got != run.Name {
+		t.Errorf("first attempt's Job = %q, want %q", got, run.Name)
+	}
+
+	run.Status.JobName = run.Name
+	run.Status.Attempt = 2
+	if got := preRunHooks(); got != 0 {
+		t.Errorf("attempt 2 runs %d preRun hooks, want 0", got)
+	}
+	if got := agentJobName(run); got != run.Name+"-attempt-2" {
+		t.Errorf("attempt 2's Job = %q, want %q", got, run.Name+"-attempt-2")
+	}
+}
+
+// harnessGateRun is an in-place harness run whose attempt 1 finished `ago`,
+// waiting in AwaitingGate for its gate Job to be created.
+func harnessGateRun(t *testing.T, name string, ago time.Duration) *sympoziumv1alpha1.AgentRun {
+	t.Helper()
+	run := parkedRun(name, &sympoziumv1alpha1.RetrySpec{MaxAttempts: 3}, 1, 0)
+	run.Spec.Task = objectTask(t, `{"mode":"harness","parameters":{"runtime":"claude","prompt":"Ship the feature"}}`)
+	run.Status.HarnessImageDigest = harnessDigest
+	run.Status.HarnessCapabilities = []string{"resume"}
+	run.Status.JobName = name
+	finished := metav1.NewTime(time.Now().Add(-ago))
+	run.Status.Attempts[0].CompletedAt = &finished
+	return run
+}
+
+func harnessGateReconciler(t *testing.T, objs ...client.Object) *AgentRunReconciler {
+	t.Helper()
+	scheme := retryScheme(t)
+	return &AgentRunReconciler{
+		Client: fake.NewClientBuilder().WithScheme(scheme).
+			WithStatusSubresource(&sympoziumv1alpha1.AgentRun{}).
+			WithObjects(objs...).Build(),
+		Scheme: scheme,
+		Log:    logr.Discard(),
+	}
+}
+
+func jobExists(t *testing.T, r *AgentRunReconciler, name string) bool {
+	t.Helper()
+	err := r.Get(context.Background(), client.ObjectKey{Namespace: "default", Name: name}, &batchv1.Job{})
+	if apierrors.IsNotFound(err) {
+		return false
+	}
+	if err != nil {
+		t.Fatalf("get Job %s: %v", name, err)
+	}
+	return true
+}
+
+// A finished harness attempt is recorded, but its gate waits for the pod.
+func TestStartGateForAttempt_AHarnessGateWaitsForThePod(t *testing.T) {
+	run := harnessGateRun(t, "harness-start", 0)
+	run.Status.Phase = sympoziumv1alpha1.AgentRunPhaseRunning
+	run.Status.PostRunJobName = ""
+	r := harnessGateReconciler(t, run)
+
+	if _, err := r.startGateForAttempt(context.Background(), logr.Discard(), run,
+		&ipc.AttemptResult{Attempt: 1, Status: "success", Response: "done"}); err != nil {
+		t.Fatalf("startGateForAttempt: %v", err)
+	}
+
+	got := getRun(t, r, run.Name)
+	if got.Status.Phase != sympoziumv1alpha1.AgentRunPhaseAwaitingGate || got.Status.Result != "done" {
+		t.Errorf("phase = %q result = %q, want AwaitingGate with the attempt's result", got.Status.Phase, got.Status.Result)
+	}
+	if got.Status.PostRunJobName != gateJobNameForAttempt(run, 1) {
+		t.Errorf("postRunJobName = %q, want %q", got.Status.PostRunJobName, gateJobNameForAttempt(run, 1))
+	}
+	if jobExists(t, r, gateJobNameForAttempt(run, 1)) {
+		t.Error("the gate Job was created while the attempt's pod may still be running")
+	}
+}
+
+// The gate checks /workspace only once no container of the attempt's pod is
+// left to change it. A pod that will not end by itself has its Job deleted.
+func TestReconcileAwaitingGate_AHarnessGateStartsOnceThePodIsGone(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		finishedAgo   time.Duration
+		pod           corev1.PodPhase // "" for no pod
+		wantGate      bool
+		wantAgentKept bool
+	}{
+		{name: "pod still running", finishedAgo: 0, pod: corev1.PodRunning, wantGate: false, wantAgentKept: true},
+		{name: "pod lingers", finishedAgo: time.Minute, pod: corev1.PodRunning, wantGate: false, wantAgentKept: false},
+		{name: "pod succeeded", finishedAgo: 0, pod: corev1.PodSucceeded, wantGate: true, wantAgentKept: true},
+		{name: "pod deleted", finishedAgo: 0, pod: "", wantGate: true, wantAgentKept: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			run := harnessGateRun(t, "harness-gate", tc.finishedAgo)
+			agentJob := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: run.Status.JobName, Namespace: run.Namespace}}
+			objs := []client.Object{run, agentJob}
+			if tc.pod != "" {
+				pod := parkedPod(run)
+				pod.Status.Phase = tc.pod
+				objs = append(objs, pod)
+			}
+			r := harnessGateReconciler(t, objs...)
+
+			res, err := r.reconcileAwaitingGate(context.Background(), logr.Discard(), run)
+			if err != nil {
+				t.Fatalf("reconcileAwaitingGate: %v", err)
+			}
+			if res.RequeueAfter == 0 {
+				t.Error("no requeue")
+			}
+			if got := jobExists(t, r, run.Status.PostRunJobName); got != tc.wantGate {
+				t.Errorf("gate Job exists = %v, want %v", got, tc.wantGate)
+			}
+			if got := jobExists(t, r, agentJob.Name); got != tc.wantAgentKept {
+				t.Errorf("agent Job exists = %v, want %v", got, tc.wantAgentKept)
+			}
+		})
+	}
+}
+
+// The attempt that can still be retried is gated through the new path. The
+// last one, and one whose pod is still working, are left to the ordinary
+// completion checks.
+func TestHarnessAttemptFinished_LeavesWhatItDoesNotGate(t *testing.T) {
+	t.Run("last attempt", func(t *testing.T) {
+		run := harnessGateRun(t, "harness-last", 0)
+		run.Status.Attempt = 3
+		r := harnessGateReconciler(t, run)
+		job := &batchv1.Job{Status: batchv1.JobStatus{Succeeded: 1}}
+		if handled, _, err := r.harnessAttemptFinished(context.Background(), logr.Discard(), run, job); handled || err != nil {
+			t.Errorf("handled = %v err = %v, want the ordinary path", handled, err)
+		}
+	})
+	t.Run("pod still working", func(t *testing.T) {
+		run := harnessGateRun(t, "harness-working", 0)
+		r := harnessGateReconciler(t, run, parkedPod(run))
+		if handled, _, err := r.harnessAttemptFinished(context.Background(), logr.Discard(), run, &batchv1.Job{}); handled || err != nil {
+			t.Errorf("handled = %v err = %v, want nothing done", handled, err)
+		}
+	})
+}
+
+// A harness's attempt pods share the run label. The run must follow the
+// current attempt's pod, not whichever the list returns first.
+func TestPodOfJob_PicksThePodOfTheCurrentAttempt(t *testing.T) {
+	owned := func(name, job string) corev1.Pod {
+		controller := true
+		return corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: name, OwnerReferences: []metav1.OwnerReference{{
+			APIVersion: "batch/v1", Kind: "Job", Name: job, Controller: &controller,
+		}}}}
+	}
+	pods := []corev1.Pod{owned("run-abc", "run"), owned("run-attempt-2-def", "run-attempt-2")}
+	job := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: "run-attempt-2"}}
+
+	if got := podOfJob(pods, job); got != "run-attempt-2-def" {
+		t.Errorf("podOfJob = %q, want run-attempt-2-def", got)
+	}
+	if got := podOfJob(pods[:1], job); got != "" {
+		t.Errorf("podOfJob = %q, want none: the only pod is an earlier attempt's", got)
+	}
+}
+
+// The normalized task is never persisted, so after Pending the spec may name
+// only a runtime, or be a plain string an Agent's runtimeRef turned into a
+// harness. Status records what ran; the in-place decision must follow it, or
+// the controller would stop retrying a harness in place after its first pod.
+func TestGateInPlace_FollowsTheHarnessRecordedInStatus(t *testing.T) {
+	for name, task := range map[string]*sympoziumv1alpha1.TaskSpec{
+		"runtime reference": objectTask(t, `{"mode":"harness","parameters":{"runtime":"claude","prompt":"Ship the feature"}}`),
+		"inherited runtime": sympoziumv1alpha1.NewStringTask("Ship the feature"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			run := gatedRun("harness-status", inPlace(&sympoziumv1alpha1.RetrySpec{MaxAttempts: 3}))
+			run.Spec.Task = task
+			run.Status.HarnessImageDigest = harnessDigest
+
+			if gateInPlaceEnabled(run) {
+				t.Error("retries in place a harness whose runtime did not declare resume")
+			}
+			run.Status.HarnessCapabilities = []string{"persona", "resume"}
+			if !gateInPlaceEnabled(run) {
+				t.Error("does not retry in place a harness whose runtime declared resume")
+			}
+		})
+	}
+}
+
+func TestResolveInPlaceGate_HandsAHarnessTheRetryCard(t *testing.T) {
+	run := parkedRun("harness-card", &sympoziumv1alpha1.RetrySpec{MaxAttempts: 3}, 1, 0)
+	run.Spec.Task = objectTask(t, `{"mode":"harness","parameters":{"runtime":"claude","prompt":"Ship the feature"}}`)
+	run.Status.HarnessImageDigest = harnessDigest
+	run.Status.HarnessCapabilities = []string{"resume"}
+	run.Status.PodName = "" // the attempt's pod exited before its gate started
+	withVerdict(run, `{"action":"retry","reason":"tests fail","response":"FAIL: 3 cases"}`)
+	r, _ := retryReconciler(t, run)
+
+	if _, err := r.resolveInPlaceGate(context.Background(), logr.Discard(), run, true, false); err != nil {
+		t.Fatalf("resolveInPlaceGate: %v", err)
+	}
+
+	verdicts := gateVerdicts(t, r, run)
+	if len(verdicts) != 1 {
+		t.Fatalf("published %d gate verdicts, want 1", len(verdicts))
+	}
+	v := verdicts[0]
+	if v.Action != ipc.GateVerdictActionContinue {
+		t.Fatalf("verdict = %+v, want continue", v)
+	}
+	want := ipc.RetryCard(&ipc.GateVerdict{Reason: "tests fail", Output: "FAIL: 3 cases", MaxAttempts: 3}, 2)
+	if v.Card != want {
+		t.Errorf("card =\n%s\nwant\n%s", v.Card, want)
+	}
+	if !v.Verify(testGateKey) {
+		t.Error("the card is not covered by the verdict's MAC")
+	}
+
+	// The next attempt is a new pod, which reconcilePending creates.
+	got := getRun(t, r, run.Name)
+	if got.Status.Phase != sympoziumv1alpha1.AgentRunPhasePending || got.Status.Attempt != 2 || got.Status.PodName != "" {
+		t.Errorf("phase = %q attempt = %d pod = %q, want Pending on attempt 2 with no pod",
+			got.Status.Phase, got.Status.Attempt, got.Status.PodName)
+	}
+}
+
+// A harness attempt's pod has exited before its gate starts, so a final
+// verdict has no pod to release.
+func TestResolveInPlaceGate_ApprovingAHarnessPublishesNoStop(t *testing.T) {
+	run := harnessGateRun(t, "harness-approve", 0)
+	withVerdict(run, `{"action":"approve","reason":"looks good"}`)
+	r, _ := retryReconciler(t, run)
+
+	if _, err := r.resolveInPlaceGate(context.Background(), logr.Discard(), run, true, false); err != nil {
+		t.Fatalf("resolveInPlaceGate: %v", err)
+	}
+	if got := getRun(t, r, run.Name); got.Status.Phase != sympoziumv1alpha1.AgentRunPhaseSucceeded {
+		t.Errorf("phase = %q, want Succeeded", got.Status.Phase)
+	}
+	if v := gateVerdicts(t, r, run); len(v) != 0 {
+		t.Errorf("published %+v, want nothing", v)
 	}
 }

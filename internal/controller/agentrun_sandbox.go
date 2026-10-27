@@ -53,11 +53,14 @@ var (
 
 // reconcilePendingAgentSandbox handles pending AgentRuns that use the Agent Sandbox
 // CRD execution backend. It creates a Sandbox CR (or SandboxClaim if a warm pool
-// is referenced) instead of a batchv1.Job.
+// is referenced) instead of a batchv1.Job. harnessRuntimeRef and
+// inheritedHarnessRuntime describe the resolved harness, as for the Job path.
 func (r *AgentRunReconciler) reconcilePendingAgentSandbox(
 	ctx context.Context,
 	log logr.Logger,
 	agentRun *sympoziumv1alpha1.AgentRun,
+	harnessRuntimeRef string,
+	inheritedHarnessRuntime bool,
 ) (ctrl.Result, error) {
 	ctx, span := controllerTracer.Start(ctx, "agentrun.create_sandbox",
 		trace.WithAttributes(
@@ -150,6 +153,7 @@ func (r *AgentRunReconciler) reconcilePendingAgentSandbox(
 	if sc := span.SpanContext(); sc.HasTraceID() {
 		agentRun.Status.TraceID = sc.TraceID().String()
 	}
+	recordHarnessExecution(agentRun, agentRun.Spec.Task, harnessRuntimeRef, inheritedHarnessRuntime)
 	if err := r.Status().Update(ctx, agentRun); err != nil {
 		return ctrl.Result{}, err
 	}

@@ -200,15 +200,16 @@ func (h *HarnessHandler) Validate(task *sympoziumv1alpha1.TaskSpec) error {
 		}
 		// These claims describe platform-mediated behavior that does not exist
 		// for an external process yet. Accepting a self-assertion would make the
-		// descriptor say more than Sympozium can enforce or verify.
-		if caps.OutputSchema || caps.Subagents || caps.Resume {
+		// descriptor say more than Sympozium can enforce or verify. Resume is
+		// not among them: the gate channel and verdict are the platform's half,
+		// and resuming the session is the adapter's (docs/modes/harness-adapters.md).
+		if caps.OutputSchema || caps.Subagents {
 			unsupported := Capabilities{
 				OutputSchema: caps.OutputSchema,
 				Subagents:    caps.Subagents,
-				Resume:       caps.Resume,
 			}.Names()
-			return fmt.Errorf("harness: task.parameters.%s claims unsupported platform-mediated capabilities %v; currently supported declarations: [%s %s]",
-				harnessParamCapabilities, unsupported, CapabilityPersona, CapabilityToolFilter)
+			return fmt.Errorf("harness: task.parameters.%s claims unsupported platform-mediated capabilities %v; currently supported declarations: [%s %s %s]",
+				harnessParamCapabilities, unsupported, CapabilityPersona, CapabilityResume, CapabilityToolFilter)
 		}
 	}
 

@@ -196,7 +196,7 @@ func driveInPlaceGate(
 			return lastText, total.inputTokens, total.outputTokens, total.toolCalls, nil
 		}
 
-		card := buildRetryCard(verdict, attempt+1)
+		card := ipc.RetryCard(verdict, attempt+1)
 		p.AddUserMessage(card)
 		log.Printf("gate retry: injected verdict for attempt %d, starting attempt %d (cardLen=%d)",
 			attempt, attempt+1, len(card))
@@ -268,31 +268,4 @@ func waitForGateVerdict(ctx context.Context, attempt int, budget time.Duration, 
 			}
 		}
 	}
-}
-
-// buildRetryCard renders the verdict as the user turn that starts the next
-// attempt. Much shorter than buildRetryTask: a successor has to be told the
-// original task and shown its predecessor's output, this conversation holds
-// both already.
-//
-// The controller bounds the gate output before publishing, so nothing is
-// truncated here.
-func buildRetryCard(v *ipc.GateVerdict, nextAttempt int) string {
-	reason := v.Reason
-	if reason == "" {
-		reason = "The response gate rejected that attempt without giving a reason."
-	}
-
-	header := fmt.Sprintf("## Attempt %d", nextAttempt)
-	if v.MaxAttempts > 0 {
-		header = fmt.Sprintf("## Attempt %d of %d", nextAttempt, v.MaxAttempts)
-	}
-
-	card := header + "\n\nYour previous response was rejected by the response gate. " +
-		"Your earlier work is still here — the files you wrote and the tool results above are unchanged, " +
-		"so correct that work rather than starting over.\n\n### Why It Was Rejected\n" + reason
-	if v.Output != "" {
-		card += "\n\n### Gate Output\n" + v.Output
-	}
-	return card
 }

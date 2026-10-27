@@ -639,6 +639,11 @@ func (in *AgentRunStatus) DeepCopyInto(out *AgentRunStatus) {
 		*out = new(CostEstimate)
 		(*in).DeepCopyInto(*out)
 	}
+	if in.HarnessCapabilities != nil {
+		in, out := &in.HarnessCapabilities, &out.HarnessCapabilities
+		*out = make([]string, len(*in))
+		copy(*out, *in)
+	}
 	if in.Attempts != nil {
 		in, out := &in.Attempts, &out.Attempts
 		*out = make([]AttemptStatus, len(*in))

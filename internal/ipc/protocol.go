@@ -121,6 +121,12 @@ type GateVerdict struct {
 	// policy it does not own.
 	MaxAttempts int `json:"maxAttempts,omitempty"`
 
+	// Card is RetryCard's rendering of a continue verdict, for a harness
+	// adapter to pass to its harness as the next user turn. Set only for a
+	// harness run: agent-runner renders its own, and an older runner that does
+	// not know the field would drop it and fail to verify the MAC.
+	Card string `json:"card,omitempty"`
+
 	// MAC authenticates the verdict as the controller's own — see Sign.
 	MAC string `json:"mac,omitempty"`
 }

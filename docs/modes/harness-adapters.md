@@ -106,8 +106,9 @@ The pod security context is not relaxed for harness mode, so the image must alre
 ## Declaring capabilities honestly
 
 `task.parameters.capabilities` is currently a comma-separated list of what your image honours:
-`toolFilter` and `persona`. Claims for `outputSchema`, `subagents`, or `resume` are rejected
-until Sympozium provides a platform-mediated implementation. Sympozium did not build the
+`toolFilter`, `persona`, and `resume` (see
+[Resuming between gate attempts](#resuming-between-gate-attempts-resume)). Claims for `outputSchema` or `subagents`
+are rejected until Sympozium provides a platform-mediated implementation. Sympozium did not build the
 image and cannot inspect it, so this declaration is the entire basis on which a run is
 admitted.
 
@@ -123,6 +124,50 @@ that quietly does not apply. If your harness has *no* name-based tool filter, do
 
 Put the reasoning in your adapter's README. The next person to bump the upstream version
 needs to know which claims were checked against what.
+
+## Resuming between gate attempts (`resume`)
+
+A run with a response gate and `lifecycle.retry.inPlace: true` can retry on the same run.
+Each attempt runs in a new pod. The pods share `/workspace` and `$HOME`, which are both
+PVCs, so the next attempt resumes the harness's own session in the same files, and the
+gate's feedback arrives as the next user turn. Only adapters that declare `resume` get
+this. For every other adapter, a `retry` verdict starts a successor run with a fresh
+workspace (see [In-place retry](../concepts/lifecycle-hooks.md#in-place-retry)).
+
+When `GATE_IN_PLACE_ENABLED=true`, your pod runs one attempt, number
+`GATE_IN_PLACE_START_ATTEMPT` (N):
+
+1. If `/gate/verdict-<N-1>.json` exists, this attempt is a retry. Resume your harness's
+   session from `$HOME`, with the verdict's `card` field as the next user message. Use
+   your harness's own resume flag. If the file does not exist, run the task as usual.
+   `/gate` is read-only, and the controller is the only writer.
+2. Emit the result as usual, and exit.
+
+The controller starts the gate only after the attempt's pod has ended, every container
+included. So nothing the model started can change `/workspace` while the gate checks it,
+or after. If a container of the pod is still running 10 seconds after your container
+exits, the controller deletes the pod.
+
+Also note:
+
+- preRun hooks run only in the first attempt's pod.
+- `$HOME` is a 1Gi PVC that belongs to the run and is deleted with it. Keep session state
+  there, not in `/tmp`.
+- Every attempt must run the same image. If the runtime resolves to a different digest
+  between attempts, the run fails.
+- The verdict also carries a `mac` field. Ignore it: it is for `agent-runner`. The model
+  runs in your container, so Sympozium never gives you the gate key.
+- The [Agent Sandbox](../concepts/agent-sandbox.md) backend does not support this. A harness run there
+  uses successor runs.
+
+```bash
+# In the minimal adapter below, after argv is built. --resume stands for your harness's own
+# flag that continues the session it keeps in $HOME.
+prev="/gate/verdict-$(( ${GATE_IN_PLACE_START_ATTEMPT:-1} - 1 )).json"
+if [ "${GATE_IN_PLACE_ENABLED:-}" = true ] && [ -s "$prev" ]; then
+  argv=(my-harness --headless --resume "$(jq -r .card "$prev")")
+fi
+```
 
 ## SkillPack tools come to you as MCP
 

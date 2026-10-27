@@ -3,8 +3,10 @@
 package system_test
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -13,6 +15,7 @@ import (
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	sympoziumv1alpha1 "github.com/sympozium-ai/sympozium/api/v1alpha1"
@@ -490,6 +493,120 @@ func TestGateInPlaceWorkspaceIsAPVC(t *testing.T) {
 	}
 	if !parked {
 		t.Error("GATE_IN_PLACE_ENABLED is not set on the agent container")
+	}
+}
+
+// TestGateInPlaceHarnessKeepsItsHomeOnAPVC proves an in-place harness run, whose
+// attempts each run in a pod of their own, gets a PVC for HOME so the next
+// attempt can resume the harness's session, and that its pod gets neither the
+// gate key nor a park timeout.
+func TestGateInPlaceHarnessKeepsItsHomeOnAPVC(t *testing.T) {
+	inPlace := true // off by default
+	ns := createTestNamespace(t)
+	agentName := "sys-inplace-harness-agent"
+
+	agentBody := map[string]any{
+		"name":     agentName,
+		"provider": "lm-studio",
+		"model":    "test-model",
+		"baseURL":  "http://fake-lmstudio:1234/v1",
+	}
+	requireStatus(t, httpDo(t, http.MethodPost, fmt.Sprintf("/api/v1/agents?namespace=%s", ns), agentBody), http.StatusCreated)
+	t.Cleanup(func() {
+		httpDo(t, http.MethodDelete, fmt.Sprintf("/api/v1/agents/%s?namespace=%s", agentName, ns), nil)
+	})
+
+	// Harness mode is opt-in per policy.
+	policy := &sympoziumv1alpha1.SympoziumPolicy{
+		ObjectMeta: metav1.ObjectMeta{Name: "sys-harness-policy", Namespace: ns},
+		Spec: sympoziumv1alpha1.SympoziumPolicySpec{
+			HarnessPolicy: &sympoziumv1alpha1.HarnessPolicySpec{Enabled: true, AllowUnmetered: true},
+		},
+	}
+	if err := k8sClient.Create(testCtx, policy); err != nil {
+		t.Fatalf("create policy: %v", err)
+	}
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		var agent sympoziumv1alpha1.Agent
+		if err := k8sClient.Get(testCtx, client.ObjectKey{Namespace: ns, Name: agentName}, &agent); err != nil {
+			return err
+		}
+		agent.Spec.PolicyRef = policy.Name
+		return k8sClient.Update(testCtx, &agent)
+	}); err != nil {
+		t.Fatalf("set the agent's policy: %v", err)
+	}
+
+	var task sympoziumv1alpha1.TaskSpec
+	if err := json.Unmarshal([]byte(`{"mode":"harness","parameters":{`+
+		`"image":"registry.example/harness@sha256:`+strings.Repeat("a", 64)+`",`+
+		`"prompt":"Write a file, then survive a gate","capabilities":"resume"}}`), &task); err != nil {
+		t.Fatalf("task: %v", err)
+	}
+	run := &sympoziumv1alpha1.AgentRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "sys-run-inplace-harness", Namespace: ns},
+		Spec: sympoziumv1alpha1.AgentRunSpec{
+			AgentRef: agentName,
+			AgentID:  agentName,
+			Task:     &task,
+			Model: sympoziumv1alpha1.ModelSpec{
+				Provider: "lm-studio",
+				Model:    "test-model",
+				BaseURL:  "http://fake-lmstudio:1234/v1",
+			},
+			Lifecycle: &sympoziumv1alpha1.LifecycleHooks{
+				GateDefault: "block",
+				Retry:       &sympoziumv1alpha1.RetrySpec{MaxAttempts: 3, On: []string{"gate"}, InPlace: &inPlace},
+				PostRun: []sympoziumv1alpha1.LifecycleHookContainer{
+					{Name: "check", Image: "check:latest", Gate: true},
+				},
+			},
+		},
+	}
+	if err := k8sClient.Create(testCtx, run); err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	t.Cleanup(func() { _ = k8sClient.Delete(testCtx, run) })
+
+	var job batchv1.Job
+	pollUntil(t, 30*time.Second, 200*time.Millisecond, func() bool {
+		var got sympoziumv1alpha1.AgentRun
+		if k8sClient.Get(testCtx, client.ObjectKeyFromObject(run), &got) == nil && got.Status.Error != "" {
+			t.Fatalf("run failed: %s", got.Status.Error)
+		}
+		return k8sClient.Get(testCtx, client.ObjectKey{Namespace: ns, Name: run.Name}, &job) == nil
+	})
+
+	var home *corev1.Volume
+	for i := range job.Spec.Template.Spec.Volumes {
+		if job.Spec.Template.Spec.Volumes[i].Name == "harness-home" {
+			home = &job.Spec.Template.Spec.Volumes[i]
+		}
+	}
+	if home == nil || home.PersistentVolumeClaim == nil {
+		t.Fatalf("harness HOME = %+v, want a PVC so the next attempt's pod can resume the session", home)
+	}
+	var pvc corev1.PersistentVolumeClaim
+	pollUntil(t, 15*time.Second, 200*time.Millisecond, func() bool {
+		return k8sClient.Get(testCtx, client.ObjectKey{Namespace: ns, Name: home.PersistentVolumeClaim.ClaimName}, &pvc) == nil
+	})
+
+	for _, c := range job.Spec.Template.Spec.Containers {
+		if c.Name != "agent" {
+			continue
+		}
+		var inPlaceSet bool
+		for _, e := range c.Env {
+			switch e.Name {
+			case "GATE_IN_PLACE_ENABLED":
+				inPlaceSet = e.Value == "true"
+			case "GATE_ATTEMPT_KEY", "GATE_PARK_TIMEOUT":
+				t.Errorf("the harness container has %s", e.Name)
+			}
+		}
+		if !inPlaceSet {
+			t.Error("GATE_IN_PLACE_ENABLED is not set on the harness container")
+		}
 	}
 }
 

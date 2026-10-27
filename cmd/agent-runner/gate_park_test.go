@@ -376,21 +376,6 @@ func TestPublishAttemptResult_WritesTheResultFile(t *testing.T) {
 	}
 }
 
-// ── the retry card ──────────────────────────────────────────────────────────
-
-func TestBuildRetryCard_FallsBackWhenTheGateGaveNoReason(t *testing.T) {
-	card := buildRetryCard(&ipc.GateVerdict{Attempt: 1, Action: "continue"}, 2)
-	if !strings.Contains(card, "without giving a reason") {
-		t.Errorf("card leaves the model guessing:\n%s", card)
-	}
-	if strings.Contains(card, "### Gate Output") {
-		t.Error("an empty gate output must not get a heading")
-	}
-	if !strings.Contains(card, "## Attempt 2") {
-		t.Errorf("card does not say which attempt this is:\n%s", card)
-	}
-}
-
 func TestGateInPlaceEnv_ReadsTheEnv(t *testing.T) {
 	t.Setenv("GATE_IN_PLACE_ENABLED", "true")
 	if !gateInPlaceEnabled() {

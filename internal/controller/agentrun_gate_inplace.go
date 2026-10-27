@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -23,6 +24,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	sympoziumv1alpha1 "github.com/sympozium-ai/sympozium/api/v1alpha1"
+	"github.com/sympozium-ai/sympozium/internal/controller/taskmodes"
 	"github.com/sympozium-ai/sympozium/internal/ipc"
 	"github.com/sympozium-ai/sympozium/internal/pricing"
 )
@@ -84,25 +86,44 @@ const (
 // operator's switch on top of that. It defaults off, so a run written for
 // successor retry keeps that behaviour.
 //
-// Backends are not named here. Every caller is already inside a path that
-// builds or owns a pod, and a backend with no pod to park in cannot reach
-// them: reconcilePending forks to the Celln backend before any pod is
-// rendered, and reconcileRunning forks before checkParkedAttempt. Such a run
-// falls through to the successor-clone retry on its own.
+// Backends are not named here, except for a harness. Every caller is already
+// inside a path that builds or owns a pod, and a backend with no pod to park
+// in cannot reach them: reconcilePending forks to the Celln backend before
+// any pod is rendered, and reconcileRunning forks before checkParkedAttempt.
+// Such a run falls through to the successor-clone retry on its own.
 func gateInPlaceEnabled(agentRun *sympoziumv1alpha1.AgentRun) bool {
 	spec := gateRetrySpec(agentRun)
 	if spec == nil || !hasResponseGateHook(agentRun) {
 		return false
 	}
-	// The park loop is agent-runner's. A mode that replaces it (harness) has
-	// nothing that parks, and runs model-chosen tools in the agent container,
-	// where the gate key would let the model sign its own attempt markers.
-	if taskModeReplacesAgentContainer(agentRun.Spec.Task) {
+	// The park loop is agent-runner's. A harness instead runs each attempt in
+	// its own Job pod (see harnessAttemptFinished), which needs an adapter
+	// that resumes its session, and the Job backend.
+	if harnessRun(agentRun) && (!harnessResumes(agentRun) || agentRun.Spec.AgentSandbox != nil && agentRun.Spec.AgentSandbox.Enabled) {
 		return false
 	}
 	// There is no mutating webhook, so the kubebuilder default is not
 	// guaranteed to have been applied — resolve nil here (see CLAUDE.md).
 	return spec.InPlace != nil && *spec.InPlace
+}
+
+// harnessRun reports whether an external harness, not agent-runner, is the
+// run's agent process. Until the pod is built the in-memory task is the
+// resolved one. After that the spec holds the task as written, which may only
+// name a runtime or be a string an Agent's runtimeRef turned into a harness,
+// so status, which records every harness run's digest, is the answer.
+func harnessRun(agentRun *sympoziumv1alpha1.AgentRun) bool {
+	return agentRun.Status.HarnessImageDigest != "" || taskModeReplacesAgentContainer(agentRun.Spec.Task)
+}
+
+// harnessResumes reports whether the run's harness declared resume, so its
+// adapter resumes its session between gate attempts. Status wins once recorded, for the
+// same reason as in harnessRun.
+func harnessResumes(agentRun *sympoziumv1alpha1.AgentRun) bool {
+	if agentRun.Status.HarnessImageDigest != "" {
+		return slices.Contains(agentRun.Status.HarnessCapabilities, taskmodes.CapabilityResume)
+	}
+	return taskmodes.CapabilitiesFor(taskmodes.NewHarnessHandler(), agentRun.Spec.Task).Resume
 }
 
 // gateParkBudget is how long one park may last: the gate Job's own budget plus
@@ -241,11 +262,127 @@ func (r *AgentRunReconciler) checkParkedAttempt(
 	return true, res, err
 }
 
+// harnessAttemptFinished starts the gate on a harness attempt once the
+// attempt's pod has finished it. handled=false leaves the Job to
+// reconcileRunning's ordinary checks.
+//
+// A harness does not park. Each attempt runs in its own Job pod, which exits
+// when the attempt ends. The harness's HOME, and with it its session, is on a
+// PVC (harnessHomePVCName), so the next attempt's pod resumes the session. The
+// model shares the adapter's container, so a live pod can fake any "parked"
+// signal, and it could keep changing /workspace while the gate checks it. A
+// pod that has exited can do neither.
+//
+// The last attempt does not come here: nothing follows it, so the ordinary
+// completion path gates it as it would a one-shot run. A failed attempt or a
+// skipped run does not either, because each ends the chain.
+func (r *AgentRunReconciler) harnessAttemptFinished(
+	ctx context.Context, log logr.Logger, agentRun *sympoziumv1alpha1.AgentRun, job *batchv1.Job,
+) (handled bool, result ctrl.Result, err error) {
+	attempt := currentAttempt(agentRun)
+	if spec := gateRetrySpec(agentRun); spec == nil || attempt >= spec.MaxAttempts {
+		return false, ctrl.Result{}, nil
+	}
+	if job.Status.Succeeded == 0 && job.Status.Failed == 0 {
+		if agentRun.Status.PodName == "" {
+			return false, ctrl.Result{}, nil
+		}
+		done, exitCode, _, _ := r.checkAgentContainer(ctx, log, agentRun)
+		if !done || exitCode != 0 {
+			return false, ctrl.Result{}, nil
+		}
+	}
+
+	response, podErr, usage, skipped := r.extractResultFromPod(ctx, log, agentRun)
+	if skipped || podErr != "" || response == "" {
+		return false, ctrl.Result{}, nil
+	}
+	finished := &ipc.AttemptResult{Attempt: attempt, Status: "success", Response: response}
+	if usage != nil {
+		finished.Metrics.InputTokens = usage.InputTokens
+		finished.Metrics.OutputTokens = usage.OutputTokens
+		finished.Metrics.ToolCalls = usage.ToolCalls
+		finished.Metrics.DurationMs = usage.DurationMs
+	}
+	sanitizeAttemptMetrics(finished, log)
+
+	log.Info("Harness attempt finished; gating it once its pod is gone", "attempt", attempt)
+	res, err := r.startGateForAttempt(ctx, log, agentRun, finished)
+	return true, res, err
+}
+
+// harnessPodLingerGrace is how long a finished harness attempt's pod may keep
+// running containers (the IPC bridge flushing, sidecars) before the controller
+// deletes its Job. A pod that ends by itself keeps its logs.
+const harnessPodLingerGrace = 10 * time.Second
+
+// startHarnessGateWhenPodIsGone creates a harness attempt's gate Job once no
+// container of the attempt's pod is still running. A sidecar that mounts
+// /workspace could otherwise change it while the gate checks it.
+func (r *AgentRunReconciler) startHarnessGateWhenPodIsGone(
+	ctx context.Context, log logr.Logger, agentRun *sympoziumv1alpha1.AgentRun,
+) (ctrl.Result, error) {
+	gone, err := r.agentPodGone(ctx, agentRun)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if !gone {
+		if gateStartedLongAgo(agentRun) {
+			log.Info("Harness attempt's pod never ended; resolving as a failed hook", "pod", agentRun.Status.PodName)
+			return r.resolveInPlaceGate(ctx, log, agentRun, true, true)
+		}
+		if finishedFor(agentRun) > harnessPodLingerGrace && agentRun.Status.JobName != "" {
+			log.Info("Harness attempt's pod still running; deleting its Job", "job", agentRun.Status.JobName)
+			_ = r.Delete(ctx, &batchv1.Job{ObjectMeta: metav1.ObjectMeta{
+				Name:      agentRun.Status.JobName,
+				Namespace: agentRun.Namespace,
+			}}, client.PropagationPolicy(metav1.DeletePropagationBackground))
+		}
+		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+	}
+
+	if err := r.createGateJob(ctx, log, agentRun, agentRun.Status.PostRunJobName, agentRun.Status.Result); err != nil {
+		return ctrl.Result{}, err
+	}
+	return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+}
+
+// agentPodGone reports whether the run's agent pod has no container left
+// running: it is deleted, or it has reached Succeeded or Failed, which a pod
+// reaches only once every container, sidecars included, has terminated.
+func (r *AgentRunReconciler) agentPodGone(ctx context.Context, agentRun *sympoziumv1alpha1.AgentRun) (bool, error) {
+	if agentRun.Status.PodName == "" {
+		return true, nil
+	}
+	var pod corev1.Pod
+	if err := r.Get(ctx, client.ObjectKey{Namespace: agentRun.Namespace, Name: agentRun.Status.PodName}, &pod); err != nil {
+		if errors.IsNotFound(err) {
+			return true, nil
+		}
+		return false, fmt.Errorf("reading the agent pod: %w", err)
+	}
+	return pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed, nil
+}
+
+// finishedFor is how long ago the current attempt finished, 0 when it has not.
+func finishedFor(agentRun *sympoziumv1alpha1.AgentRun) time.Duration {
+	attempt := currentAttempt(agentRun)
+	for _, a := range agentRun.Status.Attempts {
+		if a.Attempt == attempt && a.CompletedAt != nil {
+			return time.Since(a.CompletedAt.Time)
+		}
+	}
+	return 0
+}
+
 // startGateForAttempt records the attempt on the CR, then creates the gate Job
 // that judges it.
 //
 // That order survives a controller restart between the two steps: the entry is
 // already there, and a duplicate Create is absorbed by IsAlreadyExists.
+//
+// A harness attempt's gate waits for its pod to be gone, so reconcileAwaitingGate
+// creates that Job instead (see startHarnessGateWhenPodIsGone).
 func (r *AgentRunReconciler) startGateForAttempt(
 	ctx context.Context, log logr.Logger,
 	agentRun *sympoziumv1alpha1.AgentRun, parked *ipc.AttemptResult,
@@ -273,35 +410,49 @@ func (r *AgentRunReconciler) startGateForAttempt(
 		return ctrl.Result{}, fmt.Errorf("recording parked attempt %d: %w", parked.Attempt, err)
 	}
 
-	gateJob := r.buildPostRunJob(agentRun, exitCode, parked.Response)
-	gateJob.Name = gateJobNameForAttempt(agentRun, parked.Attempt)
-	r.pinGateJobToAgentNode(ctx, log, agentRun, gateJob)
-	if err := controllerutil.SetControllerReference(agentRun, gateJob, r.Scheme); err != nil {
-		return ctrl.Result{}, fmt.Errorf("setting owner reference on gate Job: %w", err)
-	}
-	if err := r.Create(ctx, gateJob); err != nil {
-		if !errors.IsAlreadyExists(err) {
-			return ctrl.Result{}, fmt.Errorf("creating gate Job for attempt %d: %w", parked.Attempt, err)
-		}
-		// A duplicate reconcile already created it. A Job this run does not
-		// own is not its gate, and its result must not judge this attempt.
-		var existing batchv1.Job
-		if err := r.Get(ctx, client.ObjectKeyFromObject(gateJob), &existing); err != nil {
-			return ctrl.Result{}, fmt.Errorf("reading existing gate Job %s: %w", gateJob.Name, err)
-		}
-		if !metav1.IsControlledBy(&existing, agentRun) {
-			return ctrl.Result{}, fmt.Errorf("gate Job %s exists and is not owned by this run", gateJob.Name)
+	gateJobName := gateJobNameForAttempt(agentRun, parked.Attempt)
+	if !harnessRun(agentRun) {
+		if err := r.createGateJob(ctx, log, agentRun, gateJobName, parked.Response); err != nil {
+			return ctrl.Result{}, err
 		}
 	}
 
 	if err := r.updateStatusWithRetry(ctx, agentRun, func(ar *sympoziumv1alpha1.AgentRun) {
 		ar.Status.Phase = sympoziumv1alpha1.AgentRunPhaseAwaitingGate
-		ar.Status.PostRunJobName = gateJob.Name
+		ar.Status.PostRunJobName = gateJobName
 	}); err != nil {
 		return ctrl.Result{}, err
 	}
 
 	return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+}
+
+// createGateJob creates the gate Job named name, which judges the current
+// attempt's result.
+func (r *AgentRunReconciler) createGateJob(
+	ctx context.Context, log logr.Logger, agentRun *sympoziumv1alpha1.AgentRun, name, result string,
+) error {
+	gateJob := r.buildPostRunJob(agentRun, 0, result)
+	gateJob.Name = name
+	r.pinGateJobToAgentNode(ctx, log, agentRun, gateJob)
+	if err := controllerutil.SetControllerReference(agentRun, gateJob, r.Scheme); err != nil {
+		return fmt.Errorf("setting owner reference on gate Job: %w", err)
+	}
+	if err := r.Create(ctx, gateJob); err != nil {
+		if !errors.IsAlreadyExists(err) {
+			return fmt.Errorf("creating gate Job for attempt %d: %w", currentAttempt(agentRun), err)
+		}
+		// A duplicate reconcile already created it. A Job this run does not
+		// own is not its gate, and its result must not judge this attempt.
+		var existing batchv1.Job
+		if err := r.Get(ctx, client.ObjectKeyFromObject(gateJob), &existing); err != nil {
+			return fmt.Errorf("reading existing gate Job %s: %w", gateJob.Name, err)
+		}
+		if !metav1.IsControlledBy(&existing, agentRun) {
+			return fmt.Errorf("gate Job %s exists and is not owned by this run", gateJob.Name)
+		}
+	}
+	return nil
 }
 
 // pinGateJobToAgentNode schedules the gate onto the node running the parked
@@ -457,6 +608,9 @@ func (r *AgentRunReconciler) reconcileAwaitingGate(
 		if _, has := agentRun.Annotations["sympozium.ai/gate-verdict"]; has {
 			return r.resolveInPlaceGate(ctx, log, agentRun, agentSucceeded, false)
 		}
+		if harnessRun(agentRun) {
+			return r.startHarnessGateWhenPodIsGone(ctx, log, agentRun)
+		}
 		// Right after Create the cache may not show the Job yet, so wait.
 		// But not past the gate's own budget: a Job that was never created
 		// or was deleted by hand would hold the run forever.
@@ -545,6 +699,11 @@ func (r *AgentRunReconciler) resolveInPlaceGate(
 	if verdict != nil && verdict.Action == "retry" {
 		spec := gateRetrySpec(agentRun)
 		exhausted, why := r.inPlaceExhausted(ctx, agentRun, spec, attempt)
+		if !exhausted && harnessRun(agentRun) {
+			// A harness's next attempt is a new pod, which reads the verdict
+			// when it starts.
+			return r.startNextAttempt(ctx, log, agentRun, verdict, spec, attempt)
+		}
 		if !exhausted {
 			// Only a parked runner reads the verdict. One that left its park
 			// (park timeout, /ipc/done, a crash) would never run the next
@@ -563,7 +722,10 @@ func (r *AgentRunReconciler) resolveInPlaceGate(
 
 	// Terminal: release the pod, then resolve through the shared path so a
 	// continued run ends in the same state a single-attempt gated run does.
-	r.publishGateStop(ctx, agentRun, attempt)
+	// A harness attempt's pod has already exited.
+	if !harnessRun(agentRun) {
+		r.publishGateStop(ctx, agentRun, attempt)
+	}
 	return r.resolveGate(ctx, log, agentRun, agentSucceeded, hookFailed)
 }
 
@@ -629,7 +791,8 @@ func (r *AgentRunReconciler) inPlaceExhausted(
 }
 
 // startNextAttempt delivers the verdict to the parked pod and returns the run to
-// Running for the next attempt.
+// Running for the next attempt. A harness has no parked pod: its run returns
+// to Pending, and the next attempt's pod reads the verdict when it starts.
 func (r *AgentRunReconciler) startNextAttempt(
 	ctx context.Context, log logr.Logger,
 	agentRun *sympoziumv1alpha1.AgentRun, verdict *gateVerdict,
@@ -640,13 +803,19 @@ func (r *AgentRunReconciler) startNextAttempt(
 	// Publish before the phase moves. On failure the run stays in AwaitingGate
 	// and the next reconcile retries; flipping to Running first would make a
 	// pod that was never told to continue look like one that is working.
-	if err := r.publishGateVerdict(ctx, agentRun, &ipc.GateVerdict{
+	continueVerdict := &ipc.GateVerdict{
 		Attempt:     attempt,
 		Action:      ipc.GateVerdictActionContinue,
 		Reason:      verdict.Reason,
 		Output:      truncateForStatus(verdict.Response, retryGateOutputLimit()),
 		MaxAttempts: spec.MaxAttempts,
-	}); err != nil {
+	}
+	// A harness adapter has no copy of the card format, so it gets the text
+	// agent-runner would have rendered.
+	if harnessRun(agentRun) {
+		continueVerdict.Card = ipc.RetryCard(continueVerdict, next)
+	}
+	if err := r.publishGateVerdict(ctx, agentRun, continueVerdict); err != nil {
 		return ctrl.Result{}, fmt.Errorf("delivering gate verdict for attempt %d: %w", attempt, err)
 	}
 
@@ -669,6 +838,13 @@ func (r *AgentRunReconciler) startNextAttempt(
 		ar.Status.GateVerdict = "retried"
 		ar.Status.Phase = sympoziumv1alpha1.AgentRunPhaseRunning
 		ar.Status.PostRunJobName = ""
+		// A harness's next attempt runs in a new Job pod, which
+		// reconcilePending creates. JobName stays set until then: it is what
+		// names the next Job (agentJobName) and holds the session lock.
+		if harnessRun(ar) {
+			ar.Status.Phase = sympoziumv1alpha1.AgentRunPhasePending
+			ar.Status.PodName = ""
+		}
 		ensureAttemptEntry(ar, next).StartedAt = &now
 	}); err != nil {
 		return ctrl.Result{}, err
@@ -820,7 +996,8 @@ func (r *AgentRunReconciler) publishGateVerdict(ctx context.Context, agentRun *s
 // Best-effort: if the patch fails, kubelet's own periodic sync still delivers
 // the verdict, about a minute later.
 func (r *AgentRunReconciler) nudgeAgentPod(ctx context.Context, agentRun *sympoziumv1alpha1.AgentRun, seq string) {
-	if agentRun.Status.PodName == "" {
+	// A harness reads its verdict when its next pod starts.
+	if agentRun.Status.PodName == "" || harnessRun(agentRun) {
 		return
 	}
 	patch, err := json.Marshal(map[string]any{

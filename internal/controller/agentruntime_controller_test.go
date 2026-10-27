@@ -115,7 +115,7 @@ func TestAgentRuntime_Validate_RejectsEmptyImageWithoutCelln(t *testing.T) {
 
 func TestAgentRuntime_Validate_RejectsUnsupportedCapability(t *testing.T) {
 	r := &AgentRuntimeReconciler{}
-	for _, capability := range []string{"subagents", "resume", "outputSchema", "nonsense"} {
+	for _, capability := range []string{"subagents", "outputSchema", "nonsense"} {
 		if _, reason := r.validate(runtimeSpec(runtimeTestImage, capability)); reason == "" {
 			t.Fatalf("validate(capability %q) accepted; want rejection", capability)
 		}
@@ -124,8 +124,20 @@ func TestAgentRuntime_Validate_RejectsUnsupportedCapability(t *testing.T) {
 
 func TestAgentRuntime_Validate_AllowsSupportedCapabilities(t *testing.T) {
 	r := &AgentRuntimeReconciler{}
-	if _, reason := r.validate(runtimeSpec(runtimeTestImage, "persona", "toolFilter")); reason != "" {
-		t.Fatalf("validate(persona,toolFilter) returned reason %q", reason)
+	if _, reason := r.validate(runtimeSpec(runtimeTestImage, "persona", "toolFilter", "resume")); reason != "" {
+		t.Fatalf("validate(persona,toolFilter,resume) returned reason %q", reason)
+	}
+}
+
+// resume is the one-shot adapter's promise to resume its session between gate
+// attempts. A v1alpha2 session runtime never
+// runs an AgentRun, so declaring it there promises something nothing uses.
+func TestAgentRuntime_Validate_RejectsResumeOnASessionRuntime(t *testing.T) {
+	runtime := runtimeSpec(runtimeTestImage, "resume")
+	runtime.Spec.ContractVersion = "v1alpha2"
+	runtime.Spec.Session = &sympoziumv1alpha1.AgentRuntimeSession{Protocol: "openai-chat", Port: 8080}
+	if _, reason := (&AgentRuntimeReconciler{}).validate(runtime); reason == "" {
+		t.Fatal("validate(v1alpha2 + resume) accepted; want rejection")
 	}
 }
 

@@ -348,10 +348,18 @@ In-place retry needs a pod to park in. The Job and
 identically; [Celln](celln-backend.md) dispatches to a remote executor and has
 no pod, so it always uses successor runs whatever `inPlace` says.
 
-In-place retry also needs `agent-runner`, which holds the park loop. A
-[harness](../modes/harness.md) task replaces `agent-runner`, so it uses
-successor runs too, and its container never receives the gate key or the
-`/gate` mount.
+In-place retry also needs the next attempt to continue where the last one
+stopped. `agent-runner` parks in its pod between attempts. A
+[harness](../modes/harness.md) task replaces `agent-runner` and does not park.
+When its adapter declares the `resume` capability and follows the
+[resume contract](../modes/harness-adapters.md#resuming-between-gate-attempts-resume),
+each attempt runs in a new pod of the same run. The pods share `/workspace` and a
+`$HOME` PVC that holds the harness's session. The gate starts only after the
+attempt's pod has ended, so nothing in it can change `/workspace` while the gate
+checks it. A harness never receives the gate key, because the model runs in its
+container. Without `resume`, or
+on the Agent Sandbox backend, a harness uses successor runs, and its container
+gets no `/gate` mount.
 
 Enable it with `lifecycle.retry`:
 

@@ -130,11 +130,11 @@ func TestPolicyEnforcer_HarnessRequiresUnmeteredOptIn(t *testing.T) {
 func TestPolicyEnforcer_RejectsUnmediatedHarnessCapabilityClaim(t *testing.T) {
 	pe := capabilityEnforcer(t)
 	run := capabilityRun(harnessTaskSpec(map[string]string{
-		"capabilities": taskmodes.CapabilityResume,
+		"capabilities": taskmodes.CapabilitySubagents,
 	}))
 
 	resp := pe.Handle(context.Background(), admissionRequestFor(t, run))
-	if resp.Allowed || !strings.Contains(resp.Result.Message, taskmodes.CapabilityResume) {
+	if resp.Allowed || !strings.Contains(resp.Result.Message, taskmodes.CapabilitySubagents) {
 		t.Fatalf("response allowed=%v message=%q, want unsupported claim denial", resp.Allowed, resp.Result.Message)
 	}
 }

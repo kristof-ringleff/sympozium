@@ -72,11 +72,17 @@ func (r *AgentRuntimeReconciler) validate(runtime *sympoziumv1alpha1.AgentRuntim
 		if err != nil {
 			return "", fmt.Sprintf("unknown capability %q; known: %v", capability, taskmodes.KnownCapabilities())
 		}
-		// outputSchema, subagents and resume are platform-mediated behaviours
-		// that no external runtime can implement safely yet. Rejecting the
-		// declaration keeps the descriptor honest.
-		if caps.OutputSchema || caps.Subagents || caps.Resume {
-			return "", fmt.Sprintf("capability %q is not supported for external runtimes; supported: [persona toolFilter]", capability)
+		// outputSchema and subagents are platform-mediated behaviours that no
+		// external runtime can implement safely yet. Rejecting the declaration
+		// keeps the descriptor honest.
+		if caps.OutputSchema || caps.Subagents {
+			return "", fmt.Sprintf("capability %q is not supported for external runtimes; supported: [persona resume toolFilter]", capability)
+		}
+		// resume is the one-shot adapter's promise to resume its session
+		// between gate attempts. A session runtime never runs an AgentRun, so
+		// nothing would use it.
+		if caps.Resume && runtime.Spec.ContractVersion == "v1alpha2" {
+			return "", "capability \"resume\" applies to the v1alpha1 one-shot contract; a v1alpha2 session runtime never runs an AgentRun"
 		}
 	}
 

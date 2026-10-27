@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"slices"
 	"strings"
 	"testing"
 
@@ -188,5 +189,79 @@ func TestReconcilePending_InheritedRuntimeRefSurvivesServiceAccountStep(t *testi
 	}
 	if agentContainer.Image != runtimeTestImage {
 		t.Errorf("agent image = %q, want the inherited harness image %q", agentContainer.Image, runtimeTestImage)
+	}
+}
+
+// The normalized task lives only in memory, so status is where later reconciles
+// learn what the harness declared. Without it a harness's later attempts would
+// stop being in place once the run left Pending.
+func TestReconcilePending_RecordsTheHarnessCapabilities(t *testing.T) {
+	agent := parityAgent()
+	agent.Spec.PolicyRef = "harness-ok"
+	agent.Spec.RuntimeRef = "my-harness"
+	policy := policyWithRegistries("harness-ok")
+	runtime := runtimeSpec(runtimeTestImage, "resume", "persona")
+	runtime.Name = "my-harness"
+	runtime.Namespace = "default"
+	runtime.Spec.ContractVersion = taskmodes.HarnessContractVersion
+	runtime.Status.Conditions = []metav1.Condition{{
+		Type: sympoziumv1alpha1.AgentRuntimeReadyCondition, Status: metav1.ConditionTrue, Reason: "Ready",
+	}}
+
+	run := parityRun()
+	r := newAgentRunTestReconciler(t, run, agent, policy, runtime)
+
+	if _, err := r.reconcilePending(context.Background(), logr.Discard(), run); err != nil {
+		t.Fatalf("reconcilePending returned error: %v", err)
+	}
+
+	var stored sympoziumv1alpha1.AgentRun
+	if err := r.Client.Get(context.Background(), client.ObjectKeyFromObject(run), &stored); err != nil {
+		t.Fatalf("get stored run: %v", err)
+	}
+	if stored.Status.Error != "" {
+		t.Fatalf("run failed: %s", stored.Status.Error)
+	}
+	if stored.Status.HarnessImageDigest == "" {
+		t.Fatal("status.harnessImageDigest not recorded")
+	}
+	if got, want := stored.Status.HarnessCapabilities, []string{"persona", "resume"}; !slices.Equal(got, want) {
+		t.Errorf("status.harnessCapabilities = %v, want %v", got, want)
+	}
+}
+
+// A later attempt resumes the session an earlier attempt's image left. If the
+// runtime now resolves to another image, that image would resume a session it
+// did not write, so the run fails instead.
+func TestReconcilePending_RefusesAHarnessImageThatChangedBetweenAttempts(t *testing.T) {
+	agent := parityAgent()
+	agent.Spec.PolicyRef = "harness-ok"
+	agent.Spec.RuntimeRef = "my-harness"
+	policy := policyWithRegistries("harness-ok")
+	runtime := runtimeSpec(runtimeTestImage, "resume")
+	runtime.Name = "my-harness"
+	runtime.Namespace = "default"
+	runtime.Spec.ContractVersion = taskmodes.HarnessContractVersion
+	runtime.Status.Conditions = []metav1.Condition{{
+		Type: sympoziumv1alpha1.AgentRuntimeReadyCondition, Status: metav1.ConditionTrue, Reason: "Ready",
+	}}
+
+	run := parityRun()
+	run.Status.JobName = run.Name
+	run.Status.Attempt = 2
+	run.Status.HarnessImageDigest = "sha256:" + strings.Repeat("b", 64)
+	run.Status.HarnessCapabilities = []string{"resume"}
+	r := newAgentRunTestReconciler(t, run, agent, policy, runtime)
+
+	if _, err := r.reconcilePending(context.Background(), logr.Discard(), run); err != nil {
+		t.Fatalf("reconcilePending returned error: %v", err)
+	}
+
+	var stored sympoziumv1alpha1.AgentRun
+	if err := r.Client.Get(context.Background(), client.ObjectKeyFromObject(run), &stored); err != nil {
+		t.Fatalf("get stored run: %v", err)
+	}
+	if stored.Status.Phase != sympoziumv1alpha1.AgentRunPhaseFailed || !strings.Contains(stored.Status.Error, "harness image changed between attempts") {
+		t.Errorf("phase = %q error = %q, want a failure naming the image change", stored.Status.Phase, stored.Status.Error)
 	}
 }

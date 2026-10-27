@@ -642,8 +642,12 @@ spec:
                           Agent Sandbox backends do; Celln dispatches to a remote executor and has
                           no pod, so it always uses successor runs whatever this says.
 
-                          It also requires agent-runner, which holds the park loop. A harness
-                          task replaces agent-runner, so it uses successor runs too.
+                          It also requires the next attempt to continue where the last stopped.
+                          agent-runner parks in its pod between attempts. A harness task replaces
+                          agent-runner and does not park: when its adapter declares the "resume"
+                          capability, each attempt runs in a new pod of the run, with the same
+                          workspace and a HOME PVC that keeps the harness's session. Otherwise,
+                          and on the Agent Sandbox backend, it uses successor runs.
 
                           Defaults to false, so a run written for successor retry keeps it. Set
                           true to park instead. Leave it false when a gate takes long enough that
@@ -3666,6 +3670,16 @@ spec:
                   retried (superseded by a successor attempt), retries-exhausted.
                   Empty when no gate hook is configured.
                 type: string
+              harnessCapabilities:
+                description: |-
+                  HarnessCapabilities records the capabilities the executed harness
+                  declared, from its AgentRuntime or the task. The resolved task is never
+                  written back to spec, so this is what later reconciles read: "resume"
+                  here means the adapter resumes its session in a new pod for each gate
+                  attempt.
+                items:
+                  type: string
+                type: array
               harnessContractVersion:
                 description: |-
                   HarnessContractVersion records the harness contract supplied to the

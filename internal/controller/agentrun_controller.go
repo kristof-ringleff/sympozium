@@ -957,7 +957,7 @@ func (r *AgentRunReconciler) reconcilePending(ctx context.Context, log logr.Logg
 
 	// Agent Sandbox mode — create Sandbox CR instead of Job.
 	if agentRun.Spec.AgentSandbox != nil && agentRun.Spec.AgentSandbox.Enabled {
-		return r.reconcilePendingAgentSandbox(ctx, log, agentRun)
+		return r.reconcilePendingAgentSandbox(ctx, log, agentRun, harnessRuntimeRef, inheritedHarnessRuntime)
 	}
 
 	// Setup shared with the agentSandbox backend — see prepareRunPrerequisites.
@@ -1095,6 +1095,22 @@ func (r *AgentRunReconciler) reconcilePending(ctx context.Context, log logr.Logg
 			return ctrl.Result{}, fmt.Errorf("creating workspace PVC: %w", err)
 		}
 	}
+	if harnessHomeNeedsPVC(agentRun) {
+		if err := r.ensureHarnessHomePVC(ctx, agentRun); err != nil {
+			return ctrl.Result{}, fmt.Errorf("creating harness HOME PVC: %w", err)
+		}
+	}
+
+	// A harness's next attempt resumes the session the last one left. The
+	// runtime may have been repointed since, and a different image would
+	// resume a session it did not write.
+	if recorded := agentRun.Status.HarnessImageDigest; recorded != "" {
+		if d := taskmodes.HarnessImageDigest(agentRun.Spec.Task); d != recorded {
+			return ctrl.Result{}, r.failRun(ctx, agentRun, fmt.Sprintf(
+				"harness image changed between attempts: attempt %d would run %s, earlier attempts ran %s",
+				currentAttempt(agentRun), d, recorded))
+		}
+	}
 
 	// Build and create the Job. buildJob delegates to buildAgentPodTemplate, which
 	// applies the pod mutators; register a podMutator rather than injecting here,
@@ -1120,6 +1136,8 @@ func (r *AgentRunReconciler) reconcilePending(ctx context.Context, log logr.Logg
 		return ctrl.Result{}, nil
 	}
 
+	job.Name = agentJobName(agentRun)
+
 	if err := controllerutil.SetControllerReference(agentRun, job, r.Scheme); err != nil {
 		return ctrl.Result{}, fmt.Errorf("setting owner reference: %w", err)
 	}
@@ -1137,21 +1155,13 @@ func (r *AgentRunReconciler) reconcilePending(ctx context.Context, log logr.Logg
 		now := metav1.Now()
 		ar.Status.Phase = sympoziumv1alpha1.AgentRunPhaseRunning
 		ar.Status.JobName = job.Name
-		ar.Status.StartedAt = &now
-
-		// Record the exact harness artifact that is about to execute, so run
-		// detail and audit can show which digest ran rather than which tag was
-		// requested.
-		if d := taskmodes.HarnessImageDigest(agentRun.Spec.Task); d != "" {
-			ar.Status.HarnessImageDigest = d
-			ar.Status.HarnessRuntimeRef = harnessRuntimeRef
-			ar.Status.HarnessContractVersion = taskmodes.HarnessContractVersion
-			if inheritedHarnessRuntime {
-				ar.Status.HarnessRuntimeSource = "agent-default"
-			} else {
-				ar.Status.HarnessRuntimeSource = "run"
-			}
+		// A harness's later attempts come back through here. The run started
+		// with its first.
+		if ar.Status.StartedAt == nil {
+			ar.Status.StartedAt = &now
 		}
+
+		recordHarnessExecution(ar, agentRun.Spec.Task, harnessRuntimeRef, inheritedHarnessRuntime)
 
 		// Set the trace ID so operators can look up the full distributed trace.
 		if sc := span.SpanContext(); sc.HasTraceID() {
@@ -1163,6 +1173,26 @@ func (r *AgentRunReconciler) reconcilePending(ctx context.Context, log logr.Logg
 	}
 
 	return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+}
+
+// recordHarnessExecution records the exact harness artifact that is about to
+// execute, so run detail and audit can show which digest ran rather than which
+// tag was requested. task is the resolved task, which is never written back to
+// spec; later reconciles read what it declared from here (harnessResumes).
+func recordHarnessExecution(ar *sympoziumv1alpha1.AgentRun, task *sympoziumv1alpha1.TaskSpec, runtimeRef string, inherited bool) {
+	d := taskmodes.HarnessImageDigest(task)
+	if d == "" {
+		return
+	}
+	ar.Status.HarnessImageDigest = d
+	ar.Status.HarnessRuntimeRef = runtimeRef
+	ar.Status.HarnessContractVersion = taskmodes.HarnessContractVersion
+	ar.Status.HarnessCapabilities = taskmodes.CapabilitiesFor(taskmodes.NewHarnessHandler(), task).Names()
+	if inherited {
+		ar.Status.HarnessRuntimeSource = "agent-default"
+	} else {
+		ar.Status.HarnessRuntimeSource = "run"
+	}
 }
 
 // reconcileRunning checks on a running Job and updates status.
@@ -1230,16 +1260,21 @@ func (r *AgentRunReconciler) reconcileRunning(ctx context.Context, log logr.Logg
 		if err := r.List(ctx, podList,
 			client.InNamespace(agentRun.Namespace),
 			client.MatchingLabels{"sympozium.ai/agent-run": agentRun.Name},
-		); err == nil && len(podList.Items) > 0 {
-			podName := podList.Items[0].Name
-			err := r.updateStatusWithRetry(ctx, agentRun, func(ar *sympoziumv1alpha1.AgentRun) {
-				// ⚠️ re-check condition on fresh object!
-				if ar.Status.PodName == "" {
-					ar.Status.PodName = podName
+		); err == nil {
+			podName := podOfJob(podList.Items, job)
+			if podName != "" {
+				err := r.updateStatusWithRetry(ctx, agentRun, func(ar *sympoziumv1alpha1.AgentRun) {
+					// ⚠️ re-check condition on fresh object!
+					if ar.Status.PodName == "" {
+						ar.Status.PodName = podName
+					}
+				})
+				if err != nil {
+					return ctrl.Result{}, err
 				}
-			})
-			if err != nil {
-				return ctrl.Result{}, err
+				// The checks below read the logs through this copy, and a
+				// pod can finish before the next reconcile.
+				agentRun.Status.PodName = podName
 			}
 		}
 	}
@@ -1250,8 +1285,18 @@ func (r *AgentRunReconciler) reconcileRunning(ctx context.Context, log logr.Logg
 	// An in-place gate-retry run parks instead of exiting, so its Job never completes
 	// and none of the checks below fire. Attempts announce themselves through a
 	// stdout marker; pick that up first.
+	// A harness does not park: each attempt's pod exits, and the gate starts
+	// once it has.
 	if gateInPlaceEnabled(agentRun) {
-		if handled, res, err := r.checkParkedAttempt(ctx, log, agentRun); handled || err != nil {
+		var handled bool
+		var res ctrl.Result
+		var err error
+		if harnessRun(agentRun) {
+			handled, res, err = r.harnessAttemptFinished(ctx, log, agentRun, job)
+		} else {
+			handled, res, err = r.checkParkedAttempt(ctx, log, agentRun)
+		}
+		if handled || err != nil {
 			return res, err
 		}
 	}
@@ -1362,6 +1407,28 @@ func (r *AgentRunReconciler) reconcileRunning(ctx context.Context, log logr.Logg
 	return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 }
 
+// podOfJob returns the name of the pod job created, or "" if none is listed.
+// An in-place harness run creates one Job per attempt, and an earlier
+// attempt's pod outlives its Job's completion, so the run label alone can
+// match several pods. A pod with no controller is taken only when no pod of
+// job is listed.
+func podOfJob(pods []corev1.Pod, job *batchv1.Job) string {
+	fallback := ""
+	for i := range pods {
+		owner := metav1.GetControllerOf(&pods[i])
+		if owner == nil {
+			if fallback == "" {
+				fallback = pods[i].Name
+			}
+			continue
+		}
+		if owner.Kind == "Job" && owner.Name == job.Name {
+			return pods[i].Name
+		}
+	}
+	return fallback
+}
+
 // runTimeoutAnchor returns the instant spec.timeout is measured from: the run
 // start normally, the current attempt's start for an in-place retry chain.
 //
@@ -1435,6 +1502,9 @@ func (r *AgentRunReconciler) reconcileCompleted(ctx context.Context, log logr.Lo
 	// targets runWorkspacePVCName, never the session's.
 	if workspaceNeedsPVC(agentRun) {
 		r.cleanupWorkspacePVC(ctx, log, agentRun)
+	}
+	if harnessHomeNeedsPVC(agentRun) {
+		r.cleanupRunPVC(ctx, log, agentRun, harnessHomePVCName(agentRun))
 	}
 
 	// Remove the finalizer so the CR can be deleted later if needed.
@@ -3132,8 +3202,9 @@ func (r *AgentRunReconciler) buildJob(
 	}
 	// An in-place retry run holds its pod across every attempt and gate cycle, so
 	// the deadline has to cover the whole chain. Sized off one attempt,
-	// activeDeadlineSeconds would reclaim the pod mid-chain.
-	if gateInPlaceEnabled(agentRun) {
+	// activeDeadlineSeconds would reclaim the pod mid-chain. A harness's pod
+	// runs one attempt.
+	if gateInPlaceEnabled(agentRun) && !harnessRun(agentRun) {
 		spec := gateRetrySpec(agentRun)
 		perAttempt := deadline + int64(gateParkBudget(agentRun).Seconds())
 		deadline = perAttempt * int64(max(spec.MaxAttempts, 1))
@@ -3251,19 +3322,25 @@ func (r *AgentRunReconciler) buildContainers(
 			corev1.EnvVar{Name: "GATE_IN_PLACE_ENABLED", Value: "true"},
 			corev1.EnvVar{Name: "GATE_IN_PLACE_MAX_ATTEMPTS", Value: strconv.Itoa(spec.MaxAttempts)},
 			// Not always 1: a successor created by the clone path (after a
-			// budget halt, say) keeps inPlace and continues the count.
+			// budget halt, say) keeps inPlace and continues the count. For a
+			// harness it is the one attempt this pod runs.
 			corev1.EnvVar{Name: "GATE_IN_PLACE_START_ATTEMPT", Value: strconv.Itoa(currentAttempt(agentRun))},
-			corev1.EnvVar{Name: "GATE_PARK_TIMEOUT", Value: gateParkBudget(agentRun).String()},
+		)
+		// A harness does not park, so it has no park timeout and nothing to
+		// sign. It gets no key either: the model runs shell tools in its
+		// container and could read it.
+		if !harnessRun(agentRun) {
+			agentEnv = append(agentEnv, corev1.EnvVar{Name: "GATE_PARK_TIMEOUT", Value: gateParkBudget(agentRun).String()})
 			// The key that signs attempt markers and verdicts. Only this one
 			// key of the gate Secret, and only on the agent container: the
 			// verdict token never reaches the agent, nor this key a sidecar.
-			corev1.EnvVar{Name: ipc.GateKeyEnv, ValueFrom: &corev1.EnvVarSource{
+			agentEnv = append(agentEnv, corev1.EnvVar{Name: ipc.GateKeyEnv, ValueFrom: &corev1.EnvVarSource{
 				SecretKeyRef: &corev1.SecretKeySelector{
 					LocalObjectReference: corev1.LocalObjectReference{Name: agentRunGateSecretName(agentRun)},
 					Key:                  GateAttemptKeySecretKey,
 				},
-			}},
-		)
+			}})
+		}
 	}
 
 	ipcEnv := []corev1.EnvVar{
@@ -3947,8 +4024,9 @@ func (r *AgentRunReconciler) buildContainers(
 
 	// Inject preRun lifecycle hook containers as init containers.
 	// These run after system init containers (wait-for-memory, mcp-discover)
-	// but before the agent starts.
-	if agentRun.Spec.Lifecycle != nil {
+	// but before the agent starts. Once per run: a harness's later attempt
+	// continues in the workspace its first pod's hooks prepared.
+	if agentRun.Spec.Lifecycle != nil && !harnessContinuesInANewPod(agentRun) {
 		for _, hook := range agentRun.Spec.Lifecycle.PreRun {
 			hookContainer := corev1.Container{
 				Name:            fmt.Sprintf("pre-%s", hook.Name),
@@ -4461,6 +4539,15 @@ func (r *AgentRunReconciler) buildVolumes(agentRun *sympoziumv1alpha1.AgentRun, 
 	// harness that assumes it can write to $HOME is accommodated without
 	// relaxing readOnlyRootFilesystem.
 	volumes = append(volumes, taskModeAgentVolumes(agentRun.Spec.Task)...)
+	if harnessHomeNeedsPVC(agentRun) {
+		for i := range volumes {
+			if volumes[i].Name == "harness-home" {
+				volumes[i].VolumeSource = corev1.VolumeSource{
+					PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: harnessHomePVCName(agentRun)},
+				}
+			}
+		}
+	}
 
 	// Add memory ConfigMap volume if legacy memory is enabled.
 	if memoryEnabled {
@@ -6901,6 +6988,31 @@ func workspaceNeedsPVC(agentRun *sympoziumv1alpha1.AgentRun) bool {
 	return len(agentRun.Spec.Lifecycle.PostRun) > 0
 }
 
+// agentJobName names the run's agent Job. A harness runs each in-place attempt
+// in a Job of its own, and a Job spec is immutable, so the attempts after its
+// first get their own names. status.jobName is still the previous attempt's
+// Job then (startNextAttempt); an agent-runner run only ever has one.
+func agentJobName(agentRun *sympoziumv1alpha1.AgentRun) string {
+	if !harnessContinuesInANewPod(agentRun) {
+		return agentRun.Name
+	}
+	suffix := fmt.Sprintf("-attempt-%d", currentAttempt(agentRun))
+	base := agentRun.Name
+	if len(base)+len(suffix) > jobNameMaxLen {
+		sum := sha256.Sum256([]byte(agentRun.Name))
+		hash := fmt.Sprintf("-%x", sum[:4])
+		base = strings.TrimRight(base[:jobNameMaxLen-len(suffix)-len(hash)], "-") + hash
+	}
+	return base + suffix
+}
+
+// harnessContinuesInANewPod reports whether the pod being built runs a later
+// attempt of an in-place harness run, which resumes the session an earlier
+// pod of the run left.
+func harnessContinuesInANewPod(agentRun *sympoziumv1alpha1.AgentRun) bool {
+	return agentRun.Status.JobName != "" && harnessHomeNeedsPVC(agentRun)
+}
+
 // runWorkspacePVCName is the name of the PVC a run provisions for itself.
 func runWorkspacePVCName(agentRun *sympoziumv1alpha1.AgentRun) string {
 	return fmt.Sprintf("%s-workspace", agentRun.Name)
@@ -6937,7 +7049,34 @@ func ownsRunWorkspacePVC(agentRun *sympoziumv1alpha1.AgentRun) bool {
 // ownsRunWorkspacePVC. It lets the workspace persist between the main agent
 // Job and the postRun Job.
 func (r *AgentRunReconciler) ensureWorkspacePVC(ctx context.Context, agentRun *sympoziumv1alpha1.AgentRun) error {
-	pvcName := runWorkspacePVCName(agentRun)
+	return r.ensureRunPVC(ctx, agentRun, runWorkspacePVCName(agentRun), "workspace")
+}
+
+// harnessHomeNeedsPVC reports whether the run's harness keeps its HOME on a
+// PVC rather than an emptyDir. An in-place harness runs each attempt in a new
+// pod (see harnessAttemptFinished), and the next one resumes the session the
+// last one left in HOME.
+//
+// Not a subPath of the workspace PVC: HOME holds the harness's session and
+// whatever credentials it caches, which the gate and a per-session workspace's
+// later runs have no business reading.
+func harnessHomeNeedsPVC(agentRun *sympoziumv1alpha1.AgentRun) bool {
+	return harnessRun(agentRun) && gateInPlaceEnabled(agentRun)
+}
+
+// harnessHomePVCName is the name of the PVC holding a harness run's HOME.
+func harnessHomePVCName(agentRun *sympoziumv1alpha1.AgentRun) string {
+	return fmt.Sprintf("%s-harness-home", agentRun.Name)
+}
+
+// ensureHarnessHomePVC creates the PVC harnessHomeNeedsPVC asks for.
+func (r *AgentRunReconciler) ensureHarnessHomePVC(ctx context.Context, agentRun *sympoziumv1alpha1.AgentRun) error {
+	return r.ensureRunPVC(ctx, agentRun, harnessHomePVCName(agentRun), "harness-home")
+}
+
+// ensureRunPVC creates a PVC the run owns, so it is deleted with the run if
+// reconcileCompleted does not get to it first.
+func (r *AgentRunReconciler) ensureRunPVC(ctx context.Context, agentRun *sympoziumv1alpha1.AgentRun, pvcName, component string) error {
 	storageSize := resource.MustParse("1Gi")
 	accessMode := corev1.ReadWriteOnce
 
@@ -6947,7 +7086,7 @@ func (r *AgentRunReconciler) ensureWorkspacePVC(ctx context.Context, agentRun *s
 			Namespace: agentRun.Namespace,
 			Labels: map[string]string{
 				"sympozium.ai/agent-run": agentRun.Name,
-				"sympozium.ai/component": "workspace",
+				"sympozium.ai/component": component,
 			},
 		},
 		Spec: corev1.PersistentVolumeClaimSpec{
@@ -6961,7 +7100,7 @@ func (r *AgentRunReconciler) ensureWorkspacePVC(ctx context.Context, agentRun *s
 	}
 
 	if err := controllerutil.SetControllerReference(agentRun, pvc, r.Scheme); err != nil {
-		return fmt.Errorf("setting owner reference on workspace PVC: %w", err)
+		return fmt.Errorf("setting owner reference on %s PVC: %w", component, err)
 	}
 
 	if err := r.Create(ctx, pvc); err != nil {
@@ -6976,7 +7115,11 @@ func (r *AgentRunReconciler) ensureWorkspacePVC(ctx context.Context, agentRun *s
 // cleanupWorkspacePVC deletes the run's own workspace PVC. It never touches a
 // per-session PVC, which belongs to its WorkspaceSession.
 func (r *AgentRunReconciler) cleanupWorkspacePVC(ctx context.Context, log logr.Logger, agentRun *sympoziumv1alpha1.AgentRun) {
-	pvcName := runWorkspacePVCName(agentRun)
+	r.cleanupRunPVC(ctx, log, agentRun, runWorkspacePVCName(agentRun))
+}
+
+// cleanupRunPVC deletes the run's PVC named pvcName.
+func (r *AgentRunReconciler) cleanupRunPVC(ctx context.Context, log logr.Logger, agentRun *sympoziumv1alpha1.AgentRun, pvcName string) {
 	pvc := &corev1.PersistentVolumeClaim{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      pvcName,
@@ -6984,7 +7127,7 @@ func (r *AgentRunReconciler) cleanupWorkspacePVC(ctx context.Context, log logr.L
 		},
 	}
 	if err := r.Delete(ctx, pvc); err != nil && !errors.IsNotFound(err) {
-		log.Error(err, "Failed to delete workspace PVC", "pvc", pvcName)
+		log.Error(err, "Failed to delete PVC", "pvc", pvcName)
 	}
 }
 
