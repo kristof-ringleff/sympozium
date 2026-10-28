@@ -357,6 +357,38 @@ func TestReconcilePending_RefusesAJobItDoesNotOwn(t *testing.T) {
 	}
 }
 
+// A replayed reconcilePending (its status write lost) finds the Job it created
+// itself, and carries on with it.
+func TestReconcilePending_KeepsTheJobItAlreadyCreated(t *testing.T) {
+	agent := parityAgent()
+	agent.Spec.PolicyRef = "harness-ok"
+	agent.Spec.RuntimeRef = "my-harness"
+	policy := policyWithRegistries("harness-ok")
+	runtime := runtimeSpec(runtimeTestImage, "resume")
+	runtime.Name = "my-harness"
+	runtime.Namespace = "default"
+	runtime.Spec.ContractVersion = taskmodes.HarnessContractVersion
+	runtime.Status.Conditions = []metav1.Condition{{
+		Type: sympoziumv1alpha1.AgentRuntimeReadyCondition, Status: metav1.ConditionTrue, Reason: "Ready",
+	}}
+
+	run := parityRun()
+	run.UID = "run-uid"
+	own := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{
+		Name: run.Name, Namespace: run.Namespace,
+		OwnerReferences: []metav1.OwnerReference{*metav1.NewControllerRef(run, sympoziumv1alpha1.GroupVersion.WithKind("AgentRun"))},
+	}}
+	r := newAgentRunTestReconciler(t, run, agent, policy, runtime, own)
+
+	if _, err := r.reconcilePending(context.Background(), logr.Discard(), run); err != nil {
+		t.Fatalf("reconcilePending returned error: %v", err)
+	}
+	got := getRun(t, r, run.Name)
+	if got.Status.Phase != sympoziumv1alpha1.AgentRunPhaseRunning || got.Status.JobName != own.Name || got.Status.Error != "" {
+		t.Errorf("phase = %q job = %q error = %q, want Running on its own Job %s", got.Status.Phase, got.Status.JobName, got.Status.Error, own.Name)
+	}
+}
+
 func hasInitContainer(job *batchv1.Job, name string) bool {
 	for _, c := range job.Spec.Template.Spec.InitContainers {
 		if c.Name == name {
