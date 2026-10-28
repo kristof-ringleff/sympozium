@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/go-logr/logr"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -89,9 +90,14 @@ func harnessAttemptPod(run *sympoziumv1alpha1.AgentRun, job *batchv1.Job, phase 
 	}
 }
 
-func harnessResultLog(t *testing.T, response string) string {
+// harnessResultLog is the agent log of an attempt that answered response and
+// spent tokens, split evenly between input and output.
+func harnessResultLog(t *testing.T, response string, tokens int) string {
 	t.Helper()
-	raw, err := json.Marshal(map[string]any{"status": "success", "response": response})
+	raw, err := json.Marshal(map[string]any{
+		"status": "success", "response": response,
+		"metrics": map[string]int{"inputTokens": tokens / 2, "outputTokens": tokens - tokens/2},
+	})
 	if err != nil {
 		t.Fatalf("marshal result: %v", err)
 	}
@@ -99,10 +105,27 @@ func harnessResultLog(t *testing.T, response string) string {
 }
 
 // A resuming harness's retry chain, driven through Reconcile from the first
-// attempt's Job to the approved second attempt. Each attempt runs in a Job pod
-// of its own, the gate starts only once that pod has ended, and the second pod
-// gets the verdict, the same HOME and no preRun hooks.
+// attempt's Job to the verdict on the last. Each attempt runs in a Job pod of
+// its own, every attempt's gate (the last one's included) starts only once
+// that pod has ended, and the second pod gets the verdict, the same HOME and
+// no preRun hooks. The chain's usage is every attempt's, not the last pod's.
 func TestReconcile_AResumingHarnessRetriesInANewPodOfTheSameRun(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		finalVerdict string
+		wantVerdict  string
+		wantResult   string
+	}{
+		{name: "exhausted", finalVerdict: "retry", wantVerdict: "retries-exhausted", wantResult: "Response blocked: the response gate rejected all 2 attempts"},
+		{name: "approved", finalVerdict: "approve", wantVerdict: "approved", wantResult: "attempt 2: slugify returns \"untitled\" when empty"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			driveHarnessChain(t, tc.finalVerdict, tc.wantVerdict, tc.wantResult)
+		})
+	}
+}
+
+func driveHarnessChain(t *testing.T, finalVerdict, wantVerdict, wantResult string) {
 	ctx := context.Background()
 
 	agent := parityAgent()
@@ -120,7 +143,7 @@ func TestReconcile_AResumingHarnessRetriesInANewPodOfTheSameRun(t *testing.T) {
 	run := parityRun()
 	run.Spec.Lifecycle = &sympoziumv1alpha1.LifecycleHooks{
 		GateDefault: "block",
-		Retry:       inPlace(&sympoziumv1alpha1.RetrySpec{MaxAttempts: 3, On: []string{"gate"}}),
+		Retry:       inPlace(&sympoziumv1alpha1.RetrySpec{MaxAttempts: 2, On: []string{"gate"}}),
 		PreRun:      []sympoziumv1alpha1.LifecycleHookContainer{{Name: "clone", Image: "clone:latest"}},
 		PostRun:     []sympoziumv1alpha1.LifecycleHookContainer{{Name: "check", Image: "check:latest", Gate: true}},
 	}
@@ -167,11 +190,47 @@ func TestReconcile_AResumingHarnessRetriesInANewPodOfTheSameRun(t *testing.T) {
 			t.Fatalf("update pod %s: %v", pod.Name, err)
 		}
 	}
+	// The agent container exits while the ipc-bridge still runs. The attempt
+	// is recorded, but nothing may judge /workspace until the pod has ended.
+	finishAttempt := func(job *batchv1.Job, response string, tokens int) *corev1.Pod {
+		t.Helper()
+		pod := harnessAttemptPod(run, job, corev1.PodRunning)
+		if err := r.Create(ctx, pod); err != nil {
+			t.Fatalf("create pod for %s: %v", job.Name, err)
+		}
+		logs.byPod[pod.Name] = harnessResultLog(t, response, tokens)
+
+		got := reconcileUntil("the attempt awaiting its gate", func(ar *sympoziumv1alpha1.AgentRun) bool {
+			return ar.Status.Phase == sympoziumv1alpha1.AgentRunPhaseAwaitingGate
+		})
+		if got.Status.PodName != pod.Name {
+			t.Errorf("status.podName = %q, want %q", got.Status.PodName, pod.Name)
+		}
+		gate := gateJobNameForAttempt(run, currentAttempt(got))
+		if got.Status.PostRunJobName != gate {
+			t.Fatalf("postRunJobName = %q, want %q", got.Status.PostRunJobName, gate)
+		}
+		reconcile()
+		if jobExists(t, r, gate) {
+			t.Fatalf("attempt %d's gate started while a container of its pod was still running", currentAttempt(got))
+		}
+		setPodPhase(pod, job, corev1.PodSucceeded)
+		reconcile()
+		if !jobExists(t, r, gate) {
+			t.Fatalf("attempt %d's gate did not start once its pod had ended", currentAttempt(got))
+		}
+		return pod
+	}
 	// The verdict as the API's gate-verdict handler writes it, stamped with
-	// the attempt it was made against.
-	submitVerdict := func(action, reason, response string) {
+	// the attempt it was made against, after the gate hook's Job completes.
+	gateSays := func(action, reason, response string) {
 		t.Helper()
 		current := getRun(t, r, run.Name)
+		gate := getJob(current.Status.PostRunJobName)
+		gate.Status.Succeeded = 1
+		if err := r.Status().Update(ctx, gate); err != nil {
+			t.Fatalf("complete gate Job %s: %v", gate.Name, err)
+		}
 		attempt := currentAttempt(current)
 		raw, err := json.Marshal(map[string]any{"action": action, "reason": reason, "response": response, "attempt": attempt})
 		if err != nil {
@@ -186,15 +245,6 @@ func TestReconcile_AResumingHarnessRetriesInANewPodOfTheSameRun(t *testing.T) {
 			t.Fatalf("submit verdict: %v", err)
 		}
 	}
-	// The gate hook reports, then its Job completes.
-	finishGate := func(name string) {
-		t.Helper()
-		job := getJob(name)
-		job.Status.Succeeded = 1
-		if err := r.Status().Update(ctx, job); err != nil {
-			t.Fatalf("complete gate Job %s: %v", name, err)
-		}
-	}
 
 	// ── attempt 1 ──
 	got := reconcileUntil("attempt 1 running", func(ar *sympoziumv1alpha1.AgentRun) bool {
@@ -207,54 +257,27 @@ func TestReconcile_AResumingHarnessRetriesInANewPodOfTheSameRun(t *testing.T) {
 	if !hasInitContainer(firstJob, "pre-clone") {
 		t.Error("the first attempt's pod does not run the preRun hook")
 	}
-
-	// The agent container exits while the ipc-bridge still runs. The attempt
-	// is recorded, but nothing may judge /workspace yet.
-	firstPod := harnessAttemptPod(run, firstJob, corev1.PodRunning)
-	if err := r.Create(ctx, firstPod); err != nil {
-		t.Fatalf("create attempt 1 pod: %v", err)
-	}
-	logs.byPod[firstPod.Name] = harnessResultLog(t, "attempt 1: slugify without the empty case")
-
-	got = reconcileUntil("attempt 1 awaiting its gate", func(ar *sympoziumv1alpha1.AgentRun) bool {
-		return ar.Status.Phase == sympoziumv1alpha1.AgentRunPhaseAwaitingGate
-	})
-	gate1 := got.Status.PostRunJobName
-	if gate1 != gateJobNameForAttempt(run, 1) {
-		t.Fatalf("postRunJobName = %q, want %q", gate1, gateJobNameForAttempt(run, 1))
-	}
-	reconcile()
-	if jobExists(t, r, gate1) {
-		t.Fatal("the gate started while a container of the attempt's pod was still running")
-	}
-
-	setPodPhase(firstPod, firstJob, corev1.PodSucceeded)
-	reconcile()
-	if !jobExists(t, r, gate1) {
-		t.Fatal("the gate did not start once the attempt's pod had ended")
-	}
+	finishAttempt(firstJob, "attempt 1: slugify without the empty case", 100)
 
 	// ── the gate asks for a retry ──
-	finishGate(gate1)
-	submitVerdict("retry", "npm test failed", "not ok 2 - hidden: an empty result becomes \"untitled\"")
+	gateSays("retry", "npm test failed", "not ok 2 - hidden: an empty result becomes \"untitled\"")
 	got = reconcileUntil("attempt 2 pending", func(ar *sympoziumv1alpha1.AgentRun) bool {
 		return ar.Status.Attempt == 2
 	})
 	if got.Status.Phase != sympoziumv1alpha1.AgentRunPhasePending {
 		t.Fatalf("phase = %s after a retry verdict, want the run back in Pending for its next pod", got.Status.Phase)
 	}
-
 	verdicts := gateVerdicts(t, r, run)
 	if len(verdicts) != 1 || verdicts[0].Attempt != 1 || verdicts[0].Action != ipc.GateVerdictActionContinue {
 		t.Fatalf("gate verdicts = %+v, want one continue verdict for attempt 1", verdicts)
 	}
-	for _, want := range []string{"## Attempt 2 of 3", "npm test failed", "an empty result becomes"} {
+	for _, want := range []string{"## Attempt 2 of 2", "npm test failed", "an empty result becomes"} {
 		if !strings.Contains(verdicts[0].Card, want) {
 			t.Errorf("the card the harness passes on is missing %q:\n%s", want, verdicts[0].Card)
 		}
 	}
 
-	// ── attempt 2: a new Job pod of the same run ──
+	// ── attempt 2, the last: a new Job pod of the same run ──
 	got = reconcileUntil("attempt 2 running", func(ar *sympoziumv1alpha1.AgentRun) bool {
 		return ar.Status.Phase == sympoziumv1alpha1.AgentRunPhaseRunning
 	})
@@ -275,37 +298,62 @@ func TestReconcile_AResumingHarnessRetriesInANewPodOfTheSameRun(t *testing.T) {
 	}
 
 	// Attempt 1's pod is still listed. The run must follow attempt 2's.
-	secondPod := harnessAttemptPod(run, secondJob, corev1.PodSucceeded)
-	if err := r.Create(ctx, secondPod); err != nil {
-		t.Fatalf("create attempt 2 pod: %v", err)
-	}
-	logs.byPod[secondPod.Name] = harnessResultLog(t, "attempt 2: slugify returns \"untitled\" when empty")
+	finishAttempt(secondJob, "attempt 2: slugify returns \"untitled\" when empty", 40)
 
-	got = reconcileUntil("attempt 2 awaiting its gate", func(ar *sympoziumv1alpha1.AgentRun) bool {
-		return ar.Status.Phase == sympoziumv1alpha1.AgentRunPhaseAwaitingGate
+	// ── the gate's verdict on the last attempt ──
+	gateSays(finalVerdict, "npm test: "+finalVerdict, "")
+	got = reconcileUntil("the run ended", func(ar *sympoziumv1alpha1.AgentRun) bool {
+		return ar.Status.Phase.IsTerminal()
 	})
-	if got.Status.PodName != secondPod.Name {
-		t.Errorf("status.podName = %q, want attempt 2's pod %q", got.Status.PodName, secondPod.Name)
+	if got.Status.Phase != sympoziumv1alpha1.AgentRunPhaseSucceeded || got.Status.GateVerdict != wantVerdict {
+		t.Errorf("phase = %s gateVerdict = %q, want Succeeded with %q", got.Status.Phase, got.Status.GateVerdict, wantVerdict)
 	}
-	if !strings.HasPrefix(got.Status.Result, "attempt 2:") {
-		t.Errorf("result = %q, want attempt 2's", got.Status.Result)
+	if got.Status.Result != wantResult {
+		t.Errorf("result = %q, want %q", got.Status.Result, wantResult)
 	}
-	gate2 := gateJobNameForAttempt(run, 2)
-	reconcileUntil("attempt 2's gate Job", func(*sympoziumv1alpha1.AgentRun) bool { return jobExists(t, r, gate2) })
+	if got.Status.TokenUsage == nil || got.Status.TokenUsage.TotalTokens != 140 {
+		t.Errorf("tokenUsage = %+v, want both attempts' 140 tokens", got.Status.TokenUsage)
+	}
+	if len(got.Status.Attempts) != 2 {
+		t.Fatalf("attempts = %+v, want both recorded", got.Status.Attempts)
+	}
+	last := got.Status.Attempts[1]
+	if !strings.HasPrefix(last.Result, "attempt 2:") || last.TokenUsage == nil || last.TokenUsage.TotalTokens != 40 {
+		t.Errorf("attempt 2 = result %q usage %+v, want its own result and 40 tokens", last.Result, last.TokenUsage)
+	}
 
-	// ── the gate approves ──
-	finishGate(gate2)
-	submitVerdict("approve", "npm test passed", "")
-	got = reconcileUntil("the run succeeded", func(ar *sympoziumv1alpha1.AgentRun) bool {
-		return ar.Status.Phase == sympoziumv1alpha1.AgentRunPhaseSucceeded
-	})
-	if !strings.HasPrefix(got.Status.Result, "attempt 2:") {
-		t.Errorf("result = %q, want attempt 2's", got.Status.Result)
-	}
 	reconcile() // reconcileCompleted
 	err := r.Get(ctx, client.ObjectKey{Namespace: run.Namespace, Name: harnessHomePVCName(run)}, &corev1.PersistentVolumeClaim{})
 	if !apierrors.IsNotFound(err) {
 		t.Errorf("harness HOME PVC after the run: err = %v, want it deleted", err)
+	}
+}
+
+// A later attempt's Job name is predictable, so another run can hold it. Its
+// pod's result must not become this run's.
+func TestReconcilePending_RefusesAJobItDoesNotOwn(t *testing.T) {
+	agent := parityAgent()
+	agent.Spec.PolicyRef = "harness-ok"
+	agent.Spec.RuntimeRef = "my-harness"
+	policy := policyWithRegistries("harness-ok")
+	runtime := runtimeSpec(runtimeTestImage, "resume")
+	runtime.Name = "my-harness"
+	runtime.Namespace = "default"
+	runtime.Spec.ContractVersion = taskmodes.HarnessContractVersion
+	runtime.Status.Conditions = []metav1.Condition{{
+		Type: sympoziumv1alpha1.AgentRuntimeReadyCondition, Status: metav1.ConditionTrue, Reason: "Ready",
+	}}
+
+	run := parityRun()
+	foreign := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: run.Name, Namespace: run.Namespace}}
+	r := newAgentRunTestReconciler(t, run, agent, policy, runtime, foreign)
+
+	if _, err := r.reconcilePending(context.Background(), logr.Discard(), run); err != nil {
+		t.Fatalf("reconcilePending returned error: %v", err)
+	}
+	got := getRun(t, r, run.Name)
+	if got.Status.Phase != sympoziumv1alpha1.AgentRunPhaseFailed || !strings.Contains(got.Status.Error, "not owned by this run") {
+		t.Errorf("phase = %q error = %q, want a failure naming the foreign Job", got.Status.Phase, got.Status.Error)
 	}
 }
 

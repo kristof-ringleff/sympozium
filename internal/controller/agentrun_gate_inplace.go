@@ -273,14 +273,17 @@ func (r *AgentRunReconciler) checkParkedAttempt(
 // signal, and it could keep changing /workspace while the gate checks it. A
 // pod that has exited can do neither.
 //
-// The last attempt does not come here: nothing follows it, so the ordinary
-// completion path gates it as it would a one-shot run. A failed attempt or a
-// skipped run does not either, because each ends the chain.
+// The last attempt comes here too. Its pod reports only its own usage, so the
+// ordinary completion path would overwrite the chain's total with it, and
+// would start the gate before a sidecar that mounts /workspace has ended. A
+// retry verdict on it resolves as retries-exhausted (inPlaceExhausted). A
+// failed attempt or a skipped run does not come here, because each ends the
+// chain.
 func (r *AgentRunReconciler) harnessAttemptFinished(
 	ctx context.Context, log logr.Logger, agentRun *sympoziumv1alpha1.AgentRun, job *batchv1.Job,
 ) (handled bool, result ctrl.Result, err error) {
 	attempt := currentAttempt(agentRun)
-	if spec := gateRetrySpec(agentRun); spec == nil || attempt >= spec.MaxAttempts {
+	if gateRetrySpec(agentRun) == nil {
 		return false, ctrl.Result{}, nil
 	}
 	if job.Status.Succeeded == 0 && job.Status.Failed == 0 {

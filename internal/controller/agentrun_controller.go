@@ -1143,11 +1143,20 @@ func (r *AgentRunReconciler) reconcilePending(ctx context.Context, log logr.Logg
 	}
 
 	if err := r.Create(ctx, job); err != nil {
-		if errors.IsAlreadyExists(err) {
-			log.Info("Job already exists")
-		} else {
+		if !errors.IsAlreadyExists(err) {
 			return ctrl.Result{}, fmt.Errorf("creating Job: %w", err)
 		}
+		// A replayed reconcile already created it. A Job this run does not
+		// own is someone else's (a run named <run>-attempt-2, say), and its
+		// pod's result must not become this run's.
+		var existing batchv1.Job
+		if err := r.Get(ctx, client.ObjectKeyFromObject(job), &existing); err != nil {
+			return ctrl.Result{}, fmt.Errorf("reading existing Job %s: %w", job.Name, err)
+		}
+		if !metav1.IsControlledBy(&existing, agentRun) {
+			return ctrl.Result{}, r.failRun(ctx, agentRun, fmt.Sprintf("Job %s exists and is not owned by this run", job.Name))
+		}
+		log.Info("Job already exists")
 	}
 
 	// Update status to Running

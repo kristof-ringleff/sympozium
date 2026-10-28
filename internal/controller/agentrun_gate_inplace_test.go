@@ -1434,19 +1434,10 @@ func TestReconcileAwaitingGate_AHarnessGateStartsOnceThePodIsGone(t *testing.T) 
 	}
 }
 
-// The attempt that can still be retried is gated through the new path. The
-// last one, and one whose pod is still working, are left to the ordinary
-// completion checks.
+// Every finished attempt, the last included, is gated through the new path
+// (TestReconcile_AResumingHarnessRetriesInANewPodOfTheSameRun). One whose pod
+// is still working is left to the ordinary completion checks.
 func TestHarnessAttemptFinished_LeavesWhatItDoesNotGate(t *testing.T) {
-	t.Run("last attempt", func(t *testing.T) {
-		run := harnessGateRun(t, "harness-last", 0)
-		run.Status.Attempt = 3
-		r := harnessGateReconciler(t, run)
-		job := &batchv1.Job{Status: batchv1.JobStatus{Succeeded: 1}}
-		if handled, _, err := r.harnessAttemptFinished(context.Background(), logr.Discard(), run, job); handled || err != nil {
-			t.Errorf("handled = %v err = %v, want the ordinary path", handled, err)
-		}
-	})
 	t.Run("pod still working", func(t *testing.T) {
 		run := harnessGateRun(t, "harness-working", 0)
 		r := harnessGateReconciler(t, run, parkedPod(run))
