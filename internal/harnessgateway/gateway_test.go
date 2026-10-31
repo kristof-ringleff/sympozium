@@ -4,20 +4,26 @@ import (
 	"bufio"
 	"compress/gzip"
 	"context"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	api "github.com/sympozium-ai/sympozium/api/v1alpha1"
 	"github.com/sympozium-ai/sympozium/internal/modelkey"
@@ -770,4 +776,311 @@ func TestMaxConcurrent(t *testing.T) {
 	}
 	close(release)
 	<-done
+}
+
+// Every run holds a stream open at the same time. Each call must carry its own
+// run's key and get its own run's reply, and no call may wait for another.
+func TestConcurrentCallsStreamSideBySide(t *testing.T) {
+	const runs = 8
+	padding := "event: one\ndata: " + strings.Repeat("a", 200) + "\n\n"
+	release := make(chan struct{})
+	var mu sync.Mutex
+	authByRun := map[string]string{}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		run := string(body)
+		mu.Lock()
+		authByRun[run] = r.Header.Get("Authorization")
+		mu.Unlock()
+		_, _ = io.WriteString(w, padding)
+		w.(http.Flusher).Flush()
+		<-release
+		_, _ = io.WriteString(w, "event: two\ndata: "+run+"\n\n")
+	}))
+	defer upstream.Close()
+
+	base := newFixture("openai", "OPENAI_API_KEY", upstream.URL)
+	objects := []client.Object{base.agent}
+	token := func(i int) string { return fmt.Sprintf("run-token-%d-0123456789", i) }
+	key := func(i int) string { return fmt.Sprintf("sk-real-key-%d-0123456789", i) }
+	for i := range runs {
+		name := fmt.Sprintf("run-%d", i)
+		run := base.run.DeepCopy()
+		run.Name, run.UID = name, types.UID(name+"-uid")
+		run.Spec.Model.AuthSecretRef = name + "-key"
+		runToken := base.token.DeepCopy()
+		runToken.Name = RunTokenSecretName(name)
+		runToken.Annotations[KeySecretUIDAnnotation] = name + "-key-uid"
+		runToken.OwnerReferences[0].Name, runToken.OwnerReferences[0].UID = name, run.UID
+		runToken.Data[TokenSecretKey] = []byte(token(i))
+		runKey := base.key.DeepCopy()
+		runKey.Name, runKey.UID = name+"-key", types.UID(name+"-key-uid")
+		runKey.Data["OPENAI_API_KEY"] = []byte(key(i))
+		objects = append(objects, run, runToken, runKey)
+	}
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = api.AddToScheme(scheme)
+	reader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).Build()
+	subject := &Gateway{Reader: reader, Profiles: staticProfiles{shippedProfiles(t, upstream.URL, "")}, MaxConcurrent: runs}
+	gateway := httptest.NewServer(subject.Handler())
+	defer gateway.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	// The upstream finishes no stream until every call has its first event. If
+	// calls ran one at a time, the first would never get its second event.
+	var streaming, finished sync.WaitGroup
+	streaming.Add(runs)
+	finished.Add(runs)
+	for i := range runs {
+		go func() {
+			defer finished.Done()
+			run := fmt.Sprintf("run-%d", i)
+			var once sync.Once
+			opened := func() { once.Do(streaming.Done) }
+			defer opened()
+			req, err := http.NewRequestWithContext(ctx, http.MethodPost, gateway.URL+"/runs/ns/"+run+"/v1/chat/completions", strings.NewReader(run))
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			req.Header.Set("Authorization", "Bearer "+token(i))
+			response, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Errorf("%s: %v", run, err)
+				return
+			}
+			defer func() { _ = response.Body.Close() }()
+			if response.StatusCode != http.StatusOK {
+				t.Errorf("%s: status = %d", run, response.StatusCode)
+				return
+			}
+			stream := bufio.NewReader(response.Body)
+			if line, err := stream.ReadString('\n'); err != nil || line != "event: one\n" {
+				t.Errorf("%s: first line = %q, err = %v", run, line, err)
+			}
+			opened()
+			rest, err := io.ReadAll(stream)
+			if err != nil {
+				t.Errorf("%s: %v", run, err)
+			}
+			if want := "event: two\ndata: " + run + "\n\n"; !strings.HasSuffix(string(rest), want) {
+				t.Errorf("%s: got another run's reply: %q", run, rest)
+			}
+		}()
+	}
+	streaming.Wait()
+	close(release)
+	finished.Wait()
+
+	gateway.Close() // waits for the handlers, so inFlight has settled
+	if got := subject.inFlight.Load(); got != 0 {
+		t.Errorf("inFlight = %d", got)
+	}
+	for i := range runs {
+		run := fmt.Sprintf("run-%d", i)
+		if got, want := authByRun[run], "Bearer "+key(i); got != want {
+			t.Errorf("%s: upstream saw Authorization %q, want %q", run, got, want)
+		}
+	}
+}
+
+// Concurrent callers share one read of the profiles.
+func TestLoaderReadsOnceForConcurrentCallers(t *testing.T) {
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	configMap := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "profiles", Namespace: "system"},
+		Data:       map[string]string{DataKey: "profiles: []\n"},
+	}
+	var reads atomic.Int64
+	reader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(configMap).WithInterceptorFuncs(interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			reads.Add(1)
+			return c.Get(ctx, key, obj, opts...)
+		},
+	}).Build()
+	loader := &Loader{Reader: reader, Name: "profiles", Namespace: "system", TTL: time.Minute}
+	var callers sync.WaitGroup
+	for range 32 {
+		callers.Add(1)
+		go func() {
+			defer callers.Done()
+			if _, err := loader.Load(context.Background()); err != nil {
+				t.Error(err)
+			}
+		}()
+	}
+	callers.Wait()
+	if got := reads.Load(); got != 1 {
+		t.Errorf("reads = %d", got)
+	}
+}
+
+func TestAHungUpCallerDoesNotFailTheNextCall(t *testing.T) {
+	loader := &Loader{Reader: profilesReader(t, func(ctx context.Context) error { return ctx.Err() }), Name: "profiles", Namespace: "system", TTL: time.Minute}
+	gone, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, _ = loader.Load(gone)
+	if _, err := loader.Load(context.Background()); err != nil {
+		t.Errorf("the next call got %v", err)
+	}
+}
+
+// A failed read says nothing about the next one. It must not refuse calls for a
+// whole TTL.
+func TestAFailedProfileReadIsNotCached(t *testing.T) {
+	var reads atomic.Int64
+	loader := &Loader{Reader: profilesReader(t, func(context.Context) error {
+		if reads.Add(1) == 1 {
+			return errors.New("api server blip")
+		}
+		return nil
+	}), Name: "profiles", Namespace: "system", TTL: time.Minute}
+	if _, err := loader.Load(context.Background()); err == nil {
+		t.Fatal("the failed read was not reported")
+	}
+	if _, err := loader.Load(context.Background()); err != nil {
+		t.Errorf("the next call got %v", err)
+	}
+}
+
+// A caller waiting on someone else's slow read can still hang up.
+func TestACallerCanLeaveWhileAReadIsSlow(t *testing.T) {
+	release, reading := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	loader := &Loader{Reader: profilesReader(t, func(context.Context) error {
+		once.Do(func() { close(reading) })
+		<-release
+		return nil
+	}), Name: "profiles", Namespace: "system", TTL: time.Minute}
+	defer close(release)
+	go func() { _, _ = loader.Load(context.Background()) }()
+	<-reading
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	left := make(chan error, 1)
+	go func() {
+		_, err := loader.Load(ctx)
+		left <- err
+	}()
+	select {
+	case err := <-left:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("err = %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the caller stayed queued behind the read")
+	}
+}
+
+// A read that never answers must end, or the caller behind it waits forever.
+func TestAProfileReadHasATimeLimit(t *testing.T) {
+	loader := &Loader{Reader: profilesReader(t, func(ctx context.Context) error {
+		<-ctx.Done()
+		return ctx.Err()
+	}), Name: "profiles", Namespace: "system", TTL: time.Minute, ReadTimeout: 50 * time.Millisecond}
+	done := make(chan error, 1)
+	go func() {
+		_, err := loader.Load(context.Background())
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Error("the stuck read was not reported")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the read never ended")
+	}
+}
+
+// One run holding every slot would refuse every other run.
+func TestOneRunCannotTakeEverySlot(t *testing.T) {
+	release, started := make(chan struct{}), make(chan struct{}, 3)
+	upstream := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		started <- struct{}{}
+		<-release
+	}))
+	defer upstream.Close()
+	f := newFixture("openai", "OPENAI_API_KEY", upstream.URL)
+	otherToken := f.token.DeepCopy()
+	otherToken.Name = RunTokenSecretName("other")
+	otherToken.OwnerReferences[0].Name, otherToken.OwnerReferences[0].UID = "other", "other-uid"
+	otherToken.Data[TokenSecretKey] = []byte("other-token-0123456789")
+	other := f.run.DeepCopy()
+	other.Name, other.UID = "other", "other-uid"
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = api.AddToScheme(scheme)
+	reader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(f.run, f.token, f.key, f.agent, other, otherToken).Build()
+	subject := &Gateway{Reader: reader, Profiles: staticProfiles{shippedProfiles(t, upstream.URL, "")}, MaxConcurrent: 2, MaxConcurrentPerRun: 1}
+	gateway := httptest.NewServer(subject.Handler())
+	defer gateway.Close()
+
+	var held sync.WaitGroup
+	hold := func(path, token string) {
+		held.Add(1)
+		go func() {
+			defer held.Done()
+			req, _ := http.NewRequest(http.MethodPost, gateway.URL+path, nil)
+			req.Header.Set("Authorization", "Bearer "+token)
+			if response, err := http.DefaultClient.Do(req); err == nil {
+				_ = response.Body.Close()
+			}
+		}()
+	}
+	defer func() {
+		close(release)
+		held.Wait()
+	}()
+	hold("/runs/ns/run/v1/chat/completions", testToken)
+	<-started
+
+	// The run is at its own limit, though the gateway has a slot free.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, gateway.URL+"/runs/ns/run/v1/chat/completions", nil)
+	req.Header.Set("Authorization", "Bearer "+testToken)
+	response, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("the run's second call was not refused: %v", err)
+	}
+	_ = response.Body.Close()
+	if response.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("second call of the run: status = %d", response.StatusCode)
+	}
+	if response.Header.Get("Retry-After") == "" {
+		t.Error("a busy refusal has no Retry-After")
+	}
+
+	// The other run still gets in.
+	hold("/runs/ns/other/v1/chat/completions", "other-token-0123456789")
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the other run was refused")
+	}
+}
+
+// profilesReader serves a valid profiles ConfigMap. Each read calls before first.
+func profilesReader(t *testing.T, before func(context.Context) error) client.Reader {
+	t.Helper()
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	configMap := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: "profiles", Namespace: "system"},
+		Data:       map[string]string{DataKey: "profiles: []\n"},
+	}
+	return fake.NewClientBuilder().WithScheme(scheme).WithObjects(configMap).WithInterceptorFuncs(interceptor.Funcs{
+		Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+			if err := before(ctx); err != nil {
+				return err
+			}
+			return c.Get(ctx, key, obj, opts...)
+		},
+	}).Build()
 }

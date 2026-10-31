@@ -212,6 +212,10 @@ spec:
             - name: HARNESS_GATEWAY_MAX_CONCURRENT
               value: {{ . | quote }}
             {{- end }}
+            {{- with .Values.harnessGateway.maxConcurrentPerRun }}
+            - name: HARNESS_GATEWAY_MAX_CONCURRENT_PER_RUN
+              value: {{ . | quote }}
+            {{- end }}
           ports:
             - name: https
               containerPort: 8443

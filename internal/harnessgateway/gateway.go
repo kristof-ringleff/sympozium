@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -52,6 +53,9 @@ const (
 	// A short provider header value is not a secret worth refusing a response
 	// over. "true" would match almost any response.
 	minEchoSecretLength = 8
+	// Tells a harness refused as busy when to try again. A slot frees when a call
+	// ends, so there is no better estimate.
+	busyRetryAfterSeconds = "5"
 )
 
 // Public refusal reasons. A refusal names no credential, route or provider
@@ -87,10 +91,14 @@ type Gateway struct {
 	Profiles ProfileSource
 	// MaxConcurrent caps calls in flight. Zero means no cap.
 	MaxConcurrent int64
+	// MaxConcurrentPerRun caps one run's calls in flight. Zero means no cap.
+	MaxConcurrentPerRun int64
 	// RunWatchInterval is how often a call in flight re-reads its run.
 	RunWatchInterval time.Duration
 
-	inFlight atomic.Int64
+	mu          sync.Mutex
+	inFlight    atomic.Int64
+	runInFlight map[types.NamespacedName]int64
 }
 
 // Handler serves the gateway's routes.
@@ -170,14 +178,41 @@ func (g *Gateway) serve(w http.ResponseWriter, r *http.Request) {
 		refuse(w, http.StatusForbidden, reason, namespace, name)
 		return
 	}
-	if g.MaxConcurrent > 0 {
-		defer g.inFlight.Add(-1)
-		if g.inFlight.Add(1) > g.MaxConcurrent {
-			refuse(w, http.StatusServiceUnavailable, reasonBusy, namespace, name)
-			return
-		}
+	release, admitted := g.admit(key)
+	if !admitted {
+		w.Header().Set("Retry-After", busyRetryAfterSeconds)
+		refuse(w, http.StatusServiceUnavailable, reasonBusy, namespace, name)
+		return
 	}
+	defer release()
 	g.forward(w, r, route, apiKey, headers, namespace, name)
+}
+
+// admit takes a slot for a call, or refuses if the gateway or the run is at its
+// limit. The per-run limit stops one run, or a stolen token, from taking every
+// slot and refusing all the other runs.
+func (g *Gateway) admit(run types.NamespacedName) (release func(), admitted bool) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.MaxConcurrent > 0 && g.inFlight.Load() >= g.MaxConcurrent {
+		return nil, false
+	}
+	if g.MaxConcurrentPerRun > 0 && g.runInFlight[run] >= g.MaxConcurrentPerRun {
+		return nil, false
+	}
+	if g.runInFlight == nil {
+		g.runInFlight = map[types.NamespacedName]int64{}
+	}
+	g.inFlight.Add(1)
+	g.runInFlight[run]++
+	return func() {
+		g.mu.Lock()
+		defer g.mu.Unlock()
+		g.inFlight.Add(-1)
+		if g.runInFlight[run]--; g.runInFlight[run] == 0 {
+			delete(g.runInFlight, run)
+		}
+	}, true
 }
 
 // tokenSecret returns the run's token Secret if the request holds its token. It

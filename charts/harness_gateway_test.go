@@ -58,6 +58,8 @@ func TestHarnessGatewayRender(t *testing.T) {
 		"readOnlyRootFilesystem: true",
 		"HARNESS_GATEWAY_MAX_CONCURRENT",
 		"value: \"32\"",
+		"HARNESS_GATEWAY_MAX_CONCURRENT_PER_RUN",
+		"value: \"16\"",
 		"https://harness-gateway.sympozium-system.svc",
 		"sympozium.ai/agent-run",
 		"namespace: \"tenant-a\"",

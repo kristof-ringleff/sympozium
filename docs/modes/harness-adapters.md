@@ -284,7 +284,9 @@ The gateway puts no time limit on a model call. `spec.timeout`, `RUN_TIMEOUT` an
 when the run stops being `Pending` or `Running`.
 
 The gateway answers 503 past `harnessGateway.maxConcurrent` calls in flight across all runs (32 by
-default). A streaming call counts until it ends, so raise this for more concurrent harnesses.
+default), or past `harnessGateway.maxConcurrentPerRun` calls for one run (16 by default), with a
+`Retry-After` header. A streaming call counts until it ends, so raise these for more concurrent
+harnesses, or for a run that starts many subagents.
 
 A provider's 401, 403 and 407 keep their status, but the body is replaced, because auth errors are
 where a key gets echoed. Other error bodies pass through the echo check, so a harness can still act

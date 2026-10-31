@@ -238,6 +238,10 @@ harnessGateway:
   # this for more concurrent harnesses. No duration limit applies to a call; a
   # harness's own timeouts bound it.
   maxConcurrent: 32
+  # -- Calls in flight for one run before the gateway answers 503, so one run or
+  # a stolen token can't take every slot. A run that starts many subagents may
+  # need more.
+  maxConcurrentPerRun: 16
   # -- Tenant namespaces whose model Secrets and AgentRuns the gateway may read.
   # Empty keeps a cluster-wide get ClusterRole; a list replaces it with one
   # Role/RoleBinding per namespace (least privilege).

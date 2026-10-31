@@ -63,9 +63,14 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("HARNESS_GATEWAY_MAX_CONCURRENT: %w", err)
 	}
+	maxConcurrentPerRun, err := strconv.ParseInt(env("HARNESS_GATEWAY_MAX_CONCURRENT_PER_RUN", "16"), 10, 64)
+	if err != nil {
+		return fmt.Errorf("HARNESS_GATEWAY_MAX_CONCURRENT_PER_RUN: %w", err)
+	}
 	gateway := &harnessgateway.Gateway{
-		Reader:        reader,
-		MaxConcurrent: maxConcurrent,
+		Reader:              reader,
+		MaxConcurrent:       maxConcurrent,
+		MaxConcurrentPerRun: maxConcurrentPerRun,
 		Profiles: &harnessgateway.Loader{
 			Reader:    reader,
 			Name:      env("SYMPOZIUM_HARNESS_GATEWAY_PROFILES", "sympozium-harness-gateway-profiles"),
